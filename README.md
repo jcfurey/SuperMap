@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://www.youtube.com/watch?v=TQjTTqEewNQ">
-    <img src="doc/teaser.gif" width="90%" alt="SuperMap teaser — click for the full video"/>
+    <img src="doc/teaser_cropped.gif" width="90%" alt="SuperMap teaser — click for the full video"/>
   </a>
 </p>
 
@@ -26,7 +26,7 @@
 - 🧠 **Remember** — persistent object identities capture long-term scene evolution.                                           
 - 💡 **Reason** — a queryable 4D scene graph supports spatial and tempora reasoning.                                         
 - 🤖 **Act** — spatial memory naturally grounds VLN, VLA, and future embodied AI systems.  
-- 🔌 **Model-agnostic** — works with Grounding DINO, YOLOE, or pre-baked detections.
+- 🔌 **Model-agnostic** — works with Grounding DINO, YOLOE, boxer pre-baked detections.
 - ⚡ **Fully online** — real-time on robot hardware; runs **offline** on datasets or **live** via ROS2 from one codebase.
 - 🏫 **Field-proven** — continuous 2-hour deployment across the CMU campus ([interactive demo](https://superodometry.com/supermap)).
 
@@ -67,9 +67,9 @@ colcon build --packages-select semantic_mapping && source install/setup.bash
 ros2 launch semantic_mapping semantic_mapping.launch.py
 ```
 
-Subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics; publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Configure topics, extrinsics, and detector in `config/semantic_mapping.yaml`; detection vocabulary in `config/prompts.yaml`.
+In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic, extrinsic, and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`.
 
-Both modes emit an identical per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp` — downstream consumers are written once.
+Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
 
 ## Citation
 
@@ -89,7 +89,7 @@ Both modes emit an identical per-frame JSON schema (`semantic_mapping.serializat
 
 ## Acknowledgments
 
-Spectial Thanks for Professor Wenshan and Ji Zhang on extensively testing superodometry and supermap on VLN projects 
+Special thanks to Professor Wenshan and Ji Zhang for suggestions and extensively testing SuperOdom and SuperMap on VLN projects.
 
 Built on [SAM2](https://github.com/facebookresearch/sam2), [Grounding DINO](https://github.com/IDEA-Research/GroundingDINO), [YOLOE](https://docs.ultralytics.com/models/yoloe/), and [ByteTrack](https://github.com/ifzhang/ByteTrack).
 
