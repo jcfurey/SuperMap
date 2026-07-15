@@ -18,6 +18,13 @@
   </a>
 </p>
 
+> Announcement: The code will be released after RSS.
+
+## News
+
+- 2026-07-15: Project website and teaser video are now live.
+- 2026-07-15: Initial README and project overview published.
+
 **SuperMap is a living spatial memory for embodied AI**. It perceives the world, remembers its evolution, and supports reasoning and action. It is a training-free spatio-temporal SLAM system that builds a persistent semantic world model. It fuses high-frequency geometric SLAM with asynchronous open-vocabulary perception, producing a 4D scene graph: a queryable map carrying spatial *and* temporal information for every object, enabling visual-language navigation and long-horizon reasoning on real robots.
 
 ## Highlights
