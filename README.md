@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">SuperMap: A Spatio-Temporal SLAM System for Visual-Language Navigation</h1>
+  <h1 align="center"> SuperMap: A  Living Spatial Memory for Embodied AI </h1>
   <h3 align="center">RSS 2026 </h3>
   <p align="center">
   </p>
