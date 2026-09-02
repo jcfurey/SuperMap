@@ -34,6 +34,15 @@ the tags.
 
 _ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 
+MOVED_THRESHOLD_M = 0.5
+"""Displacement before an instance is described as having moved."""
+
+SETTLE_SECONDS = 1.0
+"""Trajectory samples younger than this (after first sight) are ignored when
+judging motion: a freshly spawned object's centroid shifts as more of it is
+observed and its 3D extent fills in, which is estimate refinement, not motion.
+Reporting it as movement would hand the model a false temporal cue."""
+
 
 def _format_center(center: np.ndarray) -> str:
     return f"[{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]"
@@ -63,19 +72,23 @@ def serialize_subgraph_to_text(
         temporal_lines = []
         for node_id in scene_graph.node_ids:
             obj = by_id.get(node_id)
-            if obj is None or len(obj.trajectory) < 2:
+            if obj is None or not obj.trajectory:
                 continue
-            first_stamp, first_center, _ = obj.trajectory[0]
-            last_stamp, last_center, last_status = obj.trajectory[-1]
+            last_stamp, last_center, _last_status = obj.trajectory[-1]
             if obj.status == ObjectStatus.DISAPPEARED:
                 temporal_lines.append(
                     f"  Instance {obj.instance_id} ({obj.label}) was last seen at "
                     f"{_format_center(last_center)} at t={last_stamp:.2f}s and has since disappeared."
                 )
-            elif float(np.linalg.norm(last_center - first_center)) > 0.3:
+                continue
+            settled = [s for s in obj.trajectory if s[0] >= obj.first_seen_stamp + SETTLE_SECONDS]
+            if len(settled) < 2:
+                continue
+            ref_stamp, ref_center, _ = settled[0]
+            if float(np.linalg.norm(last_center - ref_center)) > MOVED_THRESHOLD_M:
                 temporal_lines.append(
                     f"  Instance {obj.instance_id} ({obj.label}) moved from "
-                    f"{_format_center(first_center)} at t={first_stamp:.2f}s to "
+                    f"{_format_center(ref_center)} at t={ref_stamp:.2f}s to "
                     f"{_format_center(last_center)} at t={last_stamp:.2f}s."
                 )
         if temporal_lines:

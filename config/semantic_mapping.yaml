@@ -90,3 +90,25 @@ semantic_mapping_node:
                                   bed, sofa, couch, bench, stool, chair, cart, box, floor]
 
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
+
+    # --- Language grounding (Sec. IV-D) ----------------------------------
+    # Publish a std_msgs/String instruction on query_topic; the node serializes
+    # the current scene graph, queries the VLM, and publishes the answer
+    # (JSON on answer_topic), the first target as a PoseStamped goal, and all
+    # targets in order as a nav_msgs/Path.
+    query_topic: /semantic_mapping/query
+    answer_topic: /semantic_mapping/answer
+    goal_topic: /semantic_mapping/goal
+    waypoints_topic: /semantic_mapping/waypoints
+    vlm:
+      # keyword | openai_compatible | anthropic. "keyword" is a deterministic
+      # stand-in with no network access (matches labels named in the
+      # instruction) so the node runs without credentials; use a real backend
+      # for relational/temporal reasoning. API keys come from the environment
+      # variable named in api_key_env (defaults: OPENAI_API_KEY / ANTHROPIC_API_KEY).
+      client: keyword
+      model: ""            # e.g. gpt-4o, gemini-2.0-flash (via its OpenAI-compatible endpoint), claude-opus-5
+      base_url: ""         # e.g. https://api.openai.com/v1, http://localhost:11434/v1 (Ollama)
+      api_key_env: ""
+      local_radius_m: 0.0  # > 0: serialize only objects within this distance of the robot (local subgraph)
+      max_objects: 0       # > 0: cap the number of serialized objects (nearest first)
