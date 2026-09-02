@@ -109,6 +109,7 @@ semantic_mapping_node:
 
     size_prior_weight: 0.0                 # 2D box size: 0 = Kalman only, 1 = projected 3D box (visible part)
     depth_fill_radius_px: 0                # fill empty depth pixels from neighbours within N px (LiDAR: 2-3; dense depth: 0)
+    cull_out_of_view: true                 # skip per-point evidence for instances entirely outside the view
 
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
     stats_log_period_sec: 10.0             # log module rates (detector / 3D mapping / scene graph) every N s; 0 = off

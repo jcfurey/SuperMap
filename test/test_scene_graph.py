@@ -80,3 +80,66 @@ def test_on_is_class_dependent():
     assert sg.SpatialEdge(2, "on", 1) in sg.build_spatial_edges([rug, table], support_classes=())
     # And configurable: declare rugs as supports.
     assert sg.SpatialEdge(2, "on", 1) in sg.build_spatial_edges([rug, table], support_classes=("rug",))
+
+
+def test_centroid_clustering_matches_exhaustive_greedy_reference():
+    from semantic_mapping.scene_graph import _cluster_by_centroid
+
+    rng = np.random.default_rng(3)
+    objects = []
+    for i, center in enumerate(rng.uniform(-6.0, 6.0, size=(80, 3))):
+        objects.append(make_object(i + 1, "thing", np.concatenate([center - 0.1, center + 0.1])))
+
+    centers = np.array([o.center for o in objects])
+    assigned = np.zeros(len(objects), dtype=bool)
+    reference = []
+    for i in range(len(objects)):
+        if assigned[i]:
+            continue
+        members = np.nonzero((np.linalg.norm(centers - centers[i], axis=1) <= 2.0) & ~assigned)[0].tolist()
+        assigned[members] = True
+        reference.append(members)
+
+    assert _cluster_by_centroid(objects, 2.0) == reference
+    assert _cluster_by_centroid([], 2.0) == []
+
+
+def _edge_set(edges):
+    return sorted((e.subject_id, e.predicate, e.object_id) for e in edges)
+
+
+def test_edge_cache_reproduces_uncached_edges_as_the_scene_changes():
+    table = make_object(1, "table", [0.0, 0.0, 0.0, 1.0, 1.0, 0.5])
+    mug = make_object(2, "mug", [0.2, 0.2, 0.5, 0.6, 0.6, 0.6])
+    chair = make_object(3, "chair", [1.2, 0.0, 0.0, 1.7, 0.5, 0.5])
+    far = make_object(4, "lamp", [8.0, 8.0, 0.0, 8.2, 8.2, 1.0])
+    cache = sg.SpatialEdgeCache()
+
+    scene = [table, mug, chair, far]
+    first = _edge_set(sg.build_spatial_edges(scene, cache=cache))
+    assert first == _edge_set(sg.build_spatial_edges(scene))
+    assert (2, "on", 1) in first and (1, "beside", 3) in first
+
+    assert _edge_set(sg.build_spatial_edges(scene, cache=cache)) == first  # served from the cache
+    mug.bbox3d = np.array([3.0, 3.0, 0.0, 3.2, 3.2, 0.1])                 # mug moved off the table
+    moved = _edge_set(sg.build_spatial_edges(scene, cache=cache))
+    assert moved == _edge_set(sg.build_spatial_edges(scene)) and (2, "on", 1) not in moved
+
+    scene.append(make_object(5, "book", [0.3, 0.3, 0.5, 0.8, 0.8, 0.55]))  # a new object on the table
+    added = _edge_set(sg.build_spatial_edges(scene, cache=cache))
+    assert added == _edge_set(sg.build_spatial_edges(scene)) and (5, "on", 1) in added
+
+    del scene[0]                                                          # the table is gone
+    removed = _edge_set(sg.build_spatial_edges(scene, cache=cache))
+    assert removed == _edge_set(sg.build_spatial_edges(scene)) and not any(p == "on" for _, p, _ in removed)
+
+
+def test_boxes_in_view_batches_the_single_box_test():
+    from semantic_mapping.object_map import ObjectMap
+
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    boxes = np.array([[-0.5, -0.5, 1.0, 0.5, 0.5, 2.0], [5.0, -0.5, 1.0, 6.0, 0.5, 2.0],
+                      [-0.5, -0.5, -3.0, 0.5, 0.5, -2.0], [-0.5, -0.5, -1.0, 0.5, 0.5, 1.0]])
+    batched = ObjectMap.boxes_in_view(boxes, K, np.eye(4), (120, 160))
+    assert batched.tolist() == [True, False, False, True]
+    assert batched.tolist() == [ObjectMap.may_be_in_view(b, K, np.eye(4), (120, 160)) for b in boxes]
