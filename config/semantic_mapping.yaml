@@ -92,6 +92,7 @@ semantic_mapping_node:
     size_prior_weight: 0.0                 # 2D box size: 0 = Kalman only, 1 = projected 3D box (visible part)
 
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
+    stats_log_period_sec: 10.0             # log module rates (detector / 3D mapping / scene graph) every N s; 0 = off
 
     # --- Language grounding (Sec. IV-D) ----------------------------------
     # Publish a std_msgs/String instruction on query_topic; the node serializes

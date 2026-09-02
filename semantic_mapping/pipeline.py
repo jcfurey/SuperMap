@@ -10,6 +10,7 @@ back the updated map and scene graph.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -79,6 +80,11 @@ class FrameResult:
     """For each detection in the processed observation, the instance ID it was
     fused into (matched, re-activated, or newly spawned), or -1 if it was
     discarded (e.g. a low-confidence detection with no existing track)."""
+
+    timings: dict[str, float] = field(default_factory=dict)
+    """Wall-clock seconds spent in each stage of this update (``predict``,
+    ``backproject``, ``associate``, ``map_update``, ``scene_graph``, ``total``),
+    the raw material for the Sec. V-H runtime accounting."""
 
 
 class SemanticMappingPipeline:
@@ -152,6 +158,7 @@ class SemanticMappingPipeline:
         carried on ``observation.pose``.
         """
         self._frame_index += 1
+        t_start = time.perf_counter()
         K = observation.intrinsics.K
         T_world_from_cam = observation.pose.T_world_from_frame
         detections = observation.detections
@@ -176,6 +183,7 @@ class SemanticMappingPipeline:
             bbox = tracking.current_bbox(predicted)
             visible = clip_bbox_to_image(bbox, *image_size)
             predicted_bboxes.append(bbox if visible is None else visible)
+        t_predict = time.perf_counter()
 
         # Back-project every detection once; the 3D boxes feed the re-activation
         # stage, the points feed whichever instance the detection ends up in.
@@ -188,6 +196,7 @@ class SemanticMappingPipeline:
             det_boxes3d.append(
                 bbox3d_from_points(points) if points.shape[0] >= cfg.min_points_for_3d_association else None
             )
+        t_backproject = time.perf_counter()
         detection_bboxes = [d.bbox for d in detections]
         high = [i for i, d in enumerate(detections) if d.score >= cfg.high_score_threshold]
         low = [i for i, d in enumerate(detections) if d.score < cfg.high_score_threshold]
@@ -209,6 +218,8 @@ class SemanticMappingPipeline:
             iou_threshold=cfg.reactivation_iou_threshold, containment_margin=cfg.reactivation_margin_m,
             candidate_objects=stage2.unmatched_tracks, candidate_detections=stage1.unmatched_detections,
         )
+
+        t_associate = time.perf_counter()
 
         detection_instance_ids = [-1] * len(detections)
         for track_idx, det_idx in stage1.matches + stage2.matches:
@@ -253,6 +264,7 @@ class SemanticMappingPipeline:
             sg.record_trajectory_sample(obj, observation.stamp)
 
         self.object_map.prune_disappeared(cfg.disappeared_prune_grace_frames)
+        t_update = time.perf_counter()
 
         graph = sg.build_scene_graph(
             list(self.object_map.objects.values()),
@@ -263,8 +275,18 @@ class SemanticMappingPipeline:
             support_classes=self.config.scene_graph_support_classes,
         )
 
+        t_graph = time.perf_counter()
+
         return FrameResult(
             objects=list(self.object_map.objects.values()),
             scene_graph=graph,
             detection_instance_ids=detection_instance_ids,
+            timings={
+                "predict": t_predict - t_start,
+                "backproject": t_backproject - t_predict,
+                "associate": t_associate - t_backproject,
+                "map_update": t_update - t_associate,
+                "scene_graph": t_graph - t_update,
+                "total": t_graph - t_start,
+            },
         )
