@@ -21,6 +21,7 @@ static_transform_publisher covering the common fixed-extrinsic case.
 """
 from __future__ import annotations
 
+import json
 import queue
 import threading
 
@@ -31,11 +32,12 @@ import tf2_ros
 import yaml
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
-from std_msgs.msg import ColorRGBA, Header
+from std_msgs.msg import ColorRGBA, Header, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
@@ -43,6 +45,8 @@ from semantic_mapping.geometry_utils import rasterize_depth, se3_from_translatio
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.serialization import serialize_frame
 from semantic_mapping.types import CameraIntrinsics, Observation, StampedPose
+from semantic_mapping.vln.clients import build_vlm_client
+from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
 _LABEL_PALETTE_SEED = 1000003  # arbitrary large prime for a stable pseudo-random per-label hue
 
@@ -95,6 +99,20 @@ class SemanticMappingNode(Node):
         self._detector_thread = threading.Thread(target=self._detector_loop, name="detector", daemon=True)
         self._detector_thread.start()
 
+        # Language grounding (Sec. IV-D): the query callback snapshots and
+        # serializes the current graph on the executor thread (so it never
+        # races the mapping callbacks), and only the model call runs here.
+        self._last_result: FrameResult | None = None
+        self.grounder = Grounder(
+            build_vlm_client(self._param_str("vlm.client", "keyword"), **self._vlm_kwargs()),
+            coordinate_frame=self.world_frame,
+            local_radius_m=float(self.get_parameter("vlm.local_radius_m").value) or None,
+            max_objects=int(self.get_parameter("vlm.max_objects").value) or None,
+        )
+        self._grounding_jobs: queue.Queue[GroundingRequest] = queue.Queue()
+        self._grounding_thread = threading.Thread(target=self._grounding_loop, name="grounding", daemon=True)
+        self._grounding_thread.start()
+
         self._setup_io()
         self.get_logger().info("semantic_mapping_node initialized")
 
@@ -116,6 +134,16 @@ class SemanticMappingNode(Node):
             "detector_rate_hz": 1.0,
             "prompts_file": "config/prompts.yaml",
             "publish_rate_hz": 5.0,
+            "query_topic": "/semantic_mapping/query",
+            "answer_topic": "/semantic_mapping/answer",
+            "goal_topic": "/semantic_mapping/goal",
+            "waypoints_topic": "/semantic_mapping/waypoints",
+            "vlm.client": "keyword",
+            "vlm.model": "",
+            "vlm.base_url": "",
+            "vlm.api_key_env": "",
+            "vlm.local_radius_m": 0.0,
+            "vlm.max_objects": 0,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -172,11 +200,20 @@ class SemanticMappingNode(Node):
             }
         return {"detections_dir": self._param_str("offline.detections_dir", "")}
 
+    def _vlm_kwargs(self) -> dict:
+        """Only pass what was configured, so each backend keeps its own defaults."""
+        kwargs = {}
+        for key in ("model", "base_url", "api_key_env"):
+            value = self._param_str(f"vlm.{key}", "")
+            if value:
+                kwargs[key] = value
+        return kwargs
+
     def _setup_io(self) -> None:
         rgb_sub = Subscriber(self, Image, self._param_str("rgb_topic", "/camera/color/image_raw"))
         info_sub = Subscriber(self, CameraInfo, self._param_str("camera_info_topic", "/camera/color/camera_info"))
         pc_sub = Subscriber(self, PointCloud2, self._param_str("pointcloud_topic", "/lidar/points"))
-        odom_sub = Subscriber(self, Odometry, self._param_str("odometry_topic", "/super_odometry/odometry"))
+        odom_sub = Subscriber(self, Odometry, self._param_str("odometry_topic", "/odometry"))
 
         self._sync = ApproximateTimeSynchronizer(
             [rgb_sub, info_sub, pc_sub, odom_sub],
@@ -191,6 +228,61 @@ class SemanticMappingNode(Node):
             MarkerArray, self._param_str("obj_boxes_topic", "/obj_boxes"), 10)
         self.annotated_image_pub = self.create_publisher(
             Image, self._param_str("annotated_image_topic", "/semantic_mapping/annotated_image"), 10)
+
+        self.query_sub = self.create_subscription(
+            String, self._param_str("query_topic", "/semantic_mapping/query"), self._on_query, 10)
+        self.answer_pub = self.create_publisher(
+            String, self._param_str("answer_topic", "/semantic_mapping/answer"), 10)
+        self.goal_pub = self.create_publisher(
+            PoseStamped, self._param_str("goal_topic", "/semantic_mapping/goal"), 10)
+        self.waypoints_pub = self.create_publisher(
+            Path, self._param_str("waypoints_topic", "/semantic_mapping/waypoints"), 10)
+
+    # ------------------------------------------------------------- grounding
+    def _on_query(self, msg: String) -> None:
+        """Instruction in -> (asynchronously) waypoints out (Sec. IV-D)."""
+        instruction = msg.data.strip()
+        if not instruction:
+            return
+        if self._last_result is None:
+            self.get_logger().warn(f"query '{instruction}' received before any map update; ignoring")
+            return
+        robot_position = None
+        try:
+            T = self._lookup_se3(self.world_frame, self.camera_frame, self.get_clock().now().to_msg())
+            robot_position = T[:3, 3]
+        except tf2_ros.TransformException:
+            pass  # local-subgraph selection just falls back to the whole graph
+        request = self.grounder.prepare(
+            instruction, self._last_result.objects, self._last_result.scene_graph, robot_position,
+        )
+        self._grounding_jobs.put(request)
+
+    def _grounding_loop(self) -> None:
+        while rclpy.ok():
+            try:
+                request = self._grounding_jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            result = self.grounder.complete(request)
+            if result.error:
+                self.get_logger().warn(f"grounding '{request.instruction}': {result.error}")
+            else:
+                self.get_logger().info(
+                    f"grounding '{request.instruction}' -> instances {result.target_ids}")
+
+            header = Header(stamp=self.get_clock().now().to_msg(), frame_id=self.world_frame)
+            self.answer_pub.publish(String(data=json.dumps(result.to_dict())))
+            if not result.waypoints:
+                continue
+            path = Path(header=header)
+            for waypoint in result.waypoints:
+                pose = PoseStamped(header=header)
+                pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = (float(v) for v in waypoint)
+                pose.pose.orientation.w = 1.0
+                path.poses.append(pose)
+            self.waypoints_pub.publish(path)
+            self.goal_pub.publish(path.poses[0])
 
     # ---------------------------------------------------------------- callback
     def _on_synced_frame(self, rgb_msg: Image, info_msg: CameraInfo, pc_msg: PointCloud2,
@@ -272,6 +364,7 @@ class SemanticMappingNode(Node):
 
     def _process_and_publish(self, observation: Observation, header: Header) -> FrameResult:
         result = self.pipeline.process_frame(observation)
+        self._last_result = result
         if observation.stamp - self._last_publish_stamp >= self._publish_period_sec:
             self._publish_result(result, header)
             self._last_publish_stamp = observation.stamp

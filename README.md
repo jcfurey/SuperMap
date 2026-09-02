@@ -98,6 +98,23 @@ docker run --rm -it --gpus all --network host supermap/semantic_mapping         
 # or: docker compose up --build
 ```
 
+### Query the map (visual-language navigation, Sec. IV-D)
+
+The 4D scene graph is the interface between the map and a VLM: an instruction is answered by serializing a (local) subgraph -- instance IDs, labels, centroids, spatial and temporal relations -- into a prompt, asking the model for target instance IDs inside `<answer>` tags, and resolving those IDs to 3D waypoints from the map.
+
+```bash
+python examples/query.py "go to the chair next to the table"                        # offline, on the demo sequence
+python examples/query.py --client openai_compatible --model gpt-4o "return to where the trash can was"
+python examples/query.py --client anthropic --model claude-opus-5 "..."
+
+ros2 topic pub --once /semantic_mapping/query std_msgs/String "{data: 'go to the whiteboard next to the painting'}"
+ros2 topic echo /semantic_mapping/goal           # geometry_msgs/PoseStamped, first target
+ros2 topic echo /semantic_mapping/waypoints      # nav_msgs/Path, all targets in order
+ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, raw response
+```
+
+The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
+
 Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
 
 ## Citation

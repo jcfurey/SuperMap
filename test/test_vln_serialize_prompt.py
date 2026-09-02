@@ -46,3 +46,17 @@ def test_temporal_cue_mentions_disappearance():
     graph = sg.SceneGraph(node_ids=[1], spatial_edges=[])
     text = vp.serialize_subgraph_to_text([obj], graph)
     assert "has since disappeared" in text
+
+
+def test_moved_cue_ignores_early_estimate_refinement_but_reports_real_motion():
+    obj = make_object(1, "cart", [0.0, 0.0, 0.0, 0.5, 0.5, 1.0])
+    obj.first_seen_stamp = 0.0
+    # Centroid drifting 0.8 m within the first second: refinement, not motion.
+    obj.trajectory = [(0.0, np.array([0.0, 0.0, 0.5]), "active"), (0.5, np.array([0.8, 0.0, 0.5]), "active"),
+                      (1.5, np.array([0.85, 0.0, 0.5]), "active"), (3.0, np.array([0.9, 0.0, 0.5]), "active")]
+    graph = sg.SceneGraph(node_ids=[1], spatial_edges=[])
+    assert "moved" not in vp.serialize_subgraph_to_text([obj], graph)
+
+    obj.trajectory.append((6.0, np.array([2.5, 0.0, 0.5]), "active"))  # genuinely relocated later
+    text = vp.serialize_subgraph_to_text([obj], graph)
+    assert "Instance 1 (cart) moved from [0.85, 0.00, 0.50] at t=1.50s to [2.50, 0.00, 0.50] at t=6.00s" in text
