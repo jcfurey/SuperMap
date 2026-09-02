@@ -46,10 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-yaml \
         python3-opencv \
         ros-${ROS_DISTRO}-tf2-ros \
-        ros-${ROS_DISTRO}-cv-bridge \
         ros-${ROS_DISTRO}-message-filters \
         ros-${ROS_DISTRO}-sensor-msgs-py \
-        ros-${ROS_DISTRO}-vision-opencv \
         ros-${ROS_DISTRO}-launch \
         ros-${ROS_DISTRO}-launch-ros \
     && rm -rf /var/lib/apt/lists/*
@@ -63,11 +61,11 @@ COPY package.xml requirements.txt ./
 # at build time, which is both fragile in restricted CI environments and
 # unnecessary once the mapping from package.xml keys to apt packages is known).
 #
-# numpy/scipy/opencv/pyyaml come from apt (above), not pip: ros-${ROS_DISTRO}-cv-bridge
-# is a compiled extension linked against the numpy ABI its own apt-provided
-# python3-numpy build was compiled with, and a newer pip-installed numpy
-# (numpy 2.x's C-API is not backwards compatible with 1.x-compiled extensions)
-# would shadow it and silently break image conversion at runtime.
+# numpy/scipy/opencv/pyyaml come from apt (above), not pip, so the package
+# shares one numpy with the distro's ROS Python bindings (sensor_msgs_py,
+# tf2_ros) instead of a newer pip numpy shadowing them. Image messages are
+# decoded with plain numpy (semantic_mapping/ros_msgs.py), so cv_bridge and
+# its numpy-ABI coupling are not needed.
 RUN pip3 install --no-cache-dir --break-system-packages "pytest>=7.4,<8"
 
 # Detector backends (large: torch + CUDA runtime wheels, ultralytics, spacy).
@@ -76,8 +74,8 @@ RUN pip3 install --no-cache-dir --break-system-packages "pytest>=7.4,<8"
 # (https://github.com/IDEA-Research/GroundingDINO,
 #  https://github.com/facebookresearch/sam2) if you need that backend.
 # "numpy<2" is pinned on both installs below (not just left to whatever
-# torch/ultralytics/spacy would pull in) for the same cv_bridge ABI reason
-# noted above -- pip resolves a whole command's requirements together, so
+# torch/ultralytics/spacy would pull in) so the apt-provided numpy stays the
+# one in use -- pip resolves a whole command's requirements together, so
 # this constrains any transitive numpy pull, not just a direct one.
 RUN if [ "$INSTALL_DETECTORS" = "1" ]; then \
         pip3 install --no-cache-dir --break-system-packages \

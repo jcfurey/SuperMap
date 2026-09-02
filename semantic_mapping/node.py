@@ -25,29 +25,33 @@ import json
 import queue
 import threading
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
 import rclpy.time
 import tf2_ros
 import yaml
-from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import ColorRGBA, Header, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
-from semantic_mapping.geometry_utils import rasterize_depth, transform_points
+from semantic_mapping.geometry_utils import invert_se3, rasterize_depth, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
-from semantic_mapping.ros_msgs import camera_info_to_intrinsics, pointcloud_to_xyz, transform_to_se3
+from semantic_mapping.ros_msgs import (
+    camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy, numpy_to_image, pointcloud_to_xyz,
+    transform_to_se3,
+)
 from semantic_mapping.serialization import serialize_frame
-from semantic_mapping.types import Observation, StampedPose
+from semantic_mapping.types import CameraIntrinsics, Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
@@ -82,7 +86,9 @@ class SemanticMappingNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.bridge = CvBridge()
+        self.depth_from_image = self._param_str("depth_source", "pointcloud") == "depth_image"
+        self.depth_scale = float(self.get_parameter("depth_scale").value)
+        self._scan_history: deque = deque(maxlen=max(int(self.get_parameter("pointcloud_accumulate_scans").value), 1))
         self._last_detector_stamp = -float("inf")
         detector_rate_hz = float(self.get_parameter("detector_rate_hz").value)
         self._detector_period_sec = 1.0 / max(detector_rate_hz, 1e-6)
@@ -170,6 +176,15 @@ class SemanticMappingNode(Node):
             "map_save_path": "",
             "map_autosave_sec": 0.0,
             "stats_log_period_sec": 10.0,
+            # Sensor input: drivers commonly publish best-effort; a best-effort
+            # subscription matches both reliable and best-effort publishers.
+            "sensor_qos": "best_effort",   # best_effort | reliable | sensor_data
+            "sensor_qos_depth": 10,
+            "rgb_compressed": False,       # subscribe sensor_msgs/CompressedImage on rgb_topic
+            "depth_source": "pointcloud",  # pointcloud | depth_image (aligned to the RGB camera)
+            "depth_topic": "/camera/aligned_depth_to_color/image_raw",
+            "depth_scale": 1000.0,         # units per meter for 16-bit depth images
+            "pointcloud_accumulate_scans": 1,  # rasterize the last N scans (via TF) for sparse LiDAR
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -239,14 +254,31 @@ class SemanticMappingNode(Node):
                 kwargs[key] = value
         return kwargs
 
+    def _sensor_qos(self) -> QoSProfile:
+        name = self._param_str("sensor_qos", "best_effort").lower()
+        if name == "sensor_data":
+            return qos_profile_sensor_data
+        reliability = ReliabilityPolicy.RELIABLE if name == "reliable" else ReliabilityPolicy.BEST_EFFORT
+        return QoSProfile(reliability=reliability, history=HistoryPolicy.KEEP_LAST,
+                          depth=int(self.get_parameter("sensor_qos_depth").value))
+
     def _setup_io(self) -> None:
-        rgb_sub = Subscriber(self, Image, self._param_str("rgb_topic", "/camera/color/image_raw"))
-        info_sub = Subscriber(self, CameraInfo, self._param_str("camera_info_topic", "/camera/color/camera_info"))
-        pc_sub = Subscriber(self, PointCloud2, self._param_str("pointcloud_topic", "/lidar/points"))
-        odom_sub = Subscriber(self, Odometry, self._param_str("odometry_topic", "/odometry"))
+        qos = self._sensor_qos()
+        rgb_type = CompressedImage if bool(self.get_parameter("rgb_compressed").value) else Image
+        rgb_sub = Subscriber(self, rgb_type, self._param_str("rgb_topic", "/camera/color/image_raw"), qos_profile=qos)
+        info_sub = Subscriber(self, CameraInfo, self._param_str("camera_info_topic", "/camera/color/camera_info"),
+                              qos_profile=qos)
+        if self.depth_from_image:
+            depth_sub = Subscriber(self, Image, self._param_str("depth_topic", "/camera/aligned_depth_to_color/image_raw"),
+                                   qos_profile=qos)
+        else:
+            depth_sub = Subscriber(self, PointCloud2, self._param_str("pointcloud_topic", "/lidar/points"),
+                                   qos_profile=qos)
+        odom_sub = Subscriber(self, Odometry, self._param_str("odometry_topic", "/odometry"), qos_profile=qos)
+        self._sensor_subscribers = [rgb_sub, info_sub, depth_sub, odom_sub]
 
         self._sync = ApproximateTimeSynchronizer(
-            [rgb_sub, info_sub, pc_sub, odom_sub],
+            [rgb_sub, info_sub, depth_sub, odom_sub],
             queue_size=int(self.get_parameter("sync_queue_size").value),
             slop=float(self.get_parameter("sync_slop_sec").value),
         )
@@ -380,8 +412,7 @@ class SemanticMappingNode(Node):
             self.goal_pub.publish(path.poses[0])
 
     # ---------------------------------------------------------------- callback
-    def _on_synced_frame(self, rgb_msg: Image, info_msg: CameraInfo, pc_msg: PointCloud2,
-                          odom_msg: Odometry) -> None:
+    def _on_synced_frame(self, rgb_msg, info_msg: CameraInfo, depth_msg, odom_msg: Odometry) -> None:
         # odom_msg's own pose fields are not read directly: a well-behaved
         # SLAM backbone also broadcasts the same pose as a dynamic TF
         # transform, so resolving world_frame -> camera_frame (and
@@ -393,22 +424,43 @@ class SemanticMappingNode(Node):
         # backbone's pose-update rate.
         try:
             T_world_from_cam = self._lookup_se3(self.world_frame, self.camera_frame, rgb_msg.header.stamp)
-            T_cam_from_cloud = self._lookup_se3(self.camera_frame, pc_msg.header.frame_id, pc_msg.header.stamp)
+            T_cam_from_cloud = None if self.depth_from_image else self._lookup_se3(
+                self.camera_frame, depth_msg.header.frame_id, depth_msg.header.stamp)
         except tf2_ros.TransformException as exc:
             self.get_logger().warn(f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
             return
 
         stamp = _stamp_to_seconds(rgb_msg.header.stamp)
-
-        rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
         intrinsics = camera_info_to_intrinsics(info_msg)
+        try:
+            rgb = self._decode_rgb(rgb_msg, intrinsics)
+        except ValueError as exc:
+            self.get_logger().error(f"cannot decode RGB image: {exc}", throttle_duration_sec=5.0)
+            return
 
-        # Rasterize the synchronized point cloud into the camera frame to
-        # obtain the raw sensor depth D(u) needed by geometric consistency.
-        points_cloud_frame = self._read_pointcloud_xyz(pc_msg)
-        points_cam = transform_points(T_cam_from_cloud, points_cloud_frame) if points_cloud_frame.shape[0] \
-            else points_cloud_frame
-        depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
+        if self.depth_from_image:
+            # Depth already aligned to the RGB camera (e.g. an RGB-D driver's aligned stream).
+            depth = depth_image_to_meters(depth_msg, self.depth_scale)
+            if depth.shape != (intrinsics.height, intrinsics.width):
+                self.get_logger().error(
+                    f"depth image {depth.shape[1]}x{depth.shape[0]} does not match CameraInfo "
+                    f"{intrinsics.width}x{intrinsics.height}; use the driver's depth-aligned-to-color stream",
+                    throttle_duration_sec=5.0)
+                return
+        else:
+            # Rasterize the synchronized point cloud into the camera frame to
+            # obtain the raw sensor depth D(u) needed by geometric consistency.
+            points_cloud_frame = pointcloud_to_xyz(depth_msg)
+            points_cam = transform_points(T_cam_from_cloud, points_cloud_frame) if points_cloud_frame.shape[0] \
+                else points_cloud_frame
+            if self._scan_history.maxlen > 1:
+                # A single sparse LiDAR scan covers few pixels; the last N scans,
+                # carried in the world frame and re-projected under the current
+                # pose, give the consistency update a denser depth image.
+                self._scan_history.append(transform_points(T_world_from_cam, points_cam))
+                points_cam = transform_points(
+                    invert_se3(T_world_from_cam), np.concatenate(list(self._scan_history), axis=0))
+            depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
 
         observation = Observation(
             stamp=stamp,
@@ -476,9 +528,16 @@ class SemanticMappingNode(Node):
         """
         return transform_to_se3(self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time.from_msg(stamp)))
 
-    @staticmethod
-    def _read_pointcloud_xyz(pc_msg: PointCloud2) -> np.ndarray:
-        return pointcloud_to_xyz(pc_msg)
+    def _decode_rgb(self, rgb_msg, intrinsics: CameraIntrinsics) -> np.ndarray:
+        """RGB (H, W, 3) at the CameraInfo resolution from an Image or CompressedImage."""
+        rgb = image_to_numpy(rgb_msg)
+        if rgb.ndim == 2:
+            rgb = np.repeat(rgb[:, :, None], 3, axis=2)
+        if rgb.shape[:2] != (intrinsics.height, intrinsics.width):
+            import cv2
+
+            rgb = cv2.resize(rgb, (intrinsics.width, intrinsics.height), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(rgb)
 
     # ---------------------------------------------------------------- publish
     def _publish_annotated_image(self, observation: Observation, result: FrameResult, header: Header) -> None:
@@ -501,9 +560,7 @@ class SemanticMappingNode(Node):
                 else f"{detection.label} {detection.score:.2f} (dropped)"
             cv2.putText(image, tag, (x1, max(y1 - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (r, g, b), 1, cv2.LINE_AA)
 
-        msg = self.bridge.cv2_to_imgmsg(image, encoding="rgb8")
-        msg.header = header
-        self.annotated_image_pub.publish(msg)
+        self.annotated_image_pub.publish(numpy_to_image(image, "rgb8", header))
 
     def _publish_result(self, result: FrameResult, header: Header) -> None:
         header.frame_id = self.world_frame

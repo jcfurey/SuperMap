@@ -118,3 +118,30 @@ def test_detection_instance_ids_report_where_each_detection_went():
     low.detections.append(Detection2D(bbox=np.array([5.0, 5.0, 15.0, 15.0]), label="mug", score=0.2))
     third = pipeline.process_frame(low)
     assert third.detection_instance_ids == [1, -1]  # low-score: matched existing track / discarded
+
+
+def test_depth_fill_recovers_points_and_change_detection_from_sparse_depth():
+    rng = np.random.default_rng(0)
+    keep = rng.random((120, 160)) < 0.05  # LiDAR-like: 5% of pixels carry a reading
+
+    def sparse(stamp, distance, with_detection):
+        obs = _observation(stamp, distance, with_detection)
+        obs.depth = np.where(keep, obs.depth, 0.0)
+        return obs
+
+    def run(fill_radius):
+        pipeline = SemanticMappingPipeline(PipelineConfig(min_hits_to_confirm=2, depth_fill_radius_px=fill_radius,
+                                                          disappeared_occupied_fraction=0.3))
+        for i in range(5):
+            result = pipeline.process_frame(sparse(i * 0.1, 2.0, True))
+        (obj,) = result.objects
+        points_seen = obj.points_world.shape[0]
+        for i in range(5, 45):
+            result = pipeline.process_frame(sparse(i * 0.1, 8.0, False))  # object removed, surface behind it visible
+        return points_seen, result.objects[0].status.value
+
+    sparse_points, sparse_status = run(0)
+    filled_points, filled_status = run(2)
+    assert filled_points > 2 * sparse_points          # most of the silhouette back (voxel grid caps the count)
+    assert filled_status == "disappeared"             # filled pixels carry free-space evidence for every point
+    assert sparse_status == "disappeared"             # the sampled 5% still contradict enough points over 40 frames
