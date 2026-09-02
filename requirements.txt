@@ -1,10 +1,8 @@
 # Core
-# For live ROS2 mode: if your ROS2 install's cv_bridge is a compiled package
-# (e.g. the ros-<distro>-cv-bridge apt package), it's linked against whatever
-# numpy ABI it was built with (numpy 1.x on most current distros) and a numpy
-# 2.x installed here can shadow it and break image conversion at runtime --
-# see docker/Dockerfile for how the container avoids this. Offline-only use
-# has no such constraint.
+# For live ROS2 mode, prefer the distro's apt numpy/scipy/opencv so the ROS
+# Python bindings and this package share one numpy (see docker/Dockerfile);
+# image messages are decoded with plain numpy, no cv_bridge needed.
+# Offline-only use has no such constraint.
 numpy>=1.24
 scipy>=1.10
 PyYAML>=6.0

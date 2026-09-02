@@ -30,6 +30,19 @@ semantic_mapping_node:
     sync_slop_sec: 0.05
     sync_queue_size: 30
 
+    # Sensor input. Drivers commonly publish best-effort; a best-effort
+    # subscription matches both best-effort and reliable publishers, while a
+    # reliable one silently receives nothing from a best-effort driver.
+    sensor_qos: best_effort          # best_effort | reliable | sensor_data
+    sensor_qos_depth: 10
+    rgb_compressed: false            # true: rgb_topic carries sensor_msgs/CompressedImage (e.g. .../image_raw/compressed)
+    depth_source: pointcloud         # pointcloud: rasterize pointcloud_topic into the camera (LiDAR);
+                                     # depth_image: use an RGB-aligned depth image from depth_topic (RGB-D)
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    depth_scale: 1000.0              # units per meter for 16-bit depth images
+    pointcloud_accumulate_scans: 1   # > 1: rasterize the last N scans (carried through TF) for sparse LiDAR;
+                                     # pair with depth_fill_radius_px below
+
     # --- Detector backend -------------------------------------------------
     # One of: offline | yoloe | groundingdino
     detector: yoloe
@@ -95,6 +108,7 @@ semantic_mapping_node:
                                   bed, sofa, couch, bench, stool, chair, cart, box, floor]
 
     size_prior_weight: 0.0                 # 2D box size: 0 = Kalman only, 1 = projected 3D box (visible part)
+    depth_fill_radius_px: 0                # fill empty depth pixels from neighbours within N px (LiDAR: 2-3; dense depth: 0)
 
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
     stats_log_period_sec: 10.0             # log module rates (detector / 3D mapping / scene graph) every N s; 0 = off

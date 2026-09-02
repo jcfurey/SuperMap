@@ -195,6 +195,33 @@ def rasterize_depth(points_cam: Array, K: Array, width: int, height: int) -> Arr
     return depth
 
 
+def fill_sparse_depth(depth: Array, radius_px: int) -> Array:
+    """Fill pixels without a depth reading from the nearest valid neighbours.
+
+    A LiDAR scan rasterized into a camera covers a few percent of the pixels;
+    every other pixel then carries no evidence for Eq. (7)-(9) and contributes
+    no points when a detection is back-projected. Each empty pixel takes the
+    *minimum* valid depth within ``radius_px``, and pixels with a reading are
+    left untouched. Taking the minimum is the conservative choice for the
+    consistency test: it can only make a filled pixel look closer, which turns
+    a map point behind it into "occluded" (no evidence), never into free space
+    (false disappearance). Pixels with no valid neighbour stay invalid (0).
+    """
+    depth = np.asarray(depth, dtype=np.float64)
+    if radius_px <= 0:
+        return depth
+    from scipy.ndimage import minimum_filter
+
+    valid = np.isfinite(depth) & (depth > 0)
+    if valid.all() or not valid.any():
+        return np.where(valid, depth, 0.0)
+    candidates = np.where(valid, depth, np.inf)
+    filled = minimum_filter(candidates, size=2 * int(radius_px) + 1, mode="nearest")
+    out = np.where(valid, depth, filled)
+    out[~np.isfinite(out)] = 0.0
+    return out
+
+
 def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance: float = 0.05) -> Array:
     """Reject background clutter within a loose detection (box-only, no mask):
     keep only points whose depth lies within ``mad_factor`` median-absolute-

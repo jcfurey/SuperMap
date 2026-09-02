@@ -243,6 +243,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no_masks", action="store_true",
                         help="Emit box-only detections (no instance masks) to exercise the fallback path.")
+    parser.add_argument("--lidar_like", action="store_true",
+                        help="Store sparse, noisy depth as a LiDAR scan rasterized into the camera would give "
+                             "(RGB, detections, and ground truth stay dense).")
+    parser.add_argument("--lidar_density", type=float, default=0.05,
+                        help="Fraction of pixels carrying a depth reading with --lidar_like.")
+    parser.add_argument("--lidar_noise_m", type=float, default=0.02, help="Range noise (1 sigma) with --lidar_like.")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -294,8 +300,14 @@ def main() -> None:
             depth, object_id_map, present_objects, K, R_world_from_cam, position, sample_mask, final_frac,
         ))
 
+        stored_depth = depth
+        if args.lidar_like:
+            keep = rng.random(depth.shape) < args.lidar_density
+            stored_depth = np.where(keep & (depth > 0), depth + rng.normal(0.0, args.lidar_noise_m, depth.shape), 0.0)
+            stored_depth = np.maximum(stored_depth, 0.0)
+
         frame_prefix = frames_dir / f"{frame_id:06d}"
-        np.save(f"{frame_prefix}_depth.npy", depth.astype(np.float32))
+        np.save(f"{frame_prefix}_depth.npy", stored_depth.astype(np.float32))
         np.save(f"{frame_prefix}_rgb.npy", rgb)
 
         quaternion = rotation_matrix_to_quaternion(R_world_from_cam)

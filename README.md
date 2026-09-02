@@ -98,6 +98,8 @@ ros2 launch semantic_mapping semantic_mapping.launch.py
 
 In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Perception is asynchronous, as in the paper (Sec. V-H): the detector runs in its own thread at `detector_rate_hz` (default 1 Hz) while geometric updates continue at the sensor rate; a frame handed to the detector is fused once, under its own pose and depth, when its detections return. Map outputs are published at `publish_rate_hz`. Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 rather than a fixed parameter, so a `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration).
 
+Sensor inputs subscribe best-effort by default (`sensor_qos`), which matches both best-effort and reliable drivers; RGB can arrive as `CompressedImage` (`rgb_compressed: true`), and RGB-D cameras can feed their color-aligned depth stream directly (`depth_source: depth_image`, `depth_topic`, `depth_scale`) instead of a point cloud. Images are decoded with plain numpy, so the node does not depend on cv_bridge.
+
 ## Docker
 
 ```bash
@@ -127,6 +129,16 @@ ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, 
 ```
 
 The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
+
+### Sparse LiDAR depth
+
+A LiDAR scan rasterized into the camera covers a few percent of the pixels, and a pixel without a reading carries no evidence for the consistency update and contributes no points when a detection is back-projected. Two settings address this: `depth_fill_radius_px` fills empty pixels from the nearest readings (the geometric evidence uses depth filled from all readings, while each detection is back-projected through depth filled only from readings inside its own mask, so background never leaks into an object), and `pointcloud_accumulate_scans` rasterizes the last N scans carried through TF. On the synthetic scene rendered LiDAR-like (`prepare_example_dataset.py --lidar_like`, 5% of pixels with 2 cm range noise):
+
+| depth | detection recall | change recall | instance IDs / objects | final-map F1 |
+|---|---|---|---|---|
+| dense | 0.97 | 0.96 | 9 / 9 | 0.86 |
+| 5% sparse, no fill | 0.94 | 0.94 | 12 / 9 | 0.75 |
+| 5% sparse, `depth_fill_radius_px: 2` | 0.93 | 0.93 | 9 / 9 | 0.86 |
 
 ### Real captures: rosbag2 to sequence
 

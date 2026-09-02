@@ -22,6 +22,7 @@ from semantic_mapping.geometry_utils import (
     bbox3d_from_points,
     clip_bbox_to_image,
     depth_consistency_mask,
+    fill_sparse_depth,
     transform_points,
 )
 from semantic_mapping.object_map import ObjectMap
@@ -61,6 +62,13 @@ class PipelineConfig:
     size_prior_weight: float = 0.0
     """How far the predicted 2D box size follows the projected, image-clipped
     3D box (0 = Kalman size only, 1 = projection only); see tracking.predict."""
+    depth_fill_radius_px: int = 0
+    """Fill pixels without a depth reading from valid neighbours within this
+    radius (geometry_utils.fill_sparse_depth). 0 for dense depth sources; 2-3
+    for a LiDAR scan rasterized into the camera. The geometric-consistency
+    evidence uses the image filled from all readings; a detection is
+    back-projected through depth filled only from readings inside its own
+    mask (or box), so background never leaks into an object's point set."""
 
     @classmethod
     def from_dict(cls, params: dict) -> "PipelineConfig":
@@ -126,6 +134,21 @@ class SemanticMappingPipeline:
         self._frame_index = int(header.get("metadata", {}).get("frame_index", 0))
         return header
 
+    @staticmethod
+    def _fill_within(depth: np.ndarray, region: np.ndarray, radius_px: int) -> np.ndarray:
+        """Depth filled only from readings inside ``region`` (elsewhere invalid),
+        computed on the region's bounding crop to keep the per-detection cost small."""
+        ys, xs = np.nonzero(region)
+        if xs.size == 0:
+            return depth
+        h, w = depth.shape
+        y1, y2 = max(int(ys.min()) - radius_px, 0), min(int(ys.max()) + radius_px + 1, h)
+        x1, x2 = max(int(xs.min()) - radius_px, 0), min(int(xs.max()) + radius_px + 1, w)
+        crop = np.where(region[y1:y2, x1:x2], depth[y1:y2, x1:x2], 0.0)
+        filled = np.zeros_like(depth, dtype=np.float64)
+        filled[y1:y2, x1:x2] = fill_sparse_depth(crop, radius_px)
+        return filled
+
     def _detection_points_world(
         self, detection: Detection2D, depth: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
     ) -> np.ndarray:
@@ -139,6 +162,8 @@ class SemanticMappingPipeline:
             x2, y2 = min(x2, depth.shape[1]), min(y2, depth.shape[0])
             mask[y1:y2, x1:x2] = True
 
+        if self.config.depth_fill_radius_px > 0:
+            depth = self._fill_within(depth, mask, self.config.depth_fill_radius_px)
         points_cam = back_project_depth(K, depth, mask=mask)
         if not has_instance_mask and points_cam.shape[0] > 0:
             # An axis-aligned box (unlike a segmentation mask) commonly includes
@@ -163,6 +188,13 @@ class SemanticMappingPipeline:
         T_world_from_cam = observation.pose.T_world_from_frame
         detections = observation.detections
         cfg = self.config
+        depth = observation.depth
+        # Evidence (Eq. 7-9) runs on depth filled from every reading; detections
+        # are back-projected through the raw depth, filled per detection from
+        # readings inside their own mask (see _detection_points_world).
+        evidence_depth = depth
+        if depth is not None and cfg.depth_fill_radius_px > 0:
+            evidence_depth = fill_sparse_depth(depth, cfg.depth_fill_radius_px)
 
         live_objects = [
             obj for obj in self.object_map.objects.values() if obj.status != ObjectStatus.DISAPPEARED
@@ -190,8 +222,8 @@ class SemanticMappingPipeline:
         det_points: list[np.ndarray] = []
         det_boxes3d: list[np.ndarray | None] = []
         for detection in detections:
-            points = (self._detection_points_world(detection, observation.depth, K, T_world_from_cam)
-                      if observation.depth is not None else np.zeros((0, 3)))
+            points = (self._detection_points_world(detection, depth, K, T_world_from_cam)
+                      if depth is not None else np.zeros((0, 3)))
             det_points.append(points)
             det_boxes3d.append(
                 bbox3d_from_points(points) if points.shape[0] >= cfg.min_points_for_3d_association else None
@@ -227,21 +259,21 @@ class SemanticMappingPipeline:
             updated_track = tracking.update(predicted_tracks[track_idx], detection.bbox)
             self.object_map.update_matched(
                 live_objects[track_idx], updated_track, det_points[det_idx], detection,
-                observation.stamp, K, T_world_from_cam, observation.depth,
+                observation.stamp, K, T_world_from_cam, evidence_depth,
             )
             detection_instance_ids[det_idx] = live_objects[track_idx].instance_id
         for track_idx, det_idx in stage3.matches:
             self.object_map.reactivate(
                 live_objects[track_idx], det_points[det_idx], detections[det_idx],
-                observation.stamp, K, T_world_from_cam, observation.depth,
+                observation.stamp, K, T_world_from_cam, evidence_depth,
             )
             detection_instance_ids[det_idx] = live_objects[track_idx].instance_id
 
         for track_idx in stage3.unmatched_tracks:
             obj = live_objects[track_idx]
             obj.track = predicted_tracks[track_idx]
-            if observation.depth is not None:
-                self.object_map.update_unmatched(obj, K, T_world_from_cam, observation.depth)
+            if depth is not None:
+                self.object_map.update_unmatched(obj, K, T_world_from_cam, evidence_depth)
             else:
                 obj.frames_since_seen += 1
 
