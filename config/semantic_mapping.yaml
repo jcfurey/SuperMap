@@ -84,5 +84,9 @@ semantic_mapping_node:
     scene_graph_z_tolerance: 0.1           # meters, "On" predicate z_min ~= z_max tolerance
     scene_graph_xy_iou_threshold: 0.05     # gamma in Eq. On(A,B) predicate
     scene_graph_beside_max_distance: 1.0   # meters
+    # Class-dependent "on" (Sec. IV-C): only these classes can support another
+    # object; an empty list makes the predicate purely geometric.
+    scene_graph_support_classes: [table, desk, shelf, counter, countertop, cabinet, dresser, nightstand,
+                                  bed, sofa, couch, bench, stool, chair, cart, box, floor]
 
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)

@@ -74,16 +74,33 @@ def _beside_predicate(a: ObjectInstance, b: ObjectInstance, z_tolerance: float,
     return same_support_level and barely_overlaps and horizontal_distance <= beside_max_distance
 
 
+DEFAULT_SUPPORT_CLASSES: tuple[str, ...] = (
+    "table", "desk", "shelf", "counter", "countertop", "cabinet", "dresser", "nightstand",
+    "bed", "sofa", "couch", "bench", "stool", "chair", "cart", "box", "floor",
+)
+"""Classes that can carry another object. The ``On`` predicate is class-dependent
+(Sec. IV-C): geometry alone would also say a table sits "on" a rug or a wall
+"on" the floor, so the supporting object must be something that plausibly
+supports."""
+
+
 def build_spatial_edges(
     objects: list[ObjectInstance],
     cluster_radius: float = 2.0,
     z_tolerance: float = 0.1,
     xy_iou_threshold: float = 0.05,
     beside_max_distance: float = 1.0,
+    support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
 ) -> list[SpatialEdge]:
-    """Evaluate class-dependent geometric predicates within centroid clusters."""
+    """Evaluate class-dependent geometric predicates within centroid clusters.
+
+    Emits ``on`` (A on B, with B's class in ``support_classes``; pass an empty
+    collection to make it purely geometric), its inverse ``under`` (B under
+    A), and symmetric ``beside`` edges.
+    """
     edges: list[SpatialEdge] = []
     clusters = _cluster_by_centroid(objects, cluster_radius)
+    supports = set(support_classes) if support_classes else None
 
     for members in clusters:
         for i in members:
@@ -91,8 +108,10 @@ def build_spatial_edges(
                 if i == j:
                     continue
                 a, b = objects[i], objects[j]
-                if _on_predicate(a, b, z_tolerance, xy_iou_threshold):
+                can_support = supports is None or b.label in supports
+                if can_support and _on_predicate(a, b, z_tolerance, xy_iou_threshold):
                     edges.append(SpatialEdge(a.instance_id, "on", b.instance_id))
+                    edges.append(SpatialEdge(b.instance_id, "under", a.instance_id))
                 elif i < j and _beside_predicate(a, b, z_tolerance, xy_iou_threshold, beside_max_distance):
                     edges.append(SpatialEdge(a.instance_id, "beside", b.instance_id))
                     edges.append(SpatialEdge(b.instance_id, "beside", a.instance_id))
@@ -131,6 +150,7 @@ def build_scene_graph(
     beside_max_distance: float = 1.0,
     node_statuses: tuple[ObjectStatus, ...] = (ObjectStatus.ACTIVE, ObjectStatus.OCCLUDED, ObjectStatus.DISAPPEARED),
     edge_statuses: tuple[ObjectStatus, ...] = (ObjectStatus.ACTIVE, ObjectStatus.OCCLUDED),
+    support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
 ) -> SceneGraph:
     """Build G = (V, E_s, E_t) from the current map state.
 
@@ -146,6 +166,6 @@ def build_scene_graph(
     nodes = [obj for obj in objects if obj.status in node_statuses]
     edge_eligible = [obj for obj in nodes if obj.status in edge_statuses]
     spatial_edges = build_spatial_edges(
-        edge_eligible, cluster_radius, z_tolerance, xy_iou_threshold, beside_max_distance,
+        edge_eligible, cluster_radius, z_tolerance, xy_iou_threshold, beside_max_distance, support_classes,
     )
     return SceneGraph(node_ids=[obj.instance_id for obj in nodes], spatial_edges=spatial_edges)

@@ -103,3 +103,18 @@ def test_duplicate_spawn_is_merged_back_into_original():
     # duplicate is merged into it (older ID kept) rather than kept as a second instance.
     assert len(result.objects) == 1
     assert result.objects[0].instance_id == 1
+
+
+def test_detection_instance_ids_report_where_each_detection_went():
+    pipeline = SemanticMappingPipeline(PipelineConfig(min_hits_to_confirm=1))
+    first = pipeline.process_frame(_observation(stamp=0.0, distance=2.0, with_detection=True))
+    assert first.detection_instance_ids == [1]  # spawned
+
+    second = pipeline.process_frame(_observation(stamp=0.1, distance=2.0, with_detection=True))
+    assert second.detection_instance_ids == [1]  # matched the same instance
+
+    low = _observation(stamp=0.2, distance=2.0, with_detection=True)
+    low.detections[0].score = 0.2
+    low.detections.append(Detection2D(bbox=np.array([5.0, 5.0, 15.0, 15.0]), label="mug", score=0.2))
+    third = pipeline.process_frame(low)
+    assert third.detection_instance_ids == [1, -1]  # low-score: matched existing track / discarded

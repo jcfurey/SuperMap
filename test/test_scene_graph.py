@@ -61,3 +61,22 @@ def test_record_trajectory_sample_records_status_change_even_without_motion():
     sg.record_trajectory_sample(obj, stamp=1.0)
     assert len(obj.trajectory) == 2
     assert obj.trajectory[-1][2] == "disappeared"
+
+
+def test_on_emits_inverse_under_edge():
+    table = make_object(1, "table", [0.0, 0.0, 0.0, 1.0, 1.0, 0.5])
+    mug = make_object(2, "mug", [0.1, 0.1, 0.5, 0.9, 0.9, 0.7])
+    edges = sg.build_spatial_edges([table, mug])
+    assert sg.SpatialEdge(2, "on", 1) in edges
+    assert sg.SpatialEdge(1, "under", 2) in edges
+
+
+def test_on_is_class_dependent():
+    # Geometrically a rug "supports" the table, but a rug is not a supporting class.
+    rug = make_object(1, "rug", [0.0, 0.0, 0.0, 2.0, 2.0, 0.02])
+    table = make_object(2, "table", [0.5, 0.5, 0.02, 1.5, 1.5, 0.8])
+    assert sg.build_spatial_edges([rug, table]) == []
+    # Purely geometric when no support classes are configured.
+    assert sg.SpatialEdge(2, "on", 1) in sg.build_spatial_edges([rug, table], support_classes=())
+    # And configurable: declare rugs as supports.
+    assert sg.SpatialEdge(2, "on", 1) in sg.build_spatial_edges([rug, table], support_classes=("rug",))

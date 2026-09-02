@@ -21,6 +21,9 @@ static_transform_publisher covering the common fixed-extrinsic case.
 """
 from __future__ import annotations
 
+import queue
+import threading
+
 import numpy as np
 import rclpy
 import rclpy.time
@@ -76,6 +79,21 @@ class SemanticMappingNode(Node):
         self._last_detector_stamp = -float("inf")
         detector_rate_hz = float(self.get_parameter("detector_rate_hz").value)
         self._detector_period_sec = 1.0 / max(detector_rate_hz, 1e-6)
+        publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        self._publish_period_sec = 1.0 / max(publish_rate_hz, 1e-6)
+        self._last_publish_stamp = -float("inf")
+
+        # Asynchronous perception (Sec. IV, V-H): detection runs in its own
+        # thread at detector_rate_hz while geometric updates continue at the
+        # sensor rate. A frame handed to the detector is *deferred* -- its
+        # geometry is fused together with its detections once they return,
+        # under that frame's own pose and depth -- rather than fused now and
+        # again later, which would double-count its geometric evidence.
+        # Frames in between are fused immediately with no detections.
+        self._detection_jobs: queue.Queue[Observation] = queue.Queue(maxsize=1)
+        self._detection_results: queue.Queue[Observation] = queue.Queue()
+        self._detector_thread = threading.Thread(target=self._detector_loop, name="detector", daemon=True)
+        self._detector_thread.start()
 
         self._setup_io()
         self.get_logger().info("semantic_mapping_node initialized")
@@ -208,22 +226,56 @@ class SemanticMappingNode(Node):
             else points_cloud_frame
         depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
 
-        detections = []
-        if stamp - self._last_detector_stamp >= self._detector_period_sec:
-            detections = self.detector.detect(rgb, prompts=self.prompts)
-            self._last_detector_stamp = stamp
-
         observation = Observation(
             stamp=stamp,
             pose=StampedPose(stamp=stamp, T_world_from_frame=T_world_from_cam),
             intrinsics=intrinsics,
             rgb=rgb,
             depth=depth,
-            detections=detections,
+            detections=[],
         )
 
+        # Fuse any detection frames the worker finished since last time (each
+        # under its own buffered pose/depth), then decide what to do with this one.
+        self._drain_detection_results(rgb_msg.header)
+
+        detection_due = stamp - self._last_detector_stamp >= self._detector_period_sec
+        if detection_due and not self._detection_jobs.full():
+            self._detection_jobs.put(observation)
+            self._last_detector_stamp = stamp
+            return  # deferred: processed in _drain_detection_results once detections arrive
+
+        self._process_and_publish(observation, rgb_msg.header)
+
+    def _detector_loop(self) -> None:
+        while rclpy.ok():
+            try:
+                observation = self._detection_jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                observation.detections = self.detector.detect(observation.rgb, prompts=self.prompts)
+            except Exception as exc:  # noqa: BLE001 - a detector failure must not kill the mapping loop
+                self.get_logger().error(f"detector failed, fusing frame without detections: {exc}",
+                                        throttle_duration_sec=5.0)
+                observation.detections = []
+            self._detection_results.put(observation)
+
+    def _drain_detection_results(self, header: Header) -> None:
+        while True:
+            try:
+                observation = self._detection_results.get_nowait()
+            except queue.Empty:
+                return
+            result = self._process_and_publish(observation, header)
+            self._publish_annotated_image(observation, result, header)
+
+    def _process_and_publish(self, observation: Observation, header: Header) -> FrameResult:
         result = self.pipeline.process_frame(observation)
-        self._publish_result(result, rgb_msg.header)
+        if observation.stamp - self._last_publish_stamp >= self._publish_period_sec:
+            self._publish_result(result, header)
+            self._last_publish_stamp = observation.stamp
+        return result
 
     def _lookup_se3(self, target_frame: str, source_frame: str, stamp) -> np.ndarray:
         """4x4 SE(3) transform mapping ``source_frame``-expressed points/poses
@@ -246,6 +298,30 @@ class SemanticMappingNode(Node):
         return np.stack([cloud["x"], cloud["y"], cloud["z"]], axis=-1).astype(np.float64)
 
     # ---------------------------------------------------------------- publish
+    def _publish_annotated_image(self, observation: Observation, result: FrameResult, header: Header) -> None:
+        if observation.rgb is None or self.annotated_image_pub.get_subscription_count() == 0:
+            return
+        try:
+            import cv2
+        except ImportError:
+            self.get_logger().warn("opencv-python not installed; annotated image disabled", once=True)
+            return
+
+        image = np.ascontiguousarray(observation.rgb.copy())
+        for detection, instance_id in zip(observation.detections, result.detection_instance_ids):
+            r, g, b = (int(c * 255) for c in _label_color(detection.label))
+            x1, y1, x2, y2 = (int(round(v)) for v in detection.bbox)
+            if detection.mask is not None:
+                image[detection.mask] = (0.6 * image[detection.mask] + 0.4 * np.array([r, g, b])).astype(np.uint8)
+            cv2.rectangle(image, (x1, y1), (x2, y2), (r, g, b), 2)
+            tag = f"#{instance_id} {detection.label} {detection.score:.2f}" if instance_id >= 0 \
+                else f"{detection.label} {detection.score:.2f} (dropped)"
+            cv2.putText(image, tag, (x1, max(y1 - 4, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (r, g, b), 1, cv2.LINE_AA)
+
+        msg = self.bridge.cv2_to_imgmsg(image, encoding="rgb8")
+        msg.header = header
+        self.annotated_image_pub.publish(msg)
+
     def _publish_result(self, result: FrameResult, header: Header) -> None:
         header.frame_id = self.world_frame
         self._publish_object_points(result, header)
