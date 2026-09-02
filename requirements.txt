@@ -1,4 +1,10 @@
 # Core
+# For live ROS2 mode: if your ROS2 install's cv_bridge is a compiled package
+# (e.g. the ros-<distro>-cv-bridge apt package), it's linked against whatever
+# numpy ABI it was built with (numpy 1.x on most current distros) and a numpy
+# 2.x installed here can shadow it and break image conversion at runtime --
+# see docker/Dockerfile for how the container avoids this. Offline-only use
+# has no such constraint.
 numpy>=1.24
 scipy>=1.10
 PyYAML>=6.0
@@ -16,4 +22,8 @@ ultralytics>=8.3          # yoloe
 spacy>=3.7
 
 # Testing
-pytest>=7.4
+# Capped below 8: ROS2's own launch_testing pytest plugin registers a pytest11
+# hookimpl against the pre-pytest-8 hookspec (path arg, not collection_path)
+# and fails to load under pytest 8+ -- pulling in a newer pytest here breaks
+# `ros2 test` / `colcon test` in a real workspace, not just this repo's suite.
+pytest>=7.4,<8

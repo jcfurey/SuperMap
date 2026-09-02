@@ -6,11 +6,25 @@ Sec. IV-A), runs the asynchronous open-vocabulary detector at its own rate,
 and drives :class:`semantic_mapping.pipeline.SemanticMappingPipeline` on
 every synchronized frame. Publishes per-object voxels, labeled 3D boxes, and
 an annotated debug image, as documented in the project README.
+
+Camera/LiDAR extrinsics and the world-from-camera pose (Eq. 3) are resolved
+through TF2 rather than a single hardcoded extrinsic parameter: SuperOdometry
+broadcasts a dynamic ``world_frame -> sensor_frame`` transform (in addition
+to its Odometry message) and publishes its registered point cloud directly
+in ``world_frame``, so composing poses by hand from the Odometry message
+would only be correct for that one specific backbone/topology. Looking up
+``world_frame -> camera_frame`` and ``camera_frame -> <point cloud frame>``
+through the TF tree lets this node work with any upstream SLAM backbone and
+any (URDF, robot_state_publisher, or static_transform_publisher) source of
+the camera extrinsic -- see ``launch/semantic_mapping.launch.py`` for an
+optional static_transform_publisher covering the common fixed-extrinsic case.
 """
 from __future__ import annotations
 
 import numpy as np
 import rclpy
+import rclpy.time
+import tf2_ros
 import yaml
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
@@ -22,12 +36,7 @@ from std_msgs.msg import ColorRGBA, Header
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
-from semantic_mapping.geometry_utils import (
-    invert_se3,
-    rasterize_depth,
-    se3_from_translation_quaternion,
-    transform_points,
-)
+from semantic_mapping.geometry_utils import rasterize_depth, se3_from_translation_quaternion, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.serialization import serialize_frame
 from semantic_mapping.types import CameraIntrinsics, Observation, StampedPose
@@ -54,15 +63,14 @@ class SemanticMappingNode(Node):
         self._declare_parameters()
 
         self.world_frame = self._param_str("world_frame", "map")
+        self.camera_frame = self._param_str("camera_frame", "camera_color_optical_frame")
         self.prompts = self._load_prompts(self._param_str("prompts_file", "config/prompts.yaml"))
 
         self.pipeline = SemanticMappingPipeline(self._build_pipeline_config())
         self.detector = build_detector(self._param_str("detector", "offline"), **self._detector_kwargs())
 
-        translation = np.array(self.get_parameter("body_from_camera_extrinsics").value[:3], dtype=np.float64)
-        quaternion = np.array(self.get_parameter("body_from_camera_extrinsics").value[3:], dtype=np.float64)
-        self.T_body_from_cam = se3_from_translation_quaternion(translation, quaternion)
-        self.T_cam_from_body = invert_se3(self.T_body_from_cam)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.bridge = CvBridge()
         self._last_detector_stamp = -float("inf")
@@ -77,15 +85,20 @@ class SemanticMappingNode(Node):
         defaults: dict[str, object] = {
             "rgb_topic": "/camera/color/image_raw",
             "camera_info_topic": "/camera/color/camera_info",
-            "pointcloud_topic": "/lidar/points",
-            "odometry_topic": "/super_odometry/odometry",
+            # SuperOdometry's laser_mapping_node publishes its registered point
+            # cloud on "<PROJECT_NAME>/registered_scan" (empty project name by
+            # default) already expressed in world_frame; adjust if your
+            # deployment sets PROJECT_NAME or uses a different backbone.
+            "pointcloud_topic": "/registered_scan",
+            # SuperOdometry's laser_mapping_node publishes pose on
+            # "<PROJECT_NAME>/laser_odometry" (some example launch files remap
+            # this to "integrated_to_init"); adjust to match your launch setup.
+            "odometry_topic": "/laser_odometry",
             "obj_points_topic": "/obj_points",
             "obj_boxes_topic": "/obj_boxes",
             "annotated_image_topic": "/semantic_mapping/annotated_image",
             "world_frame": "map",
-            "body_frame": "base_link",
             "camera_frame": "camera_color_optical_frame",
-            "body_from_camera_extrinsics": [0.0, 0.0, 0.0, -0.5, 0.5, -0.5, 0.5],
             "sync_slop_sec": 0.05,
             "sync_queue_size": 30,
             "detector": "offline",
@@ -171,6 +184,22 @@ class SemanticMappingNode(Node):
     # ---------------------------------------------------------------- callback
     def _on_synced_frame(self, rgb_msg: Image, info_msg: CameraInfo, pc_msg: PointCloud2,
                           odom_msg: Odometry) -> None:
+        # odom_msg's own pose fields are not read directly: SuperOdometry (and
+        # any well-behaved SLAM backbone) also broadcasts the same pose as a
+        # dynamic TF transform, so resolving world_frame -> camera_frame (and
+        # <point cloud frame> -> camera_frame) through TF2 handles the full
+        # chain -- dynamic odometry composed with whatever static camera
+        # extrinsic is in the TF tree -- without this node hardcoding either.
+        # The message is still subscribed to keep the four-topic sync
+        # documented in the README and to pace processing at the SLAM
+        # backbone's pose-update rate.
+        try:
+            T_world_from_cam = self._lookup_se3(self.world_frame, self.camera_frame, rgb_msg.header.stamp)
+            T_cam_from_cloud = self._lookup_se3(self.camera_frame, pc_msg.header.frame_id, pc_msg.header.stamp)
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
+            return
+
         stamp = _stamp_to_seconds(rgb_msg.header.stamp)
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
@@ -179,26 +208,11 @@ class SemanticMappingNode(Node):
             width=info_msg.width, height=info_msg.height,
         )
 
-        body_translation = np.array([
-            odom_msg.pose.pose.position.x,
-            odom_msg.pose.pose.position.y,
-            odom_msg.pose.pose.position.z,
-        ])
-        body_quaternion = np.array([
-            odom_msg.pose.pose.orientation.x,
-            odom_msg.pose.pose.orientation.y,
-            odom_msg.pose.pose.orientation.z,
-            odom_msg.pose.pose.orientation.w,
-        ])
-        T_world_from_body = se3_from_translation_quaternion(body_translation, body_quaternion)
-        # Eq. (3): P_t = T_world_from_body * T_BC
-        T_world_from_cam = T_world_from_body @ self.T_body_from_cam
-
-        # The synchronized point cloud is expected pre-registered to body_frame
-        # by the upstream SLAM backbone; rasterize it into the camera frame to
-        # obtain the raw sensor depth D(u) used by geometric consistency.
-        points_body = self._read_pointcloud_xyz(pc_msg)
-        points_cam = transform_points(self.T_cam_from_body, points_body) if points_body.shape[0] else points_body
+        # Rasterize the synchronized point cloud into the camera frame to
+        # obtain the raw sensor depth D(u) needed by geometric consistency.
+        points_cloud_frame = self._read_pointcloud_xyz(pc_msg)
+        points_cam = transform_points(T_cam_from_cloud, points_cloud_frame) if points_cloud_frame.shape[0] \
+            else points_cloud_frame
         depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
 
         detections = []
@@ -217,6 +231,16 @@ class SemanticMappingNode(Node):
 
         result = self.pipeline.process_frame(observation)
         self._publish_result(result, rgb_msg.header)
+
+    def _lookup_se3(self, target_frame: str, source_frame: str, stamp) -> np.ndarray:
+        """4x4 SE(3) transform mapping ``source_frame``-expressed points/poses
+        into ``target_frame`` coordinates, per REP 105 TF2 lookup semantics.
+        """
+        tf = self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time.from_msg(stamp))
+        t, q = tf.transform.translation, tf.transform.rotation
+        return se3_from_translation_quaternion(
+            np.array([t.x, t.y, t.z]), np.array([q.x, q.y, q.z, q.w]),
+        )
 
     @staticmethod
     def _read_pointcloud_xyz(pc_msg: PointCloud2) -> np.ndarray:
