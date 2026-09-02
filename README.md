@@ -73,6 +73,19 @@ No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synth
 | boxes + masks | 0.97 | 0.96 | 9 / 9 | 0.86 |
 | boxes only (`--no_masks`) | 0.47 | 0.52 | 13 / 9 | 0.50 |
 
+`evaluate.py` also runs the paper's segmentation benchmark (Sec. V-B): map instances are transferred onto annotated points by nearest neighbour and scored with class-level mIoU / f-mIoU / accuracy, with and without background classes (Table II), and instance-level AP25 / AP50 per class (Table III). The synthetic scene ships annotated surfaces (`gt_points.npz`), so this runs offline too; the mask run above scores:
+
+| setting | mIoU | f-mIoU | Acc | mAP25 | mAP50 |
+|---|---|---|---|---|---|
+| without background | 0.996 | 0.996 | 0.996 | 1.000 | 1.000 |
+| with background (wall / floor / ceiling) | 0.609 | 0.090 | 0.096 | | |
+
+The "with background" gap is the map never predicting wall / floor / ceiling, the same effect visible in the paper's Table II. ScanNet scenes are read straight from the standard `SensReader` export plus the annotated mesh (`semantic_mapping/datasets_scannet.py`); vocabulary-to-class aliases and the background set live in `config/segmentation_eval.yaml`:
+
+```bash
+python examples/evaluate.py --data_dir scans/scene0000_00 --frame_skip 10 --detector groundingdino
+```
+
 Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--config <yaml>`, `--prompts <yaml>`, `--live` (rerun window).
 
 ## Run (live ROS2)

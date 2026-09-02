@@ -1,0 +1,30 @@
+# Settings for the Sec. V-B segmentation benchmark (examples/evaluate.py).
+#
+# A ground-truth point takes the label of the nearest map point within
+# max_distance (meters); farther points stay unlabeled and count as misses.
+max_distance: 0.1
+
+# Ground-truth classes excluded in the "without background" setting (Table II).
+background_classes: [wall, floor, ceiling]
+
+# Detector vocabulary -> ground-truth class name. Applied to both sides before
+# scoring, so a prompt and an annotation that mean the same thing compare
+# equal. The defaults fold common spellings onto ScanNet's NYU40 names.
+aliases:
+  refrigerator: refridgerator
+  fridge: refridgerator
+  couch: sofa
+  tv: television
+  monitor: television
+  bookcase: bookshelf
+  book shelf: bookshelf
+  night stand: nightstand
+  white board: whiteboard
+  bath tub: bathtub
+  trash can: otherprop
+  garbage can: otherprop
+
+# Restrict instance-level AP to these classes; empty = every class that has
+# ground-truth instances. Table III reports:
+#   instance_classes: [chair, window, refridgerator, sofa, door]
+instance_classes: []
