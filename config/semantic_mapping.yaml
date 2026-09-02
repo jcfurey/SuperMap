@@ -2,16 +2,12 @@ semantic_mapping_node:
   ros__parameters:
     # --- I/O topics -----------------------------------------------------
     # SuperMap consumes accurate pose/geometry from an upstream SLAM backbone
-    # (SuperOdometry, github.com/superxslam/SuperOdom) rather than estimating
-    # it itself; see Sec. IV-A. SuperOdometry's laser_mapping_node publishes
-    # its registered point cloud on "<PROJECT_NAME>/registered_scan" (already
-    # in world_frame) and its pose on "<PROJECT_NAME>/laser_odometry"
-    # (PROJECT_NAME is empty by default; some example launch files remap the
-    # pose topic to "integrated_to_init") -- adjust these to match your setup.
+    # rather than estimating it itself; see Sec. IV-A. Point these at whatever
+    # topics your SLAM stack publishes.
     rgb_topic: /camera/color/image_raw
     camera_info_topic: /camera/color/camera_info
-    pointcloud_topic: /registered_scan
-    odometry_topic: /laser_odometry
+    pointcloud_topic: /lidar/points
+    odometry_topic: /odometry
 
     obj_points_topic: /obj_points
     obj_boxes_topic: /obj_boxes
@@ -24,9 +20,8 @@ semantic_mapping_node:
     # cloud's own frame -> camera_frame extrinsic are resolved through TF2 at
     # runtime, not a fixed parameter here: this node expects the upstream SLAM
     # backbone to broadcast a dynamic world_frame -> sensor_frame TF transform
-    # (SuperOdometry's sensor_frame defaults to "sensor") and a static
-    # sensor_frame -> camera_frame extrinsic to be published by a URDF /
-    # robot_state_publisher, or by the optional static_transform_publisher
+    # and a static sensor_frame -> camera_frame extrinsic to be published by a
+    # URDF / robot_state_publisher, or by the optional static_transform_publisher
     # launch/semantic_mapping.launch.py includes (see its sensor_frame and
     # camera_extrinsics launch arguments).
 

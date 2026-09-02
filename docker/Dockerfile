@@ -23,7 +23,7 @@
 #     bash -lc "python3 examples/prepare_example_dataset.py && python3 examples/example.py"
 #
 # Run (live ROS2, GPU + host networking so DDS discovery reaches other
-# containers/nodes on the host, e.g. SuperOdometry -- see docker-compose.yml):
+# nodes/containers on the host, e.g. an upstream SLAM backbone):
 #   docker run --rm -it --gpus all --network host supermap/semantic_mapping
 
 ARG ROS_DISTRO=jazzy

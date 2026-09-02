@@ -1,19 +1,9 @@
-# Live-mode topology: semantic_mapping (this repo, ROS2 Jazzy) alongside the
-# upstream geometric SLAM backbone, SuperOdometry (ROS2 Humble). The two run
-# in separate containers/distros -- they only need to agree on the standard
-# message types (sensor_msgs, nav_msgs) they exchange over ROS2 DDS, not on a
-# shared ROS2 install, so this is the supported way to combine them.
-#
-# SuperOdometry is a separate project and is not vendored into this repo.
-# Before running, clone it next to this one (or point SUPERODOM_DIR at your
-# checkout):
-#   git clone https://github.com/superxslam/SuperOdom ../SuperOdom
+# Convenience wrapper around `docker build`/`docker run` for the semantic_mapping
+# image. Uses host networking, the standard way to let ROS2 DDS discovery work
+# when a separate upstream SLAM backbone node is also running on the host.
 #
 # Usage:
-#   SUPERODOM_DIR=../SuperOdom docker compose up --build
-#
-# Both services use host networking, the standard way to let ROS2 DDS
-# discovery work across containers without extra multicast configuration.
+#   docker compose up --build
 services:
   semantic_mapping:
     build:
@@ -32,16 +22,3 @@ services:
               count: 1
               capabilities: [gpu]
     command: ["ros2", "launch", "semantic_mapping", "semantic_mapping.launch.py"]
-
-  superodometry:
-    build:
-      context: ${SUPERODOM_DIR:-../SuperOdom}
-      dockerfile: ros2_humble_docker/Dockerfile
-    image: supermap/superodometry
-    network_mode: host
-    ipc: host
-    environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
-    # Replace with your sensor's launch file, e.g. livox_mid360.launch.py --
-    # see https://github.com/superxslam/SuperOdom for configuration.
-    command: ["bash", "-lc", "ros2 launch super_odometry livox_mid360.launch.py"]

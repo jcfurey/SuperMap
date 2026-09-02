@@ -34,8 +34,7 @@ def generate_launch_description() -> LaunchDescription:
 
     sensor_frame_arg = DeclareLaunchArgument(
         "sensor_frame", default_value="sensor",
-        description="TF frame the upstream SLAM backbone's dynamic world_frame transform targets "
-                     "(SuperOdometry's sensor_frame parameter defaults to 'sensor').",
+        description="TF frame the upstream SLAM backbone's dynamic world_frame transform targets.",
     )
     camera_frame_arg = DeclareLaunchArgument(
         "camera_frame", default_value="camera_color_optical_frame",

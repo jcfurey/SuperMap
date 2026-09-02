@@ -75,7 +75,7 @@ colcon build --packages-select semantic_mapping && source install/setup.bash
 ros2 launch semantic_mapping semantic_mapping.launch.py
 ```
 
-In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (e.g. [SuperOdometry](https://github.com/superxslam/SuperOdom), Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 rather than a fixed parameter, so a `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration).
+In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 rather than a fixed parameter, so a `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration).
 
 ## Docker
 
@@ -87,12 +87,7 @@ docker run --rm -it supermap/semantic_mapping:lite \
   bash -lc "python3 examples/prepare_example_dataset.py && python3 examples/example.py"       # offline demo, no GPU needed
 
 docker run --rm -it --gpus all --network host supermap/semantic_mapping                       # live ROS2 mode
-```
-
-SuperOdometry runs on ROS2 Humble (this package targets Jazzy per the Requirements above); they only need to agree on the standard message types they exchange over ROS2 DDS, not a shared ROS2 install. `docker-compose.yml` runs both together (see its header comment for the one-time `git clone` it expects next to this repo):
-
-```bash
-SUPERODOM_DIR=../SuperOdom docker compose up --build
+# or: docker compose up --build
 ```
 
 Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.

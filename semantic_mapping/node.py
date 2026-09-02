@@ -1,23 +1,23 @@
 """Live ROS2 entry point.
 
 Subscribes to synchronized RGB, CameraInfo, PointCloud2, and Odometry
-topics produced by an upstream geometric SLAM backbone (SuperOdometry, see
-Sec. IV-A), runs the asynchronous open-vocabulary detector at its own rate,
-and drives :class:`semantic_mapping.pipeline.SemanticMappingPipeline` on
-every synchronized frame. Publishes per-object voxels, labeled 3D boxes, and
-an annotated debug image, as documented in the project README.
+topics produced by an upstream geometric SLAM backbone (see Sec. IV-A),
+runs the asynchronous open-vocabulary detector at its own rate, and drives
+:class:`semantic_mapping.pipeline.SemanticMappingPipeline` on every
+synchronized frame. Publishes per-object voxels, labeled 3D boxes, and an
+annotated debug image, as documented in the project README.
 
 Camera/LiDAR extrinsics and the world-from-camera pose (Eq. 3) are resolved
-through TF2 rather than a single hardcoded extrinsic parameter: SuperOdometry
-broadcasts a dynamic ``world_frame -> sensor_frame`` transform (in addition
-to its Odometry message) and publishes its registered point cloud directly
-in ``world_frame``, so composing poses by hand from the Odometry message
-would only be correct for that one specific backbone/topology. Looking up
-``world_frame -> camera_frame`` and ``camera_frame -> <point cloud frame>``
-through the TF tree lets this node work with any upstream SLAM backbone and
-any (URDF, robot_state_publisher, or static_transform_publisher) source of
-the camera extrinsic -- see ``launch/semantic_mapping.launch.py`` for an
-optional static_transform_publisher covering the common fixed-extrinsic case.
+through TF2 rather than a single hardcoded extrinsic parameter: different
+SLAM backbones publish their point cloud in different frames (world-registered
+vs. sensor-frame) and provide the pose in different ways, so composing it by
+hand from the Odometry message would only be correct for one specific
+backbone/topology. Looking up ``world_frame -> camera_frame`` and
+``camera_frame -> <point cloud frame>`` through the TF tree instead works
+with any upstream SLAM backbone and any (URDF, robot_state_publisher, or
+static_transform_publisher) source of the camera extrinsic -- see
+``launch/semantic_mapping.launch.py`` for an optional
+static_transform_publisher covering the common fixed-extrinsic case.
 """
 from __future__ import annotations
 
@@ -85,15 +85,8 @@ class SemanticMappingNode(Node):
         defaults: dict[str, object] = {
             "rgb_topic": "/camera/color/image_raw",
             "camera_info_topic": "/camera/color/camera_info",
-            # SuperOdometry's laser_mapping_node publishes its registered point
-            # cloud on "<PROJECT_NAME>/registered_scan" (empty project name by
-            # default) already expressed in world_frame; adjust if your
-            # deployment sets PROJECT_NAME or uses a different backbone.
-            "pointcloud_topic": "/registered_scan",
-            # SuperOdometry's laser_mapping_node publishes pose on
-            # "<PROJECT_NAME>/laser_odometry" (some example launch files remap
-            # this to "integrated_to_init"); adjust to match your launch setup.
-            "odometry_topic": "/laser_odometry",
+            "pointcloud_topic": "/lidar/points",
+            "odometry_topic": "/odometry",
             "obj_points_topic": "/obj_points",
             "obj_boxes_topic": "/obj_boxes",
             "annotated_image_topic": "/semantic_mapping/annotated_image",
@@ -184,9 +177,9 @@ class SemanticMappingNode(Node):
     # ---------------------------------------------------------------- callback
     def _on_synced_frame(self, rgb_msg: Image, info_msg: CameraInfo, pc_msg: PointCloud2,
                           odom_msg: Odometry) -> None:
-        # odom_msg's own pose fields are not read directly: SuperOdometry (and
-        # any well-behaved SLAM backbone) also broadcasts the same pose as a
-        # dynamic TF transform, so resolving world_frame -> camera_frame (and
+        # odom_msg's own pose fields are not read directly: a well-behaved
+        # SLAM backbone also broadcasts the same pose as a dynamic TF
+        # transform, so resolving world_frame -> camera_frame (and
         # <point cloud frame> -> camera_frame) through TF2 handles the full
         # chain -- dynamic odometry composed with whatever static camera
         # extrinsic is in the TF tree -- without this node hardcoding either.
