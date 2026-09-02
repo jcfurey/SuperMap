@@ -53,6 +53,7 @@ class PipelineConfig:
     scene_graph_z_tolerance: float = 0.1
     scene_graph_xy_iou_threshold: float = 0.05
     scene_graph_beside_max_distance: float = 1.0
+    scene_graph_support_classes: list[str] = field(default_factory=lambda: list(sg.DEFAULT_SUPPORT_CLASSES))
     max_points_per_detection: int = 4000
 
     @classmethod
@@ -69,6 +70,10 @@ class PipelineConfig:
 class FrameResult:
     objects: list[ObjectInstance] = field(default_factory=list)
     scene_graph: sg.SceneGraph | None = None
+    detection_instance_ids: list[int] = field(default_factory=list)
+    """For each detection in the processed observation, the instance ID it was
+    fused into (matched, re-activated, or newly spawned), or -1 if it was
+    discarded (e.g. a low-confidence detection with no existing track)."""
 
 
 class SemanticMappingPipeline:
@@ -176,6 +181,7 @@ class SemanticMappingPipeline:
             candidate_objects=stage2.unmatched_tracks, candidate_detections=stage1.unmatched_detections,
         )
 
+        detection_instance_ids = [-1] * len(detections)
         for track_idx, det_idx in stage1.matches + stage2.matches:
             detection = detections[det_idx]
             updated_track = tracking.update(predicted_tracks[track_idx], detection.bbox)
@@ -183,11 +189,13 @@ class SemanticMappingPipeline:
                 live_objects[track_idx], updated_track, det_points[det_idx], detection,
                 observation.stamp, K, T_world_from_cam, observation.depth,
             )
+            detection_instance_ids[det_idx] = live_objects[track_idx].instance_id
         for track_idx, det_idx in stage3.matches:
             self.object_map.reactivate(
                 live_objects[track_idx], det_points[det_idx], detections[det_idx],
                 observation.stamp, K, T_world_from_cam, observation.depth,
             )
+            detection_instance_ids[det_idx] = live_objects[track_idx].instance_id
 
         for track_idx in stage3.unmatched_tracks:
             obj = live_objects[track_idx]
@@ -200,13 +208,18 @@ class SemanticMappingPipeline:
         # Only high-confidence detections may start a new object (ByteTrack).
         for det_idx in stage3.unmatched_detections:
             detection = detections[det_idx]
-            self.object_map.spawn(
+            spawned = self.object_map.spawn(
                 detection.bbox, det_points[det_idx], detection.label, detection.score, observation.stamp,
             )
+            detection_instance_ids[det_idx] = spawned.instance_id
 
         for obj in self.object_map.objects.values():
             self.object_map.confirm_tentative(obj, cfg.min_hits_to_confirm)
-        self.object_map.merge_duplicates(cfg.merge_iou_threshold, cfg.merge_distance_m)
+        merged = dict(
+            (dropped, kept)
+            for kept, dropped in self.object_map.merge_duplicates(cfg.merge_iou_threshold, cfg.merge_distance_m)
+        )
+        detection_instance_ids = [merged.get(i, i) for i in detection_instance_ids]
         for obj in self.object_map.objects.values():
             sg.record_trajectory_sample(obj, observation.stamp)
 
@@ -218,6 +231,11 @@ class SemanticMappingPipeline:
             z_tolerance=self.config.scene_graph_z_tolerance,
             xy_iou_threshold=self.config.scene_graph_xy_iou_threshold,
             beside_max_distance=self.config.scene_graph_beside_max_distance,
+            support_classes=self.config.scene_graph_support_classes,
         )
 
-        return FrameResult(objects=list(self.object_map.objects.values()), scene_graph=graph)
+        return FrameResult(
+            objects=list(self.object_map.objects.values()),
+            scene_graph=graph,
+            detection_instance_ids=detection_instance_ids,
+        )
