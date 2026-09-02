@@ -130,6 +130,17 @@ ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, 
 
 The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
 
+### Scaling to long deployments
+
+A two-hour run accumulates far more instances than the camera sees at any moment, so the per-frame cost has to follow the view rather than the map. One batched frustum test on every instance's 3D box decides which instances can be seen at all; the rest skip tracklet prediction, association, and the per-point evidence update for that frame (`cull_out_of_view`, on by default and equivalent in outcome, since an out-of-view point carries no evidence). Duplicate merging and scene-graph clustering draw their candidate pairs from a KD-tree, and scene-graph edges are cached per cluster and re-evaluated only when a member changed. Timing the map update on the 640x480 synthetic scene with the room's instances cloned far outside the view (this 4-core CPU sandbox):
+
+| instances | points | map update, culled | map update, exhaustive | full frame, culled |
+|---|---|---|---|---|
+| 7 | 9 k | 20 ms | 20 ms | 30 ms |
+| 77 | 102 k | 20 ms | 38 ms | 30 ms |
+| 357 | 472 k | 26 ms | 139 ms | 41 ms |
+| 707 | 934 k | 34 ms | 287 ms | 56 ms |
+
 ### Sparse LiDAR depth
 
 A LiDAR scan rasterized into the camera covers a few percent of the pixels, and a pixel without a reading carries no evidence for the consistency update and contributes no points when a detection is back-projected. Two settings address this: `depth_fill_radius_px` fills empty pixels from the nearest readings (the geometric evidence uses depth filled from all readings, while each detection is back-projected through depth filled only from readings inside its own mask, so background never leaks into an object), and `pointcloud_accumulate_scans` rasterizes the last N scans carried through TF. On the synthetic scene rendered LiDAR-like (`prepare_example_dataset.py --lidar_like`, 5% of pixels with 2 cm range noise):

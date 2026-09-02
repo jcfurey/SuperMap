@@ -1,7 +1,7 @@
 import numpy as np
 
 from semantic_mapping.pipeline import PipelineConfig, SemanticMappingPipeline
-from semantic_mapping.types import CameraIntrinsics, Detection2D, Observation, StampedPose
+from semantic_mapping.types import CameraIntrinsics, Detection2D, ObjectStatus, Observation, StampedPose
 
 K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
 INTRINSICS = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0, width=160, height=120)
@@ -145,3 +145,31 @@ def test_depth_fill_recovers_points_and_change_detection_from_sparse_depth():
     assert filled_points > 2 * sparse_points          # most of the silhouette back (voxel grid caps the count)
     assert filled_status == "disappeared"             # filled pixels carry free-space evidence for every point
     assert sparse_status == "disappeared"             # the sampled 5% still contradict enough points over 40 frames
+
+
+def test_culling_leaves_the_map_identical_when_an_object_leaves_and_re_enters_the_view():
+    looking_away = np.eye(4)
+    looking_away[:3, :3] = np.diag([-1.0, 1.0, -1.0])  # camera turned 180 degrees: the object is behind it
+
+    def frames():
+        for i in range(5):
+            yield _observation(i * 0.1, 2.0, True)
+        for i in range(5, 15):
+            obs = _observation(i * 0.1, 8.0, False)
+            obs.pose = StampedPose(stamp=obs.stamp, T_world_from_frame=looking_away)
+            yield obs
+        for i in range(15, 20):
+            yield _observation(i * 0.1, 2.0, True)
+
+    final = {}
+    for cull in (True, False):
+        pipeline = SemanticMappingPipeline(PipelineConfig(min_hits_to_confirm=2, cull_out_of_view=cull))
+        for obs in frames():
+            result = pipeline.process_frame(obs)
+        final[cull] = result.objects
+
+    assert [o.instance_id for o in final[True]] == [o.instance_id for o in final[False]] == [1]
+    a, b = final[True][0], final[False][0]
+    assert (a.status, a.hits, a.frames_since_seen) == (b.status, b.hits, b.frames_since_seen) == (ObjectStatus.ACTIVE, 10, 0)
+    np.testing.assert_array_equal(a.point_log_odds, b.point_log_odds)
+    np.testing.assert_allclose(a.bbox3d, b.bbox3d)

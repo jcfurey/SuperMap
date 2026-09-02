@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from semantic_mapping.geometry_utils import iou_xy
 from semantic_mapping.types import ObjectInstance, ObjectStatus
@@ -38,15 +39,17 @@ def _cluster_by_centroid(objects: list[ObjectInstance], cluster_radius: float) -
     clusters rather than over every object pair.
     """
     n = len(objects)
-    centers = np.array([obj.center for obj in objects]) if n else np.zeros((0, 3))
+    if n == 0:
+        return []
+    centers = np.array([obj.center for obj in objects])
+    tree = cKDTree(centers)
     assigned = np.zeros(n, dtype=bool)
     clusters: list[list[int]] = []
 
     for i in range(n):
         if assigned[i]:
             continue
-        distances = np.linalg.norm(centers - centers[i], axis=1)
-        members = np.nonzero((distances <= cluster_radius) & ~assigned)[0].tolist()
+        members = sorted(int(j) for j in tree.query_ball_point(centers[i], cluster_radius) if not assigned[j])
         assigned[members] = True
         clusters.append(members)
 
@@ -84,6 +87,52 @@ DEFAULT_SUPPORT_CLASSES: tuple[str, ...] = (
 supports."""
 
 
+class SpatialEdgeCache:
+    """Remembers each cluster's edges keyed by what the predicates depend on.
+
+    Objects that were not touched this frame keep the same box and label, so
+    a cluster whose members are all unchanged yields exactly the edges it
+    yielded last time. Re-evaluating only clusters with a changed member
+    keeps graph construction proportional to what moved, not to map size.
+    """
+
+    def __init__(self) -> None:
+        self._edges: dict[tuple, list[SpatialEdge]] = {}
+
+    @staticmethod
+    def signature(objects: list[ObjectInstance], members: list[int]) -> tuple:
+        return tuple(
+            (objects[i].instance_id, objects[i].label, tuple(np.round(objects[i].bbox3d, 4).tolist())) for i in members
+        )
+
+    def get(self, key: tuple) -> list[SpatialEdge] | None:
+        return self._edges.get(key)
+
+    def put(self, key: tuple, edges: list[SpatialEdge]) -> None:
+        self._edges[key] = edges
+
+    def retain(self, keys: set[tuple]) -> None:
+        """Drop entries for clusters that no longer exist."""
+        self._edges = {k: v for k, v in self._edges.items() if k in keys}
+
+
+def _cluster_edges(objects, members, z_tolerance, xy_iou_threshold, beside_max_distance, supports) -> list[SpatialEdge]:
+    edges: list[SpatialEdge] = []
+    for i in members:
+        for j in members:
+            if i == j:
+                continue
+            a, b = objects[i], objects[j]
+            can_support = supports is None or b.label in supports
+            if can_support and _on_predicate(a, b, z_tolerance, xy_iou_threshold):
+                edges.append(SpatialEdge(a.instance_id, "on", b.instance_id))
+                edges.append(SpatialEdge(b.instance_id, "under", a.instance_id))
+            elif i < j and _beside_predicate(a, b, z_tolerance, xy_iou_threshold, beside_max_distance):
+                edges.append(SpatialEdge(a.instance_id, "beside", b.instance_id))
+                edges.append(SpatialEdge(b.instance_id, "beside", a.instance_id))
+    return edges
+
+
 def build_spatial_edges(
     objects: list[ObjectInstance],
     cluster_radius: float = 2.0,
@@ -91,31 +140,35 @@ def build_spatial_edges(
     xy_iou_threshold: float = 0.05,
     beside_max_distance: float = 1.0,
     support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
+    cache: SpatialEdgeCache | None = None,
 ) -> list[SpatialEdge]:
     """Evaluate class-dependent geometric predicates within centroid clusters.
 
     Emits ``on`` (A on B, with B's class in ``support_classes``; pass an empty
     collection to make it purely geometric), its inverse ``under`` (B under
-    A), and symmetric ``beside`` edges.
+    A), and symmetric ``beside`` edges. With a ``cache``, clusters whose
+    members are unchanged since the last call reuse their edges.
     """
     edges: list[SpatialEdge] = []
     clusters = _cluster_by_centroid(objects, cluster_radius)
     supports = set(support_classes) if support_classes else None
+    keys: set[tuple] = set()
 
     for members in clusters:
-        for i in members:
-            for j in members:
-                if i == j:
-                    continue
-                a, b = objects[i], objects[j]
-                can_support = supports is None or b.label in supports
-                if can_support and _on_predicate(a, b, z_tolerance, xy_iou_threshold):
-                    edges.append(SpatialEdge(a.instance_id, "on", b.instance_id))
-                    edges.append(SpatialEdge(b.instance_id, "under", a.instance_id))
-                elif i < j and _beside_predicate(a, b, z_tolerance, xy_iou_threshold, beside_max_distance):
-                    edges.append(SpatialEdge(a.instance_id, "beside", b.instance_id))
-                    edges.append(SpatialEdge(b.instance_id, "beside", a.instance_id))
+        if len(members) < 2:
+            continue
+        key = SpatialEdgeCache.signature(objects, members) if cache is not None else None
+        cluster_edges = cache.get(key) if cache is not None else None
+        if cluster_edges is None:
+            cluster_edges = _cluster_edges(objects, members, z_tolerance, xy_iou_threshold, beside_max_distance, supports)
+            if cache is not None:
+                cache.put(key, cluster_edges)
+        if cache is not None:
+            keys.add(key)
+        edges.extend(cluster_edges)
 
+    if cache is not None:
+        cache.retain(keys)
     return edges
 
 
@@ -151,6 +204,7 @@ def build_scene_graph(
     node_statuses: tuple[ObjectStatus, ...] = (ObjectStatus.ACTIVE, ObjectStatus.OCCLUDED, ObjectStatus.DISAPPEARED),
     edge_statuses: tuple[ObjectStatus, ...] = (ObjectStatus.ACTIVE, ObjectStatus.OCCLUDED),
     support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
+    cache: SpatialEdgeCache | None = None,
 ) -> SceneGraph:
     """Build G = (V, E_s, E_t) from the current map state.
 
@@ -167,5 +221,6 @@ def build_scene_graph(
     edge_eligible = [obj for obj in nodes if obj.status in edge_statuses]
     spatial_edges = build_spatial_edges(
         edge_eligible, cluster_radius, z_tolerance, xy_iou_threshold, beside_max_distance, support_classes,
+        cache=cache,
     )
     return SceneGraph(node_ids=[obj.instance_id for obj in nodes], spatial_edges=spatial_edges)

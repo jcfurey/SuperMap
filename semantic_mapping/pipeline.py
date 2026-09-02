@@ -62,6 +62,10 @@ class PipelineConfig:
     size_prior_weight: float = 0.0
     """How far the predicted 2D box size follows the projected, image-clipped
     3D box (0 = Kalman size only, 1 = projection only); see tracking.predict."""
+    cull_out_of_view: bool = True
+    """Skip the per-point geometric update for instances whose 3D box lies
+    entirely outside the current view (ObjectMap.may_be_in_view)."""
+
     depth_fill_radius_px: int = 0
     """Fill pixels without a depth reading from valid neighbours within this
     radius (geometry_utils.fill_sparse_depth). 0 for dense depth sources; 2-3
@@ -113,8 +117,10 @@ class SemanticMappingPipeline:
             min_label_confidence=self.config.min_label_confidence,
             min_observations_for_confidence_check=self.config.min_observations_for_confidence_check,
             tentative_max_age=self.config.tentative_max_age,
+            cull_out_of_view=self.config.cull_out_of_view,
         )
         self._frame_index = 0
+        self._edge_cache = sg.SpatialEdgeCache()
 
     # ------------------------------------------------------------ persistence
     def save(self, path: str | Path, metadata: dict | None = None) -> Path:
@@ -201,9 +207,24 @@ class SemanticMappingPipeline:
         ]
 
         image_size = (observation.intrinsics.width, observation.intrinsics.height)
+        # One batched frustum test decides which instances can be seen at all;
+        # the rest skip prediction, association, and per-point evidence this
+        # frame, so the update cost follows the view, not the map size.
+        in_view = np.ones(len(live_objects), dtype=bool)
+        if cfg.cull_out_of_view and live_objects:
+            has_points = np.array([o.points_world.shape[0] > 0 for o in live_objects])
+            boxes = np.array([o.bbox3d for o in live_objects], dtype=np.float64).reshape(-1, 6)
+            in_view = ~has_points | self.object_map.boxes_in_view(
+                boxes, K, T_world_from_cam, (image_size[1], image_size[0]))
+        visible_indices = [i for i, flag in enumerate(in_view) if flag]
+
         predicted_tracks: list[tracking.TrackKalmanState] = []
         predicted_bboxes: list[np.ndarray] = []
-        for obj in live_objects:
+        for obj, flag in zip(live_objects, in_view):
+            if not flag:
+                predicted_tracks.append(obj.track)
+                predicted_bboxes.append(tracking.current_bbox(obj.track))
+                continue
             dt = max(observation.stamp - obj.latest_stamp, 1e-3)
             predicted = tracking.predict(
                 obj.track, dt, K=K, T_world_from_cam=T_world_from_cam, object_centroid_world=obj.center,
@@ -236,7 +257,8 @@ class SemanticMappingPipeline:
         # Stage 1: 2D, high-confidence detections, gated.
         stage1 = association.associate(
             predicted_tracks, predicted_bboxes, detection_bboxes,
-            iou_threshold=cfg.association_iou_threshold, candidate_detections=high,
+            iou_threshold=cfg.association_iou_threshold, candidate_tracks=visible_indices,
+            candidate_detections=high,
         )
         # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no gate.
         stage2 = association.associate(
@@ -276,6 +298,12 @@ class SemanticMappingPipeline:
                 self.object_map.update_unmatched(obj, K, T_world_from_cam, evidence_depth)
             else:
                 obj.frames_since_seen += 1
+        for track_idx in np.nonzero(~in_view)[0]:
+            obj = live_objects[track_idx]
+            if depth is not None:
+                self.object_map.update_unmatched(obj, K, T_world_from_cam, evidence_depth, in_view=False)
+            else:
+                obj.frames_since_seen += 1
 
         # Only high-confidence detections may start a new object (ByteTrack).
         for det_idx in stage3.unmatched_detections:
@@ -305,6 +333,7 @@ class SemanticMappingPipeline:
             xy_iou_threshold=self.config.scene_graph_xy_iou_threshold,
             beside_max_distance=self.config.scene_graph_beside_max_distance,
             support_classes=self.config.scene_graph_support_classes,
+            cache=self._edge_cache,
         )
 
         t_graph = time.perf_counter()

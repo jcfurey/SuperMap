@@ -188,3 +188,71 @@ def test_bbox_is_padded_by_half_voxel_so_single_face_views_have_volume():
     obj = m.spawn(np.array([0.0, 0.0, 10.0, 10.0]), np.array([[0.0, 0.0, 1.0], [0.0, 0.5, 1.5]]), "chair", 0.9, 0.0)
     dims = obj.bbox3d[3:] - obj.bbox3d[:3]
     assert np.allclose(dims, [0.1, 0.6, 0.6])
+
+
+def _plane_instance(object_map, instance_id, label, x_center, depth_m):
+    """A 0.4 m square of points facing the camera at z = depth_m (camera at the origin looking +z)."""
+    xs, ys = np.meshgrid(np.linspace(-0.2, 0.2, 9), np.linspace(-0.2, 0.2, 9))
+    points = np.stack([xs.ravel() + x_center, ys.ravel(), np.full(xs.size, depth_m)], axis=1)
+    obj = object_map.spawn(np.array([0.0, 0.0, 10.0, 10.0]), points, label, 0.9, stamp=0.0)
+    obj.status = ObjectStatus.ACTIVE
+    assert obj.instance_id == instance_id
+    return obj
+
+
+def test_out_of_view_instances_get_no_evidence_and_culling_is_equivalent():
+    import copy
+
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    depth = np.full((120, 160), 8.0)  # surface far behind every object: free-space evidence for what is in view
+    results = {}
+    for cull in (True, False):
+        object_map = ObjectMap(cull_out_of_view=cull)
+        in_view = _plane_instance(object_map, 1, "box", 0.0, 2.0)
+        far_right = _plane_instance(object_map, 2, "box", 5.0, 2.0)   # projects far outside the 160 px image
+        behind = _plane_instance(object_map, 3, "box", 0.0, -2.0)     # behind the camera
+        for obj in (in_view, far_right, behind):
+            object_map.update_unmatched(obj, K, np.eye(4), depth)
+        results[cull] = copy.deepcopy(object_map.objects)
+
+    for instance_id in (1, 2, 3):
+        a, b = results[True][instance_id], results[False][instance_id]
+        np.testing.assert_array_equal(a.point_log_odds, b.point_log_odds)
+        assert a.status == b.status and a.points_contradicted == b.points_contradicted
+    assert np.all(results[True][1].point_log_odds < 0)          # in view: contradicted by the far surface
+    assert np.all(results[True][2].point_log_odds == 0)         # out of view: untouched
+    assert np.all(results[True][3].point_log_odds == 0)
+
+
+def test_may_be_in_view_keeps_boxes_straddling_the_camera_plane():
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    assert ObjectMap.may_be_in_view(np.array([-0.5, -0.5, 1.0, 0.5, 0.5, 2.0]), K, np.eye(4), (120, 160))
+    assert not ObjectMap.may_be_in_view(np.array([5.0, -0.5, 1.0, 6.0, 0.5, 2.0]), K, np.eye(4), (120, 160))
+    assert not ObjectMap.may_be_in_view(np.array([-0.5, -0.5, -3.0, 0.5, 0.5, -2.0]), K, np.eye(4), (120, 160))
+    assert ObjectMap.may_be_in_view(np.array([-0.5, -0.5, -1.0, 0.5, 0.5, 1.0]), K, np.eye(4), (120, 160))
+
+
+def test_merge_duplicates_kdtree_candidates_match_exhaustive_pairs():
+    object_map = ObjectMap()
+    rng = np.random.default_rng(1)
+    expected_drops = []
+    next_id = 1
+    for gx in range(6):
+        for gy in range(5):
+            base = np.array([3.0 * gx, 3.0 * gy, 0.0])
+            points = base + rng.uniform(0.0, 0.5, size=(30, 3))
+            obj = object_map.spawn(np.array([0, 0, 10, 10.0]), points, "crate", 0.9, 0.0)
+            obj.status = ObjectStatus.ACTIVE
+            next_id += 1
+    live = sorted(object_map.objects.values(), key=lambda o: o.instance_id)
+    for keep in live[:5]:  # five same-label duplicates, slightly offset: must merge into the older ID
+        dup = object_map.spawn(np.array([0, 0, 10, 10.0]), keep.points_world + 0.03, "crate", 0.9, 1.0)
+        dup.status = ObjectStatus.ACTIVE
+        expected_drops.append((keep.instance_id, dup.instance_id))
+    for keep in live[5:8]:  # three overlapping instances with a different label: never merged
+        other = object_map.spawn(np.array([0, 0, 10, 10.0]), keep.points_world + 0.03, "barrel", 0.9, 1.0)
+        other.status = ObjectStatus.ACTIVE
+
+    merged = object_map.merge_duplicates(iou_threshold=0.3, distance_threshold=0.25)
+    assert sorted(merged) == sorted(expected_drops)
+    assert len(object_map.objects) == 30 + 3
