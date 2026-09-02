@@ -89,6 +89,8 @@ semantic_mapping_node:
     scene_graph_support_classes: [table, desk, shelf, counter, countertop, cabinet, dresser, nightstand,
                                   bed, sofa, couch, bench, stool, chair, cart, box, floor]
 
+    size_prior_weight: 0.0                 # 2D box size: 0 = Kalman only, 1 = projected 3D box (visible part)
+
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
 
     # --- Language grounding (Sec. IV-D) ----------------------------------
@@ -112,3 +114,13 @@ semantic_mapping_node:
       api_key_env: ""
       local_radius_m: 0.0  # > 0: serialize only objects within this distance of the robot (local subgraph)
       max_objects: 0       # > 0: cap the number of serialized objects (nearest first)
+
+    # --- Persistence (living memory across sessions) ----------------------
+    # map_load_path: restore a saved map at startup. Restored objects resume
+    # as "occluded" until re-observed; their IDs, points, labels, and
+    # histories carry over, and new IDs continue from the saved counter.
+    # map_save_path: where the ~/save_map service and autosave write
+    # (~/load_map reads map_load_path, falling back to map_save_path).
+    map_load_path: ""
+    map_save_path: ""
+    map_autosave_sec: 0.0    # > 0: save to map_save_path every N seconds
