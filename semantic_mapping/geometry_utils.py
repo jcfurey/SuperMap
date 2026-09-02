@@ -113,6 +113,29 @@ def project_point(K: Array, T_world_to_cam: Array, point_world: Array) -> tuple[
     return pixels[0], float(depths[0])
 
 
+def project_bbox3d(K: Array, T_world_to_cam: Array, bbox3d: Array) -> tuple[Array, float]:
+    """Project a world-frame axis-aligned box into the image.
+
+    Returns the [x1, y1, x2, y2] envelope of the eight projected corners and
+    the smallest corner depth; a non-positive depth means part of the box is
+    behind the camera and the envelope is not meaningful.
+    """
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox3d
+    corners = np.array([[x, y, z] for x in (xmin, xmax) for y in (ymin, ymax) for z in (zmin, zmax)])
+    pixels, depths = project_points(K, T_world_to_cam, corners)
+    box = np.array([pixels[:, 0].min(), pixels[:, 1].min(), pixels[:, 0].max(), pixels[:, 1].max()])
+    return box, float(depths.min())
+
+
+def clip_bbox_to_image(bbox: Array, width: int, height: int) -> Array | None:
+    """Intersect an [x1, y1, x2, y2] box with the image; None when nothing is left."""
+    x1, y1 = max(float(bbox[0]), 0.0), max(float(bbox[1]), 0.0)
+    x2, y2 = min(float(bbox[2]), float(width)), min(float(bbox[3]), float(height))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return np.array([x1, y1, x2, y2], dtype=np.float64)
+
+
 def back_project_depth(K: Array, depth: Array, mask: Array | None = None) -> Array:
     """Back-project a depth image (or masked subset) into the camera frame.
 

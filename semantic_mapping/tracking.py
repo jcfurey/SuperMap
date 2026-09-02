@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from semantic_mapping.geometry_utils import invert_se3, project_point
+from semantic_mapping.geometry_utils import centroid, clip_bbox_to_image, invert_se3, project_bbox3d, project_point
 from semantic_mapping.types import TrackKalmanState
 
 # State layout: [cx, cy, w, h, vx, vy]
@@ -83,15 +83,27 @@ def predict(
     K: np.ndarray | None = None,
     T_world_from_cam: np.ndarray | None = None,
     object_centroid_world: np.ndarray | None = None,
+    object_bbox3d_world: np.ndarray | None = None,
+    image_size: tuple[int, int] | None = None,
     projection_prior_weight: float = 1.0,
+    size_prior_weight: float = 0.0,
 ) -> TrackKalmanState:
     """Predict the tracklet forward by ``dt``, implementing Eq. (5)-(6).
 
-    When camera intrinsics/pose and the object's current 3D centroid are
-    available, the predicted image centroid is replaced (or blended, via
+    When camera intrinsics/pose and the object's 3D state are available, the
+    predicted image centroid is replaced (or blended, via
     ``projection_prior_weight`` in [0, 1]) by the re-projection
     c_hat_i(t) = pi(K * P_t^-1 * X_i), which remains valid under aggressive
     ego-motion where a linear image-plane velocity model would fail.
+
+    Given the object's 3D box (``object_bbox3d_world``) and the image size,
+    the prior is the centre of the projected box's *visible* part rather
+    than the projected centroid: a detector boxes only what is inside the
+    frame, so for an object cut by the image border the two differ by up to
+    half the object's width, enough to hand its detection to a neighbour.
+    ``size_prior_weight`` optionally blends the box size toward the visible
+    projected extent as well. Falls back to the centroid projection when the
+    box has corners behind the camera or lies entirely outside the image.
     """
     F = transition_matrix(dt)
     Q = process_noise(max(dt, 1e-3))
@@ -99,13 +111,27 @@ def predict(
     predicted_state = F @ track.state
     predicted_covariance = F @ track.covariance @ F.T + Q
 
+    if object_centroid_world is None and object_bbox3d_world is not None:
+        object_centroid_world = centroid(object_bbox3d_world)
+
     if K is not None and T_world_from_cam is not None and object_centroid_world is not None:
         T_cam_from_world = invert_se3(T_world_from_cam)
-        pixel, depth = project_point(K, T_cam_from_world, object_centroid_world)
-        if depth > 0:
+        prior: np.ndarray | None = None  # [cx, cy, w, h] of the (visible) projected object
+        if object_bbox3d_world is not None:
+            box2d, min_depth = project_bbox3d(K, T_cam_from_world, object_bbox3d_world)
+            if min_depth > 0:
+                visible = clip_bbox_to_image(box2d, *image_size) if image_size is not None else box2d
+                if visible is not None:
+                    prior = bbox_to_measurement(visible)
+        if prior is None:
+            pixel, depth = project_point(K, T_cam_from_world, object_centroid_world)
+            if depth > 0:
+                prior = np.array([pixel[0], pixel[1], predicted_state[2], predicted_state[3]])
+        if prior is not None:
             w = float(np.clip(projection_prior_weight, 0.0, 1.0))
-            predicted_state[0] = (1 - w) * predicted_state[0] + w * pixel[0]
-            predicted_state[1] = (1 - w) * predicted_state[1] + w * pixel[1]
+            s = float(np.clip(size_prior_weight, 0.0, 1.0))
+            predicted_state[0:2] = (1 - w) * predicted_state[0:2] + w * prior[0:2]
+            predicted_state[2:4] = (1 - s) * predicted_state[2:4] + s * prior[2:4]
 
     return TrackKalmanState(state=predicted_state, covariance=predicted_covariance)
 

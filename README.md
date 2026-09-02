@@ -71,7 +71,7 @@ No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synth
 | detections | detection recall | change recall | instance IDs / objects | final-map F1 |
 |---|---|---|---|---|
 | boxes + masks | 0.97 | 0.96 | 9 / 9 | 0.86 |
-| boxes only (`--no_masks`) | 0.47 | 0.52 | 13 / 9 | 0.50 |
+| boxes only (`--no_masks`) | 0.47 | 0.52 | 14 / 9 | 0.53 |
 
 `evaluate.py` also runs the paper's segmentation benchmark (Sec. V-B): map instances are transferred onto annotated points by nearest neighbour and scored with class-level mIoU / f-mIoU / accuracy, with and without background classes (Table II), and instance-level AP25 / AP50 per class (Table III). The synthetic scene ships annotated surfaces (`gt_points.npz`), so this runs offline too; the mask run above scores:
 
@@ -127,6 +127,20 @@ ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, 
 ```
 
 The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
+
+### Persist the map (living memory across sessions)
+
+The complete map state (per-instance points with their geometric and membership evidence, label beliefs, lifecycle status, timestamps, trajectories, and the ID counter) can be written to disk and restored, so a robot starts a session knowing what it mapped last time:
+
+```bash
+python examples/example.py --save_map data/office_map                       # offline: write the final map
+python examples/example.py --load_map data/office_map --save_map data/office_map   # continue from it
+
+ros2 launch semantic_mapping semantic_mapping.launch.py map_load_path:=/maps/office map_save_path:=/maps/office
+ros2 service call /semantic_mapping_node/save_map std_srvs/srv/Trigger     # or set map_autosave_sec
+```
+
+Restored instances resume as *occluded* with a reset 2D tracklet (a tracklet is camera-relative and meaningless after a restart); re-observation runs through the 3D re-activation stage like any object that left the field of view, and the geometric-consistency update retires objects that are gone. New instances keep counting from the saved ID counter, so IDs recorded by downstream consumers stay unique. Format: `map.json` + `map_arrays.npz` (`semantic_mapping/persistence.py`).
 
 Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
 

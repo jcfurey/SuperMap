@@ -11,13 +11,15 @@ back the updated map and scene graph.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
+from pathlib import Path
 
 import numpy as np
 
-from semantic_mapping import association, scene_graph as sg, tracking
+from semantic_mapping import association, persistence, scene_graph as sg, tracking
 from semantic_mapping.geometry_utils import (
     back_project_depth,
     bbox3d_from_points,
+    clip_bbox_to_image,
     depth_consistency_mask,
     transform_points,
 )
@@ -55,6 +57,9 @@ class PipelineConfig:
     scene_graph_beside_max_distance: float = 1.0
     scene_graph_support_classes: list[str] = field(default_factory=lambda: list(sg.DEFAULT_SUPPORT_CLASSES))
     max_points_per_detection: int = 4000
+    size_prior_weight: float = 0.0
+    """How far the predicted 2D box size follows the projected, image-clipped
+    3D box (0 = Kalman size only, 1 = projection only); see tracking.predict."""
 
     @classmethod
     def from_dict(cls, params: dict) -> "PipelineConfig":
@@ -97,6 +102,24 @@ class SemanticMappingPipeline:
         )
         self._frame_index = 0
 
+    # ------------------------------------------------------------ persistence
+    def save(self, path: str | Path, metadata: dict | None = None) -> Path:
+        """Write the current map M_t to a directory (see :mod:`semantic_mapping.persistence`)."""
+        return persistence.save_map(
+            self.object_map, path, metadata={"frame_index": self._frame_index, **(metadata or {})},
+        )
+
+    def load(self, path: str | Path, resume: bool = True) -> dict:
+        """Replace the current map with a saved one and continue from it.
+
+        Instance IDs keep counting from where the saved session stopped, so
+        histories recorded by downstream consumers stay valid. Returns the
+        saved header.
+        """
+        header = persistence.load_map(path, self.object_map, resume=resume)
+        self._frame_index = int(header.get("metadata", {}).get("frame_index", 0))
+        return header
+
     def _detection_points_world(
         self, detection: Detection2D, depth: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
     ) -> np.ndarray:
@@ -138,15 +161,21 @@ class SemanticMappingPipeline:
             obj for obj in self.object_map.objects.values() if obj.status != ObjectStatus.DISAPPEARED
         ]
 
+        image_size = (observation.intrinsics.width, observation.intrinsics.height)
         predicted_tracks: list[tracking.TrackKalmanState] = []
         predicted_bboxes: list[np.ndarray] = []
         for obj in live_objects:
             dt = max(observation.stamp - obj.latest_stamp, 1e-3)
             predicted = tracking.predict(
                 obj.track, dt, K=K, T_world_from_cam=T_world_from_cam, object_centroid_world=obj.center,
+                object_bbox3d_world=obj.bbox3d if obj.points_world.shape[0] > 0 else None,
+                image_size=image_size, size_prior_weight=cfg.size_prior_weight,
             )
             predicted_tracks.append(predicted)
-            predicted_bboxes.append(tracking.current_bbox(predicted))
+            # Detections never extend past the frame, so score the prediction's visible part.
+            bbox = tracking.current_bbox(predicted)
+            visible = clip_bbox_to_image(bbox, *image_size)
+            predicted_bboxes.append(bbox if visible is None else visible)
 
         # Back-project every detection once; the 3D boxes feed the re-activation
         # stage, the points feed whichever instance the detection ends up in.

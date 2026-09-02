@@ -57,6 +57,15 @@ def generate_launch_description() -> LaunchDescription:
     camera_qz_arg = DeclareLaunchArgument("camera_qz", default_value="-0.5")
     camera_qw_arg = DeclareLaunchArgument("camera_qw", default_value="0.5")
 
+    map_load_path_arg = DeclareLaunchArgument(
+        "map_load_path", default_value="",
+        description="Directory of a saved map to restore at startup (empty: start from an empty map).",
+    )
+    map_save_path_arg = DeclareLaunchArgument(
+        "map_save_path", default_value="",
+        description="Directory the ~/save_map service and autosave write the map to (empty: disabled).",
+    )
+
     static_camera_tf_node = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
@@ -86,6 +95,8 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "prompts_file": LaunchConfiguration("prompts_file"),
                 "camera_frame": LaunchConfiguration("camera_frame"),
+                "map_load_path": LaunchConfiguration("map_load_path"),
+                "map_save_path": LaunchConfiguration("map_save_path"),
             },
         ],
     )
@@ -95,5 +106,6 @@ def generate_launch_description() -> LaunchDescription:
         sensor_frame_arg, camera_frame_arg, publish_static_camera_tf_arg,
         camera_x_arg, camera_y_arg, camera_z_arg,
         camera_qx_arg, camera_qy_arg, camera_qz_arg, camera_qw_arg,
+        map_load_path_arg, map_save_path_arg,
         static_camera_tf_node, node,
     ])

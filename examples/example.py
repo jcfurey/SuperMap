@@ -6,7 +6,8 @@
     python examples/evaluate.py                  # score it with the paper's metrics (Sec. V-D/V-E)
 
 Options: --detector yoloe|offline|groundingdino, --data_dir <path>, --config <yaml>,
---prompts <yaml>, --live (rerun window).
+--prompts <yaml>, --live (rerun window), --load_map <dir> / --save_map <dir> (persist the
+map across runs; see semantic_mapping/persistence.py).
 """
 from __future__ import annotations
 
@@ -61,6 +62,8 @@ def main() -> None:
     parser.add_argument("--config", default="config/semantic_mapping.yaml")
     parser.add_argument("--prompts", default="config/prompts.yaml")
     parser.add_argument("--live", action="store_true", help="Open a Rerun window to visualize the map live.")
+    parser.add_argument("--load_map", default=None, help="Start from a map saved by --save_map.")
+    parser.add_argument("--save_map", default=None, help="Write the final map to this directory.")
     args = parser.parse_args()
 
     dataset = SequenceDataset(args.data_dir)
@@ -73,6 +76,10 @@ def main() -> None:
         detector = build_detector(args.detector, **params.get(args.detector, {}))
 
     pipeline = SemanticMappingPipeline(PipelineConfig.from_dict(params))
+    if args.load_map:
+        header = pipeline.load(args.load_map)
+        print(f"Restored {header['num_instances']} instances from {args.load_map} "
+              f"(next instance id {pipeline.object_map._next_id})")
     rr = _maybe_init_rerun(args.live)
 
     result = None
@@ -85,6 +92,8 @@ def main() -> None:
             _log_to_rerun(rr, frame.stamp, result)
 
     print(f"\nProcessed {len(dataset)} frames.")
+    if args.save_map:
+        print(f"Saved {len(pipeline.object_map.objects)} instances to {pipeline.save(args.save_map)}")
     if result is None:
         return
 

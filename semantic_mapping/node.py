@@ -38,6 +38,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import ColorRGBA, Header, String
+from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
@@ -113,6 +114,17 @@ class SemanticMappingNode(Node):
         self._grounding_thread = threading.Thread(target=self._grounding_loop, name="grounding", daemon=True)
         self._grounding_thread.start()
 
+        # Persistence: restore yesterday's memory, keep today's on disk.
+        self.map_save_path = self._param_str("map_save_path", "")
+        load_path = self._param_str("map_load_path", "")
+        if load_path:
+            self.get_logger().info(self._load_map(load_path))
+        autosave_sec = float(self.get_parameter("map_autosave_sec").value)
+        if autosave_sec > 0 and self.map_save_path:
+            self.create_timer(autosave_sec, self._autosave)
+        elif autosave_sec > 0:
+            self.get_logger().warn("map_autosave_sec is set but map_save_path is empty; autosave disabled")
+
         self._setup_io()
         self.get_logger().info("semantic_mapping_node initialized")
 
@@ -144,6 +156,9 @@ class SemanticMappingNode(Node):
             "vlm.api_key_env": "",
             "vlm.local_radius_m": 0.0,
             "vlm.max_objects": 0,
+            "map_load_path": "",
+            "map_save_path": "",
+            "map_autosave_sec": 0.0,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -237,6 +252,52 @@ class SemanticMappingNode(Node):
             PoseStamped, self._param_str("goal_topic", "/semantic_mapping/goal"), 10)
         self.waypoints_pub = self.create_publisher(
             Path, self._param_str("waypoints_topic", "/semantic_mapping/waypoints"), 10)
+
+        self.save_map_srv = self.create_service(Trigger, "~/save_map", self._on_save_map)
+        self.load_map_srv = self.create_service(Trigger, "~/load_map", self._on_load_map)
+
+    # ----------------------------------------------------------- persistence
+    def _save_map(self, path: str) -> str:
+        """Save the map; returns a human-readable outcome. Runs on the executor
+        thread, like every map update, so it never races the pipeline."""
+        saved = self.pipeline.save(path, metadata={"world_frame": self.world_frame})
+        return f"saved {len(self.pipeline.object_map.objects)} instances to {saved}"
+
+    def _load_map(self, path: str) -> str:
+        header = self.pipeline.load(path)
+        self._last_result = None  # the next frame re-derives the graph from the restored map
+        return f"restored {header['num_instances']} instances from {path}"
+
+    def _on_save_map(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        if not self.map_save_path:
+            response.success, response.message = False, "map_save_path parameter is empty"
+            return response
+        try:
+            response.success, response.message = True, self._save_map(self.map_save_path)
+            self.get_logger().info(response.message)
+        except Exception as exc:  # report to the caller instead of killing the executor
+            response.success, response.message = False, f"save failed: {exc}"
+            self.get_logger().error(response.message)
+        return response
+
+    def _on_load_map(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        path = self._param_str("map_load_path", "") or self.map_save_path
+        if not path:
+            response.success, response.message = False, "neither map_load_path nor map_save_path is set"
+            return response
+        try:
+            response.success, response.message = True, self._load_map(path)
+            self.get_logger().info(response.message)
+        except Exception as exc:
+            response.success, response.message = False, f"load failed: {exc}"
+            self.get_logger().error(response.message)
+        return response
+
+    def _autosave(self) -> None:
+        try:
+            self.get_logger().debug(self._save_map(self.map_save_path))
+        except Exception as exc:
+            self.get_logger().error(f"autosave failed: {exc}")
 
     # ------------------------------------------------------------- grounding
     def _on_query(self, msg: String) -> None:
