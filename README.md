@@ -128,6 +128,22 @@ ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, 
 
 The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
 
+### Runtime and memory (Sec. V-H)
+
+Every map update records per-stage timings (`FrameResult.timings`), the live node logs module rates every `stats_log_period_sec`, and `examples/benchmark.py` turns a sequence into the paper's runtime table. On the synthetic scene rendered at 640x480 with pre-baked detections, CPU only (4-core Xeon, no GPU):
+
+| module | mean latency | sustainable rate | paper (onboard, Sec. V-H) |
+|---|---|---|---|
+| 3D mapping (tracklet prediction, back-projection, association, map update) | 38 ms | 26 Hz | 3 Hz |
+| 4D scene graph construction | 0.3 ms | > 3 kHz | 5 Hz |
+| 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
+
+The geometric-consistency update over all instance points dominates (27 ms of the 38 ms); memory is 0.5 MiB of point arrays for 9 instances and a 91 MiB process. Latency scales with image resolution and map size, so measure your own sequence:
+
+```bash
+python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
+```
+
 ### Persist the map (living memory across sessions)
 
 The complete map state (per-instance points with their geometric and membership evidence, label beliefs, lifecycle status, timestamps, trajectories, and the ID counter) can be written to disk and restored, so a robot starts a session knowing what it mapped last time:

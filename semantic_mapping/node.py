@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 
 import numpy as np
 import rclpy
@@ -125,6 +126,14 @@ class SemanticMappingNode(Node):
         elif autosave_sec > 0:
             self.get_logger().warn("map_autosave_sec is set but map_save_path is empty; autosave disabled")
 
+        # Runtime accounting (Sec. V-H): module rates over each log period.
+        self._stats_lock = threading.Lock()
+        self._stats = {"frames": 0, "detections": 0, "publishes": 0, "stage_seconds": {}}
+        self._stats_since = time.monotonic()
+        stats_period = float(self.get_parameter("stats_log_period_sec").value)
+        if stats_period > 0:
+            self.create_timer(stats_period, self._log_runtime_stats)
+
         self._setup_io()
         self.get_logger().info("semantic_mapping_node initialized")
 
@@ -159,6 +168,7 @@ class SemanticMappingNode(Node):
             "map_load_path": "",
             "map_save_path": "",
             "map_autosave_sec": 0.0,
+            "stats_log_period_sec": 10.0,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -299,6 +309,25 @@ class SemanticMappingNode(Node):
         except Exception as exc:
             self.get_logger().error(f"autosave failed: {exc}")
 
+    def _log_runtime_stats(self) -> None:
+        """Report module rates in the terms of Sec. V-H: 2D segmentation (detector),
+        3D mapping (geometric update at the sensor rate), and 4D scene graph output."""
+        now = time.monotonic()
+        with self._stats_lock:
+            elapsed = max(now - self._stats_since, 1e-6)
+            frames, detections, publishes = (self._stats[k] for k in ("frames", "detections", "publishes"))
+            stage_seconds = dict(self._stats["stage_seconds"])
+            self._stats = {"frames": 0, "detections": 0, "publishes": 0, "stage_seconds": {}}
+            self._stats_since = now
+        if frames == 0 and detections == 0:
+            return
+        stages = " ".join(f"{k}={1e3 * v / max(frames, 1):.1f}ms" for k, v in stage_seconds.items())
+        objects = len(self.pipeline.object_map.objects)
+        self.get_logger().info(
+            f"runtime: detector {detections / elapsed:.2f} Hz, 3D mapping {frames / elapsed:.2f} Hz, "
+            f"scene graph published {publishes / elapsed:.2f} Hz, {objects} instances | per frame: {stages}"
+        )
+
     # ------------------------------------------------------------- grounding
     def _on_query(self, msg: String) -> None:
         """Instruction in -> (asynchronously) waypoints out (Sec. IV-D)."""
@@ -412,6 +441,8 @@ class SemanticMappingNode(Node):
                 self.get_logger().error(f"detector failed, fusing frame without detections: {exc}",
                                         throttle_duration_sec=5.0)
                 observation.detections = []
+            with self._stats_lock:
+                self._stats["detections"] += 1
             self._detection_results.put(observation)
 
     def _drain_detection_results(self, header: Header) -> None:
@@ -426,9 +457,15 @@ class SemanticMappingNode(Node):
     def _process_and_publish(self, observation: Observation, header: Header) -> FrameResult:
         result = self.pipeline.process_frame(observation)
         self._last_result = result
+        with self._stats_lock:
+            self._stats["frames"] += 1
+            for stage, seconds in result.timings.items():
+                self._stats["stage_seconds"][stage] = self._stats["stage_seconds"].get(stage, 0.0) + seconds
         if observation.stamp - self._last_publish_stamp >= self._publish_period_sec:
             self._publish_result(result, header)
             self._last_publish_stamp = observation.stamp
+            with self._stats_lock:
+                self._stats["publishes"] += 1
         return result
 
     def _lookup_se3(self, target_frame: str, source_frame: str, stamp) -> np.ndarray:
