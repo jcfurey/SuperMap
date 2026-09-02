@@ -10,7 +10,11 @@ real capture should be converted to)::
       frames/<frame_id:06d>_pose.json  {"stamp", "translation":[x,y,z], "quaternion":[x,y,z,w]}
                                         = world-from-camera pose P_t
       detections/<frame_id:06d>.json   pre-baked detections (see detectors/offline.py)
-      scene_ground_truth.json          optional, see evaluation.py
+      scene_ground_truth.json          optional, see evaluation.py (Sec. V-D/V-E metrics)
+      gt_points.npz                    optional, see segmentation_metrics.py (Sec. V-B metrics)
+
+ScanNet scene exports are loaded by :mod:`semantic_mapping.datasets_scannet`;
+:func:`load_dataset` picks the loader from the directory layout.
 """
 from __future__ import annotations
 
@@ -38,7 +42,7 @@ class SequenceFrame:
 
 
 class SequenceDataset:
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(self, data_dir: str | Path, frame_skip: int = 1, max_frames: int | None = None) -> None:
         self.data_dir = Path(data_dir)
         intrinsics_path = self.data_dir / "intrinsics.json"
         if not intrinsics_path.exists():
@@ -50,6 +54,18 @@ class SequenceDataset:
         self.frames_dir = self.data_dir / "frames"
         self.detections_dir = self.data_dir / "detections"
         self.frame_ids = sorted(int(p.name.split("_")[0]) for p in self.frames_dir.glob("*_pose.json"))
+        self.frame_ids = self.frame_ids[:: max(int(frame_skip), 1)]
+        if max_frames is not None:
+            self.frame_ids = self.frame_ids[:max_frames]
+
+    def ground_truth_points(self):
+        """Annotated surface points for the segmentation benchmark, if the sequence has them."""
+        path = self.data_dir / "gt_points.npz"
+        if not path.exists():
+            return None
+        from semantic_mapping.segmentation_metrics import GroundTruthPoints
+
+        return GroundTruthPoints.load(path)
 
     def __len__(self) -> int:
         return len(self.frame_ids)
@@ -78,6 +94,15 @@ class SequenceDataset:
             depth=frame.depth,
             detections=detections,
         )
+
+
+def load_dataset(data_dir: str | Path, frame_skip: int = 1, max_frames: int | None = None):
+    """Open a sequence directory with whichever loader matches its layout."""
+    from semantic_mapping.datasets_scannet import ScanNetScene, is_scannet_scene
+
+    if is_scannet_scene(data_dir):
+        return ScanNetScene(data_dir, frame_skip=frame_skip, max_frames=max_frames)
+    return SequenceDataset(data_dir, frame_skip=frame_skip, max_frames=max_frames)
 
 
 def run_sequence(

@@ -29,7 +29,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_mapping.geometry_utils import rotation_matrix_to_quaternion  # noqa: E402
+from semantic_mapping.geometry_utils import back_project_depth, rotation_matrix_to_quaternion  # noqa: E402
+from semantic_mapping.segmentation_metrics import GroundTruthPoints  # noqa: E402
 
 WORLD_UP = np.array([0.0, 0.0, 1.0])
 
@@ -76,6 +77,9 @@ SCENE_OBJECTS: list[SceneObject] = [
 # object; must comfortably contain the whole camera orbit (radius=3.4 below)
 # on every axis, or the shell's near face gets hit instead of its far face.
 ROOM_BOUNDS = np.array([-5.5, -4.5, 0.0, 5.5, 4.5, 3.0])  # xmin,ymin,zmin,xmax,ymax,zmax
+
+# Voxel size used to thin the accumulated ground-truth surface samples.
+GT_VOXEL_M = 0.05
 
 # An object with fewer rendered pixels than this is treated as not visible:
 # no detection is emitted for it, and the frame is excluded from its
@@ -157,6 +161,44 @@ def render_frame(
     return depth, rgb, object_id_map
 
 
+def ground_truth_surfaces(
+    depth: np.ndarray,
+    object_id_map: np.ndarray,
+    present_objects: list[SceneObject],
+    K: np.ndarray,
+    R_world_from_cam: np.ndarray,
+    position: np.ndarray,
+    sample_mask: np.ndarray,
+    final_frac: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """World-frame surface samples with class labels and instance ids, the
+    synthetic stand-in for ScanNet's annotated mesh (Sec. V-B benchmark).
+
+    Scores the *final* scene: surfaces of objects removed before the end are
+    dropped, and the room shell is labeled wall / floor / ceiling by the face
+    the ray hit, so "with background" metrics have real background classes.
+    """
+    valid = sample_mask & (depth > 0)
+    points_world = back_project_depth(K, depth, mask=valid) @ R_world_from_cam.T + position
+    ids_local = object_id_map[valid]
+    labels = np.full(points_world.shape[0], "", dtype=object)
+    instance_ids = np.full(points_world.shape[0], -1, dtype=np.int64)
+
+    shell = ids_local < 0
+    z = points_world[shell, 2]
+    labels[shell] = np.where(
+        np.abs(z - ROOM_BOUNDS[2]) < 0.02, "floor", np.where(np.abs(z - ROOM_BOUNDS[5]) < 0.02, "ceiling", "wall"),
+    )
+    for local_idx, obj in enumerate(present_objects):
+        if not obj.is_present(final_frac):
+            continue
+        member = ids_local == local_idx
+        labels[member] = obj.label
+        instance_ids[member] = SCENE_OBJECTS.index(obj)
+    keep = labels != ""
+    return points_world[keep], labels[keep].astype(str), instance_ids[keep]
+
+
 def make_detections(
     present_objects: list[SceneObject],
     object_id_map: np.ndarray,
@@ -222,6 +264,12 @@ def main() -> None:
     visible_frames: dict[str, list[int]] = {o.label: [] for o in SCENE_OBJECTS}
     present_frames: dict[str, list[int]] = {o.label: [] for o in SCENE_OBJECTS}
 
+    K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+    final_frac = (args.num_frames - 1) / args.num_frames
+    sample_mask = np.zeros((args.height, args.width), dtype=bool)
+    sample_mask[::2, ::2] = True
+    gt_chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
     for frame_id in range(args.num_frames):
         # Orbit progress spans the full arc (last frame lands on theta1);
         # presence uses a half-open fraction in [0, 1) so disappear_frac=1.0
@@ -241,6 +289,10 @@ def main() -> None:
         depth, rgb, object_id_map = render_frame(
             position, R_world_from_cam, present_objects, args.width, args.height, fx, fy, cx, cy,
         )
+
+        gt_chunks.append(ground_truth_surfaces(
+            depth, object_id_map, present_objects, K, R_world_from_cam, position, sample_mask, final_frac,
+        ))
 
         frame_prefix = frames_dir / f"{frame_id:06d}"
         np.save(f"{frame_prefix}_depth.npy", depth.astype(np.float32))
@@ -279,7 +331,18 @@ def main() -> None:
     }
     (out_dir / "scene_ground_truth.json").write_text(json.dumps(scene_meta, indent=2))
 
-    print(f"Wrote {args.num_frames} synthetic frames to {out_dir}/")
+    # Segmentation benchmark ground truth (Sec. V-B): every surface sample seen
+    # over the sequence, thinned to one per (voxel, instance).
+    points = np.concatenate([c[0] for c in gt_chunks], axis=0)
+    labels = np.concatenate([c[1] for c in gt_chunks])
+    instance_ids = np.concatenate([c[2] for c in gt_chunks])
+    keys = np.concatenate([np.floor(points / GT_VOXEL_M).astype(np.int64), instance_ids[:, None]], axis=1)
+    _unique, first = np.unique(keys, axis=0, return_index=True)
+    first = np.sort(first)
+    GroundTruthPoints(points[first], labels[first], instance_ids[first]).save(out_dir / "gt_points.npz")
+
+    print(f"Wrote {args.num_frames} synthetic frames to {out_dir}/ "
+          f"({first.size} labeled ground-truth surface points in gt_points.npz)")
     print("This is a deterministic offline substitute for a real capture -- "
           "point --data_dir at a real RGB-D/LiDAR sequence for actual deployment.")
 
