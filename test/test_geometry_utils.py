@@ -70,6 +70,16 @@ def test_bbox3d_and_centroid():
     assert np.allclose(centroid(box), [1.0, 2.0, 3.0])
 
 
+def test_iou_3d():
+    from semantic_mapping.geometry_utils import iou_3d
+
+    a = np.array([0.0, 0.0, 0.0, 2.0, 2.0, 2.0])
+    assert iou_3d(a, a) == 1.0
+    assert iou_3d(a, np.array([5.0, 5.0, 5.0, 6.0, 6.0, 6.0])) == 0.0
+    b = np.array([1.0, 1.0, 1.0, 3.0, 3.0, 3.0])  # intersection 1, union 8+8-1
+    assert np.isclose(iou_3d(a, b), 1.0 / 15.0)
+
+
 def test_iou_xy_on_stacked_boxes():
     lower = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 0.5])
     upper = np.array([0.0, 0.0, 0.5, 1.0, 1.0, 1.0])

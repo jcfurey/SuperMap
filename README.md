@@ -61,9 +61,17 @@ python -m spacy download en_core_web_sm
 ```bash
 python examples/prepare_example_dataset.py   # generate a synthetic demo sequence (one-time)
 python examples/example.py                   # run the mapping pipeline
+python examples/evaluate.py                  # score it with the paper's metrics (Sec. V-D / V-E)
 ```
 
-No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synthesizes a small deterministic RGB-D + odometry + detections sequence (ray-cast against a scripted scene with objects appearing/disappearing, mirroring Sec. V-C) so the pipeline is runnable end-to-end offline. Point `--data_dir` at a real capture once one is available.
+No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synthesizes a small deterministic RGB-D + odometry + detections sequence (ray-cast against a scripted scene with objects appearing/disappearing, mirroring Sec. V-C) so the pipeline is runnable end-to-end offline. Detections come with instance masks, as the paper's Grounding DINO + SAM2 pairing produces; `--no_masks` emits box-only detections to exercise the harder fallback path. Point `--data_dir` at a real capture once one is available (layout documented in `semantic_mapping/datasets.py`).
+
+`evaluate.py` implements the paper's true-positive criterion (3D IoU > 0.1, centroid < 0.3 m, correct label) and reports per-object detection recall and change-detection recall (Sec. V-D), identity fragmentation, and a final-map precision/recall/F1 in the spirit of the Sec. V-E ablation. On the synthetic sequence (9 objects, 3 removed and 3 introduced mid-sequence):
+
+| detections | detection recall | change recall | instance IDs / objects | final-map F1 |
+|---|---|---|---|---|
+| boxes + masks | 0.97 | 0.96 | 9 / 9 | 0.86 |
+| boxes only (`--no_masks`) | 0.47 | 0.52 | 13 / 9 | 0.50 |
 
 Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--config <yaml>`, `--prompts <yaml>`, `--live` (rerun window).
 

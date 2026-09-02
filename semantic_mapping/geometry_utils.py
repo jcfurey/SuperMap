@@ -220,6 +220,20 @@ def iou_xy(bbox3d_a: Array, bbox3d_b: Array) -> float:
     return iou_xyxy(box_a_xy, box_b_xy)
 
 
+def iou_3d(bbox3d_a: Array, bbox3d_b: Array) -> float:
+    """IoU of two axis-aligned 3D boxes [xmin, ymin, zmin, xmax, ymax, zmax]."""
+    inter_min = np.maximum(bbox3d_a[:3], bbox3d_b[:3])
+    inter_max = np.minimum(bbox3d_a[3:], bbox3d_b[3:])
+    inter_dims = np.clip(inter_max - inter_min, 0.0, None)
+    inter_vol = float(np.prod(inter_dims))
+    vol_a = float(np.prod(np.clip(bbox3d_a[3:] - bbox3d_a[:3], 0.0, None)))
+    vol_b = float(np.prod(np.clip(bbox3d_b[3:] - bbox3d_b[:3], 0.0, None)))
+    union = vol_a + vol_b - inter_vol
+    if union <= 1e-12:
+        return 0.0
+    return inter_vol / union
+
+
 def centroid(bbox3d: Array) -> Array:
     """Center of an axis-aligned 3D box [xmin, ymin, zmin, xmax, ymax, zmax]."""
     return np.array([

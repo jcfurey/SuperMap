@@ -15,7 +15,12 @@ from dataclasses import dataclass, field, fields
 import numpy as np
 
 from semantic_mapping import association, scene_graph as sg, tracking
-from semantic_mapping.geometry_utils import back_project_depth, depth_consistency_mask, invert_se3, transform_points
+from semantic_mapping.geometry_utils import (
+    back_project_depth,
+    bbox3d_from_points,
+    depth_consistency_mask,
+    transform_points,
+)
 from semantic_mapping.object_map import ObjectMap
 from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus, Observation
 
@@ -26,13 +31,23 @@ class PipelineConfig:
     tau_eps: float = 0.15
     max_points_per_object: int = 20000
     prune_log_odds: float = -1.5
+    prune_membership: float = -1.5
+    membership_margin_px: float = 2.0
     active_occupied_fraction: float = 0.6
     disappeared_occupied_fraction: float = 0.2
     max_occlusion_frames: int = 30
     min_label_confidence: float = 0.4
     min_observations_for_confidence_check: int = 5
     min_hits_to_confirm: int = 2
+    tentative_max_age: int = 10
     association_iou_threshold: float = 0.3
+    high_score_threshold: float = 0.5
+    low_score_iou_threshold: float = 0.2
+    reactivation_iou_threshold: float = 0.05
+    reactivation_margin_m: float = 0.25
+    min_points_for_3d_association: int = 5
+    merge_iou_threshold: float = 0.3
+    merge_distance_m: float = 0.25
     disappeared_prune_grace_frames: int = 60
     scene_graph_cluster_radius: float = 2.0
     scene_graph_z_tolerance: float = 0.1
@@ -66,11 +81,14 @@ class SemanticMappingPipeline:
             tau_eps=self.config.tau_eps,
             max_points_per_object=self.config.max_points_per_object,
             prune_log_odds=self.config.prune_log_odds,
+            prune_membership=self.config.prune_membership,
+            membership_margin_px=self.config.membership_margin_px,
             active_occupied_fraction=self.config.active_occupied_fraction,
             disappeared_occupied_fraction=self.config.disappeared_occupied_fraction,
             max_occlusion_frames=self.config.max_occlusion_frames,
             min_label_confidence=self.config.min_label_confidence,
             min_observations_for_confidence_check=self.config.min_observations_for_confidence_check,
+            tentative_max_age=self.config.tentative_max_age,
         )
         self._frame_index = 0
 
@@ -108,13 +126,12 @@ class SemanticMappingPipeline:
         self._frame_index += 1
         K = observation.intrinsics.K
         T_world_from_cam = observation.pose.T_world_from_frame
-        T_cam_from_world = invert_se3(T_world_from_cam)
+        detections = observation.detections
+        cfg = self.config
 
-        live_ids = [
-            instance_id for instance_id, obj in self.object_map.objects.items()
-            if obj.status != ObjectStatus.DISAPPEARED
+        live_objects = [
+            obj for obj in self.object_map.objects.values() if obj.status != ObjectStatus.DISAPPEARED
         ]
-        live_objects = [self.object_map.objects[i] for i in live_ids]
 
         predicted_tracks: list[tracking.TrackKalmanState] = []
         predicted_bboxes: list[np.ndarray] = []
@@ -126,49 +143,74 @@ class SemanticMappingPipeline:
             predicted_tracks.append(predicted)
             predicted_bboxes.append(tracking.current_bbox(predicted))
 
-        detection_bboxes = [d.bbox for d in observation.detections]
-        result = association.associate(
+        # Back-project every detection once; the 3D boxes feed the re-activation
+        # stage, the points feed whichever instance the detection ends up in.
+        det_points: list[np.ndarray] = []
+        det_boxes3d: list[np.ndarray | None] = []
+        for detection in detections:
+            points = (self._detection_points_world(detection, observation.depth, K, T_world_from_cam)
+                      if observation.depth is not None else np.zeros((0, 3)))
+            det_points.append(points)
+            det_boxes3d.append(
+                bbox3d_from_points(points) if points.shape[0] >= cfg.min_points_for_3d_association else None
+            )
+        detection_bboxes = [d.bbox for d in detections]
+        high = [i for i, d in enumerate(detections) if d.score >= cfg.high_score_threshold]
+        low = [i for i, d in enumerate(detections) if d.score < cfg.high_score_threshold]
+
+        # Stage 1: 2D, high-confidence detections, gated.
+        stage1 = association.associate(
             predicted_tracks, predicted_bboxes, detection_bboxes,
-            iou_threshold=self.config.association_iou_threshold,
+            iou_threshold=cfg.association_iou_threshold, candidate_detections=high,
+        )
+        # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no gate.
+        stage2 = association.associate(
+            predicted_tracks, predicted_bboxes, detection_bboxes,
+            iou_threshold=cfg.low_score_iou_threshold, use_mahalanobis_gate=False,
+            candidate_tracks=stage1.unmatched_tracks, candidate_detections=low,
+        )
+        # Stage 3: 3D-aware re-activation for high-confidence detections still unmatched.
+        stage3 = association.associate_3d(
+            det_boxes3d, [d.label for d in detections], live_objects,
+            iou_threshold=cfg.reactivation_iou_threshold, containment_margin=cfg.reactivation_margin_m,
+            candidate_objects=stage2.unmatched_tracks, candidate_detections=stage1.unmatched_detections,
         )
 
-        matched_track_indices = set()
-        for track_idx, det_idx in result.matches:
-            obj = live_objects[track_idx]
-            detection = observation.detections[det_idx]
+        for track_idx, det_idx in stage1.matches + stage2.matches:
+            detection = detections[det_idx]
             updated_track = tracking.update(predicted_tracks[track_idx], detection.bbox)
-            points_world = np.zeros((0, 3))
-            if observation.depth is not None:
-                points_world = self._detection_points_world(detection, observation.depth, K, T_world_from_cam)
             self.object_map.update_matched(
-                obj, updated_track, points_world, detection.label, detection.score,
+                live_objects[track_idx], updated_track, det_points[det_idx], detection,
                 observation.stamp, K, T_world_from_cam, observation.depth,
             )
-            matched_track_indices.add(track_idx)
+        for track_idx, det_idx in stage3.matches:
+            self.object_map.reactivate(
+                live_objects[track_idx], det_points[det_idx], detections[det_idx],
+                observation.stamp, K, T_world_from_cam, observation.depth,
+            )
 
-        if observation.depth is not None:
-            for track_idx in result.unmatched_tracks:
-                obj = live_objects[track_idx]
-                obj.track = predicted_tracks[track_idx]
+        for track_idx in stage3.unmatched_tracks:
+            obj = live_objects[track_idx]
+            obj.track = predicted_tracks[track_idx]
+            if observation.depth is not None:
                 self.object_map.update_unmatched(obj, K, T_world_from_cam, observation.depth)
-        else:
-            for track_idx in result.unmatched_tracks:
-                obj = live_objects[track_idx]
-                obj.track = predicted_tracks[track_idx]
+            else:
                 obj.frames_since_seen += 1
 
-        for det_idx in result.unmatched_detections:
-            detection = observation.detections[det_idx]
-            points_world = np.zeros((0, 3))
-            if observation.depth is not None:
-                points_world = self._detection_points_world(detection, observation.depth, K, T_world_from_cam)
-            self.object_map.spawn(detection.bbox, points_world, detection.label, detection.score, observation.stamp)
+        # Only high-confidence detections may start a new object (ByteTrack).
+        for det_idx in stage3.unmatched_detections:
+            detection = detections[det_idx]
+            self.object_map.spawn(
+                detection.bbox, det_points[det_idx], detection.label, detection.score, observation.stamp,
+            )
 
         for obj in self.object_map.objects.values():
-            self.object_map.confirm_tentative(obj, self.config.min_hits_to_confirm)
+            self.object_map.confirm_tentative(obj, cfg.min_hits_to_confirm)
+        self.object_map.merge_duplicates(cfg.merge_iou_threshold, cfg.merge_distance_m)
+        for obj in self.object_map.objects.values():
             sg.record_trajectory_sample(obj, observation.stamp)
 
-        self.object_map.prune_disappeared(self.config.disappeared_prune_grace_frames)
+        self.object_map.prune_disappeared(cfg.disappeared_prune_grace_frames)
 
         graph = sg.build_scene_graph(
             list(self.object_map.objects.values()),
