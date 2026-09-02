@@ -128,6 +128,19 @@ ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, 
 
 The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
 
+### Real captures: rosbag2 to sequence
+
+Record RGB, CameraInfo, a point cloud (or an aligned depth image), odometry, and TF from any robot, then convert the bag into the offline layout so `example.py`, `evaluate.py`, `benchmark.py`, and `query.py` run on it unchanged:
+
+```bash
+python examples/rosbag_to_sequence.py my_capture.bag --out_dir data/my_capture \
+    --rgb_topic /camera/color/image_raw --camera_info_topic /camera/color/camera_info \
+    --pointcloud_topic /lidar/points --odometry_topic /odometry \
+    --world_frame map --camera_frame camera_color_optical_frame --detector yoloe   # bake detections for replay
+```
+
+The camera pose is resolved through the bag's TF tree exactly as the live node does (odometry is injected as its `header.frame_id -> child_frame_id` transform), the point cloud is rasterized into the camera for depth, and RGB frames are paired with the nearest depth source within `--sync_slop`. Use `--depth_topic` for RGB-D cameras whose depth is already aligned to color. Needs a sourced ROS 2 environment (the Docker image works).
+
 ### Runtime and memory (Sec. V-H)
 
 Every map update records per-stage timings (`FrameResult.timings`), the live node logs module rates every `stats_log_period_sec`, and `examples/benchmark.py` turns a sequence into the paper's runtime table. On the synthetic scene rendered at 640x480 with pre-baked detections, CPU only (4-core Xeon, no GPU):

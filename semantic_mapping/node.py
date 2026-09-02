@@ -43,10 +43,11 @@ from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
-from semantic_mapping.geometry_utils import rasterize_depth, se3_from_translation_quaternion, transform_points
+from semantic_mapping.geometry_utils import rasterize_depth, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
+from semantic_mapping.ros_msgs import camera_info_to_intrinsics, pointcloud_to_xyz, transform_to_se3
 from semantic_mapping.serialization import serialize_frame
-from semantic_mapping.types import CameraIntrinsics, Observation, StampedPose
+from semantic_mapping.types import Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
@@ -396,10 +397,7 @@ class SemanticMappingNode(Node):
         stamp = _stamp_to_seconds(rgb_msg.header.stamp)
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="rgb8")
-        intrinsics = CameraIntrinsics(
-            fx=info_msg.k[0], fy=info_msg.k[4], cx=info_msg.k[2], cy=info_msg.k[5],
-            width=info_msg.width, height=info_msg.height,
-        )
+        intrinsics = camera_info_to_intrinsics(info_msg)
 
         # Rasterize the synchronized point cloud into the camera frame to
         # obtain the raw sensor depth D(u) needed by geometric consistency.
@@ -472,21 +470,11 @@ class SemanticMappingNode(Node):
         """4x4 SE(3) transform mapping ``source_frame``-expressed points/poses
         into ``target_frame`` coordinates, per REP 105 TF2 lookup semantics.
         """
-        tf = self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time.from_msg(stamp))
-        t, q = tf.transform.translation, tf.transform.rotation
-        return se3_from_translation_quaternion(
-            np.array([t.x, t.y, t.z]), np.array([q.x, q.y, q.z, q.w]),
-        )
+        return transform_to_se3(self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time.from_msg(stamp)))
 
     @staticmethod
     def _read_pointcloud_xyz(pc_msg: PointCloud2) -> np.ndarray:
-        # read_points returns a structured numpy array; stay vectorized (no
-        # per-point Python loop) since a LiDAR scan can carry tens of
-        # thousands of points and this runs every synchronized frame.
-        cloud = pc2.read_points(pc_msg, field_names=("x", "y", "z"), skip_nans=True)
-        if cloud.size == 0:
-            return np.zeros((0, 3), dtype=np.float64)
-        return np.stack([cloud["x"], cloud["y"], cloud["z"]], axis=-1).astype(np.float64)
+        return pointcloud_to_xyz(pc_msg)
 
     # ---------------------------------------------------------------- publish
     def _publish_annotated_image(self, observation: Observation, result: FrameResult, header: Header) -> None:
