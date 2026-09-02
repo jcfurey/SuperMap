@@ -1,0 +1,24 @@
+# Convenience wrapper around `docker build`/`docker run` for the semantic_mapping
+# image. Uses host networking, the standard way to let ROS2 DDS discovery work
+# when a separate upstream SLAM backbone node is also running on the host.
+#
+# Usage:
+#   docker compose up --build
+services:
+  semantic_mapping:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: supermap/semantic_mapping
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: ["ros2", "launch", "semantic_mapping", "semantic_mapping.launch.py"]

@@ -18,10 +18,9 @@
   </a>
 </p>
 
-> Announcement: The code will be released after RSS.
-
 ## News
 
+- 2026-09-02: Initial `semantic_mapping` ROS2 package published: instance-level spatio-temporal tracking (Sec. IV-B), 4D scene graph construction (Sec. IV-C), and VLN grounding (Sec. IV-D), with an offline demo and unit tests. See [Setup](#setup) below.
 - 2026-07-15: Project website and teaser video are now live.
 - 2026-07-15: Initial README and project overview published.
 
@@ -60,11 +59,13 @@ python -m spacy download en_core_web_sm
 ## Run (offline)
 
 ```bash
-python examples/prepare_example_dataset.py   # download example dataset (one-time)
+python examples/prepare_example_dataset.py   # generate a synthetic demo sequence (one-time)
 python examples/example.py                   # run the mapping pipeline
 ```
 
-Options: `--detector yoloe|offline`, `--data_dir <path>`, `--config <yaml>`, `--live` (rerun window).
+No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synthesizes a small deterministic RGB-D + odometry + detections sequence (ray-cast against a scripted scene with objects appearing/disappearing, mirroring Sec. V-C) so the pipeline is runnable end-to-end offline. Point `--data_dir` at a real capture once one is available.
+
+Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--config <yaml>`, `--prompts <yaml>`, `--live` (rerun window).
 
 ## Run (live ROS2)
 
@@ -74,7 +75,20 @@ colcon build --packages-select semantic_mapping && source install/setup.bash
 ros2 launch semantic_mapping semantic_mapping.launch.py
 ```
 
-In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic, extrinsic, and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`.
+In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 rather than a fixed parameter, so a `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration).
+
+## Docker
+
+```bash
+docker build -f docker/Dockerfile -t supermap/semantic_mapping .                              # full image (torch, YOLOE)
+docker build -f docker/Dockerfile --build-arg INSTALL_DETECTORS=0 -t supermap/semantic_mapping:lite .  # offline/CI-sized, no GPU stack
+
+docker run --rm -it supermap/semantic_mapping:lite \
+  bash -lc "python3 examples/prepare_example_dataset.py && python3 examples/example.py"       # offline demo, no GPU needed
+
+docker run --rm -it --gpus all --network host supermap/semantic_mapping                       # live ROS2 mode
+# or: docker compose up --build
+```
 
 Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
 
