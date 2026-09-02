@@ -117,6 +117,21 @@ class ObjectInstance:
     latest_stamp: float
     frames_since_seen: int = 0
     hits: int = 0
+    points_contradicted: int = 0
+    """Points pruned because geometric evidence contradicted them since the
+    instance was last detected. Pruning removes the contradicted points, so
+    without this count an object whose bulk has been ruled out but whose
+    floor-contact points still coincide with the floor would look intact."""
+
+    point_membership: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Per-point log-odds that the point belongs to *this* instance (Sec. IV-B.4,
+    "remove object points whose posterior belief is too small"), shape (N,).
+    Geometric consistency (``point_log_odds``) only says a surface exists at the
+    point; this says whether that surface is part of the object the detector
+    keeps reporting -- it goes negative when the point is visible but keeps
+    projecting outside the detected region, which is how background caught in
+    a loose box gets pruned instead of inflating the object's 3D extent."""
+
     trajectory: list[tuple[float, np.ndarray, str]] = field(default_factory=list)
     """Temporal edge history E_t: (stamp, world centroid, status) samples tracing this
     instance's trajectory (Sec. IV-C), used for temporal-edge queries such as

@@ -73,6 +73,32 @@ def best_label(belief: LabelBelief) -> tuple[str, float]:
     return label, prob
 
 
+def update_point_membership(
+    membership: "np.ndarray",
+    observable: "np.ndarray",
+    inside_detection: "np.ndarray",
+    p_inside: float = 0.8,
+    p_outside: float = 0.3,
+    clamp: float = 8.0,
+) -> "np.ndarray":
+    """Per-point instance-membership update, the point-level half of Sec. IV-B.4.
+
+    For points the geometry confirms as observable this frame, being inside
+    the detected region is evidence the point belongs to the instance
+    (``p_inside``); being visible yet outside it is evidence it doesn't
+    (``p_outside``). Points that are occluded or out of view carry no
+    evidence and are left unchanged.
+    """
+    import numpy as np
+
+    updated = membership.copy()
+    inside = observable & inside_detection
+    outside = observable & ~inside_detection
+    updated[inside] += np.log(p_inside / (1.0 - p_inside))
+    updated[outside] += np.log(p_outside / (1.0 - p_outside))
+    return np.clip(updated, -clamp, clamp)
+
+
 def should_discard_instance(belief: LabelBelief, min_confidence: float, min_observations: int,
                              observation_count: int) -> bool:
     """Instance-level counterpart of "remove content whose posterior belief is

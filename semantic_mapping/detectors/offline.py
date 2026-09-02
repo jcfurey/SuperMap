@@ -12,7 +12,11 @@ stored as a small JSON record:
     }
 
 ``mask`` is an optional path (relative to the same directory) to a binary
-PNG instance mask.
+instance mask, either a ``.npy`` boolean array or a PNG. Masks are what the
+paper's detector pairing (Grounding DINO + SAM2) produces and what keeps
+background out of an object's 3D point set; box-only records still work but
+rely on the depth-consistency filter and per-point membership pruning to
+reject background caught inside the box.
 """
 from __future__ import annotations
 
@@ -34,6 +38,8 @@ class OfflineDetector(Detector):
         mask_path = self.detections_dir / mask_relpath
         if not mask_path.exists():
             return None
+        if mask_path.suffix == ".npy":
+            return np.load(mask_path).astype(bool)
         try:
             import cv2
 

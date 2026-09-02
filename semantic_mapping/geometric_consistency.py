@@ -57,26 +57,29 @@ def gaussian_likelihood(delta_d: np.ndarray, sigma: float) -> np.ndarray:
     return np.exp(-0.5 * (delta_d / sigma) ** 2) / (sigma * np.sqrt(2.0 * np.pi))
 
 
-def classify_points(
+def project_and_classify(
     K: np.ndarray,
     T_world_from_cam: np.ndarray,
     depth_image: np.ndarray,
     points_world: np.ndarray,
     tau_eps: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Classify each world-frame point per Eq. (9).
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Classify each world-frame point per Eq. (9) and return where it projects.
 
     Returns
     -------
     states : int array of :class:`GeometricState` codes, one per point.
     delta_d : array of signed depth residuals (NaN where undefined).
+    pixels : (N, 2) int array of rounded (u, v) image coordinates; only
+        meaningful for points whose state is not ``OUT_OF_VIEW``.
     """
     n = points_world.shape[0]
     states = np.full(n, int(GeometricState.OUT_OF_VIEW), dtype=np.int64)
     delta_d = np.full(n, np.nan, dtype=np.float64)
+    pixels_int = np.full((n, 2), -1, dtype=np.int64)
 
     if n == 0:
-        return states, delta_d
+        return states, delta_d, pixels_int
 
     T_cam_from_world = invert_se3(T_world_from_cam)
     pixels, d_proj = project_points(K, T_cam_from_world, points_world)
@@ -87,6 +90,8 @@ def classify_points(
     in_front = d_proj > 1e-6
     in_frame = (us >= 0) & (us < w) & (vs >= 0) & (vs < h)
     valid = in_front & in_frame
+    pixels_int[valid, 0] = us[valid]
+    pixels_int[valid, 1] = vs[valid]
 
     sensor_depth = np.full(n, np.nan, dtype=np.float64)
     sensor_depth[valid] = depth_image[vs[valid], us[valid]]
@@ -104,6 +109,18 @@ def classify_points(
     states[disappeared] = GeometricState.DISAPPEARED
     # remaining entries keep GeometricState.OUT_OF_VIEW
 
+    return states, delta_d, pixels_int
+
+
+def classify_points(
+    K: np.ndarray,
+    T_world_from_cam: np.ndarray,
+    depth_image: np.ndarray,
+    points_world: np.ndarray,
+    tau_eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Classify each world-frame point per Eq. (9); see :func:`project_and_classify`."""
+    states, delta_d, _pixels = project_and_classify(K, T_world_from_cam, depth_image, points_world, tau_eps)
     return states, delta_d
 
 
@@ -138,17 +155,17 @@ def update_object_points(
     p_hit: float = 0.9,
     p_miss: float = 0.1,
     p_unknown: float = 0.5,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """One fused geometric-consistency step for all points of an object.
 
-    Returns the updated per-point log-odds and the raw classification, so
-    callers (e.g. semantic fusion) can restrict label updates to points
-    classified as :attr:`GeometricState.OBSERVABLE`.
+    Returns the updated per-point log-odds, the raw classification (so callers
+    can restrict semantic updates to points classified
+    :attr:`GeometricState.OBSERVABLE`), and each point's projected pixel.
     """
-    states, _delta_d = classify_points(K, T_world_from_cam, depth_image, points_world, tau_eps)
+    states, _delta_d, pixels = project_and_classify(K, T_world_from_cam, depth_image, points_world, tau_eps)
     probabilities = inverse_sensor_model(states, p_hit=p_hit, p_miss=p_miss, p_unknown=p_unknown)
     new_log_odds = update_log_odds(prior_log_odds, probabilities)
-    return new_log_odds, states
+    return new_log_odds, states, pixels
 
 
 def prune_mask(log_odds: np.ndarray, prune_threshold: float = -1.5) -> np.ndarray:
@@ -157,6 +174,13 @@ def prune_mask(log_odds: np.ndarray, prune_threshold: float = -1.5) -> np.ndarra
 
 
 def occupied_fraction(log_odds: np.ndarray) -> float:
+    """Fraction of points not contradicted by evidence.
+
+    A point at the neutral prior (log-odds 0, p = 0.5) counts as occupied: it
+    was just back-projected from a detection and simply hasn't been re-observed
+    yet, which is not evidence of absence. Only accumulated negative evidence
+    (Eq. 9 "disappeared" classifications) moves a point below the line.
+    """
     if log_odds.size == 0:
         return 0.0
-    return float(np.mean(log_odds_to_prob(log_odds) > 0.5))
+    return float(np.mean(log_odds >= 0.0))

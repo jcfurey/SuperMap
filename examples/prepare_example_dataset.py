@@ -67,7 +67,7 @@ SCENE_OBJECTS: list[SceneObject] = [
     SceneObject("trash can", (-1.4, 1.7), (0.2, 0.2, 0.35), 0.35, (80, 80, 80), 0.0, 0.55),
     SceneObject("chair", (0.6, -1.8), (0.25, 0.25, 0.45), 0.45, (170, 130, 90), 0.0, 0.55),
     # Newly introduced partway through:
-    SceneObject("bucket", (0.4, 1.5), (0.2, 0.2, 0.25), 0.25, (200, 60, 60), 0.45, 1.0),
+    SceneObject("bucket", (0.7, 0.3), (0.2, 0.2, 0.25), 0.25, (200, 60, 60), 0.45, 1.0),
     SceneObject("cart", (-2.0, 0.4), (0.35, 0.5, 0.5), 0.5, (60, 60, 200), 0.45, 1.0),
     SceneObject("safety sign", (2.0, 0.6), (0.05, 0.3, 0.5), 0.9, (230, 200, 40), 0.45, 1.0),
 ]
@@ -76,6 +76,11 @@ SCENE_OBJECTS: list[SceneObject] = [
 # object; must comfortably contain the whole camera orbit (radius=3.4 below)
 # on every axis, or the shell's near face gets hit instead of its far face.
 ROOM_BOUNDS = np.array([-5.5, -4.5, 0.0, 5.5, 4.5, 3.0])  # xmin,ymin,zmin,xmax,ymax,zmax
+
+# An object with fewer rendered pixels than this is treated as not visible:
+# no detection is emitted for it, and the frame is excluded from its
+# evaluation "appearance interval" (see semantic_mapping/evaluation.py).
+MIN_VISIBLE_PIXELS = 20
 
 
 def _look_at_rotation(position: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -132,7 +137,13 @@ def render_frame(
         best_dist = np.where(closer, dist, best_dist)
         best_id = np.where(closer, idx, best_id)
 
-    depth = best_dist.reshape(height, width)
+    # _ray_box_hit returns range along the (unit) ray; a depth image stores
+    # z-depth (distance along the optical axis), which is what real RGB-D
+    # sensors emit and what the pipeline's pinhole back-projection assumes.
+    # Storing range instead stretches peripheral points radially by 1/cos and
+    # makes Eq. (9) see them as "in front of the surface", so the conversion
+    # here is load-bearing, not cosmetic.
+    depth = (best_dist * dirs_cam[:, 2]).reshape(height, width)
     depth[~np.isfinite(depth)] = 0.0
     object_id_map = best_id.reshape(height, width)
 
@@ -147,20 +158,36 @@ def render_frame(
 
 
 def make_detections(
-    present_objects: list[SceneObject], object_id_map: np.ndarray, rng: np.random.Generator,
+    present_objects: list[SceneObject],
+    object_id_map: np.ndarray,
+    rng: np.random.Generator,
+    detections_dir: Path | None = None,
+    frame_id: int = 0,
+    with_masks: bool = True,
 ) -> list[dict]:
+    """Pre-baked detections for one frame: a jittered box per visible object and,
+    by default, its instance mask -- mirroring the paper's Grounding DINO box +
+    SAM2 mask pairing. ``with_masks=False`` emits box-only records to exercise
+    the harder fallback path.
+    """
     detections = []
     for idx, obj in enumerate(present_objects):
-        ys, xs = np.nonzero(object_id_map == idx)
-        if xs.size < 20:  # object not (meaningfully) visible this frame
+        mask = object_id_map == idx
+        ys, xs = np.nonzero(mask)
+        if xs.size < MIN_VISIBLE_PIXELS:  # object not (meaningfully) visible this frame
             continue
         jitter = rng.normal(0.0, 1.5, size=4)
         bbox = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float64) + jitter
-        detections.append({
+        record = {
             "bbox": bbox.tolist(),
             "label": obj.label,
             "score": float(np.clip(rng.normal(0.9, 0.05), 0.5, 0.99)),
-        })
+        }
+        if with_masks and detections_dir is not None:
+            mask_name = f"{frame_id:06d}_{len(detections)}.npy"
+            np.save(detections_dir / mask_name, mask)
+            record["mask"] = mask_name
+        detections.append(record)
     return detections
 
 
@@ -172,6 +199,8 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=160)
     parser.add_argument("--height", type=int, default=120)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no_masks", action="store_true",
+                        help="Emit box-only detections (no instance masks) to exercise the fallback path.")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -190,20 +219,18 @@ def main() -> None:
     target = np.array([0.0, 0.0, 0.9])
     theta0, theta1 = np.deg2rad(200), np.deg2rad(-20)
 
-    scene_meta = {
-        "objects": [
-            {"label": o.label, "bbox3d": o.bbox3d().tolist(),
-             "appear_frac": o.appear_frac, "disappear_frac": o.disappear_frac}
-            for o in SCENE_OBJECTS
-        ],
-    }
-    (out_dir / "scene_ground_truth.json").write_text(json.dumps(scene_meta, indent=2))
+    visible_frames: dict[str, list[int]] = {o.label: [] for o in SCENE_OBJECTS}
+    present_frames: dict[str, list[int]] = {o.label: [] for o in SCENE_OBJECTS}
 
     for frame_id in range(args.num_frames):
-        frac = frame_id / max(args.num_frames - 1, 1)
+        # Orbit progress spans the full arc (last frame lands on theta1);
+        # presence uses a half-open fraction in [0, 1) so disappear_frac=1.0
+        # really means "never removed" on the final frame too.
+        orbit_frac = frame_id / max(args.num_frames - 1, 1)
+        frac = frame_id / args.num_frames
         stamp = frame_id / args.fps
 
-        theta = theta0 + (theta1 - theta0) * frac
+        theta = theta0 + (theta1 - theta0) * orbit_frac
         position = np.array([radius * np.cos(theta), radius * np.sin(theta), cam_height])
         assert np.all(position > ROOM_BOUNDS[:3]) and np.all(position < ROOM_BOUNDS[3:]), (
             "camera orbit must stay strictly inside ROOM_BOUNDS for the backdrop ray-cast to hit its far face"
@@ -223,8 +250,34 @@ def main() -> None:
         pose = {"stamp": stamp, "translation": position.tolist(), "quaternion": quaternion.tolist()}
         (frames_dir / f"{frame_id:06d}_pose.json").write_text(json.dumps(pose))
 
-        detections = make_detections(present_objects, object_id_map, rng)
+        detections = make_detections(
+            present_objects, object_id_map, rng, detections_dir, frame_id, with_masks=not args.no_masks,
+        )
         (detections_dir / f"{frame_id:06d}.json").write_text(json.dumps({"detections": detections}))
+
+        for idx, obj in enumerate(present_objects):
+            present_frames[obj.label].append(frame_id)
+            if int((object_id_map == idx).sum()) >= MIN_VISIBLE_PIXELS:
+                visible_frames[obj.label].append(frame_id)
+
+    scene_meta = {
+        "num_frames": args.num_frames,
+        "fps": args.fps,
+        "objects": [
+            {
+                "label": o.label,
+                "bbox3d": o.bbox3d().tolist(),
+                "appear_frac": o.appear_frac,
+                "disappear_frac": o.disappear_frac,
+                # Presence is a single contiguous interval by construction.
+                "appear_frame": present_frames[o.label][0] if present_frames[o.label] else args.num_frames,
+                "disappear_frame": present_frames[o.label][-1] + 1 if present_frames[o.label] else args.num_frames,
+                "visible_frames": visible_frames[o.label],
+            }
+            for o in SCENE_OBJECTS
+        ],
+    }
+    (out_dir / "scene_ground_truth.json").write_text(json.dumps(scene_meta, indent=2))
 
     print(f"Wrote {args.num_frames} synthetic frames to {out_dir}/")
     print("This is a deterministic offline substitute for a real capture -- "
