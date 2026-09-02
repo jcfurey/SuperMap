@@ -32,7 +32,7 @@
 - 🧠 **Remember** — persistent object identities capture long-term scene evolution.                                           
 - 💡 **Reason** — a queryable 4D scene graph supports spatial and tempora reasoning.                                         
 - 🤖 **Act** — spatial memory naturally grounds VLN, VLA, and future embodied AI systems.  
-- 🔌 **Model-agnostic** — works with Grounding DINO, YOLOE, boxer pre-baked detections.
+- 🔌 **Model-agnostic** — works with Grounding DINO, YOLOE, boxer pre-baked detections; SAM2 mask refinement wraps any of them.
 - ⚡ **Fully online** — real-time on robot hardware; runs **offline** on datasets or **live** via ROS2 from one codebase.
 - 🏫 **Field-proven** — continuous 2-hour deployment across the CMU campus ([interactive demo](https://superodometry.com/supermap)).
 
