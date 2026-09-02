@@ -36,10 +36,15 @@ semantic_mapping_node:
     detector_rate_hz: 1.0   # asynchronous perception runs slower than SLAM (Sec. IV, V-H)
     prompts_file: config/prompts.yaml
 
+    # Any backend accepts sam2_checkpoint + sam2_model_cfg: boxes are then
+    # refined into instance masks by SAM2 (the paper's pairing, Sec. V-B),
+    # which keeps background out of each object's 3D point set.
     yoloe:
       checkpoint: yoloe-v8l-seg.pt
       device: cuda
       confidence_threshold: 0.25
+      sam2_checkpoint: ""       # optional; "-seg" checkpoints already produce masks
+      sam2_model_cfg: ""
 
     groundingdino:
       config_path: ""

@@ -1,8 +1,10 @@
-"""Grounding DINO (open-set text-prompted boxes) + SAM2 (instance masks) backend.
+"""Grounding DINO (open-set text-prompted boxes) backend.
 
-This is the detector pairing used for the instance-level segmentation
-results in the paper (Sec. V-B): Grounding DINO proposes boxes for the
-active prompt vocabulary, SAM2 refines each box into a per-instance mask.
+With SAM2 mask refinement (``sam2_checkpoint`` / ``sam2_model_cfg`` through
+:func:`semantic_mapping.detectors.build_detector`) this is the detector
+pairing used for the instance-level segmentation results in the paper
+(Sec. V-B): Grounding DINO proposes boxes for the active prompt vocabulary,
+SAM2 refines each box into a per-instance mask.
 """
 from __future__ import annotations
 
@@ -17,8 +19,6 @@ class GroundingDINODetector(Detector):
         self,
         config_path: str,
         checkpoint_path: str,
-        sam2_checkpoint: str | None = None,
-        sam2_model_cfg: str | None = None,
         device: str = "cuda",
         box_threshold: float = 0.35,
         text_threshold: float = 0.25,
@@ -38,25 +38,6 @@ class GroundingDINODetector(Detector):
         self.box_threshold = box_threshold
         self.text_threshold = text_threshold
 
-        self.sam_predictor = None
-        if sam2_checkpoint and sam2_model_cfg:
-            try:
-                from sam2.build_sam import build_sam2
-                from sam2.sam2_image_predictor import SAM2ImagePredictor
-            except ImportError as exc:
-                raise ImportError(
-                    "SAM2 refinement requires the 'sam2' package (https://github.com/facebookresearch/sam2)."
-                ) from exc
-            sam2_model = build_sam2(sam2_model_cfg, sam2_checkpoint, device=device)
-            self.sam_predictor = SAM2ImagePredictor(sam2_model)
-
-    def _segment(self, rgb_image: np.ndarray, boxes_xyxy: np.ndarray) -> np.ndarray | None:
-        if self.sam_predictor is None or boxes_xyxy.shape[0] == 0:
-            return None
-        self.sam_predictor.set_image(rgb_image)
-        masks, _scores, _logits = self.sam_predictor.predict(box=boxes_xyxy, multimask_output=False)
-        return masks[:, 0] if masks.ndim == 4 else masks
-
     def detect(self, rgb_image: np.ndarray, prompts: list[str] | None = None, **kwargs) -> list[Detection2D]:
         if not prompts:
             return []
@@ -72,15 +53,9 @@ class GroundingDINODetector(Detector):
         scores = np.asarray(detections_raw.confidence, dtype=np.float64)
         class_ids = np.asarray(detections_raw.class_id)
 
-        masks = self._segment(rgb_image, boxes_xyxy)
-
         detections: list[Detection2D] = []
         for i in range(boxes_xyxy.shape[0]):
             if class_ids[i] is None:
                 continue
-            label = prompts[int(class_ids[i])]
-            mask = masks[i] > 0.5 if masks is not None else None
-            detections.append(Detection2D(
-                bbox=boxes_xyxy[i], label=label, score=float(scores[i]), mask=mask,
-            ))
+            detections.append(Detection2D(bbox=boxes_xyxy[i], label=prompts[int(class_ids[i])], score=float(scores[i])))
         return detections

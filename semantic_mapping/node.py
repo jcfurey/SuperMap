@@ -178,6 +178,8 @@ class SemanticMappingNode(Node):
         self.declare_parameter("yoloe.checkpoint", "yoloe-v8l-seg.pt")
         self.declare_parameter("yoloe.device", "cuda")
         self.declare_parameter("yoloe.confidence_threshold", 0.25)
+        self.declare_parameter("yoloe.sam2_checkpoint", "")
+        self.declare_parameter("yoloe.sam2_model_cfg", "")
         self.declare_parameter("groundingdino.config_path", "")
         self.declare_parameter("groundingdino.checkpoint_path", "")
         self.declare_parameter("groundingdino.sam2_checkpoint", "")
@@ -213,6 +215,8 @@ class SemanticMappingNode(Node):
                 "checkpoint": self._param_str("yoloe.checkpoint", "yoloe-v8l-seg.pt"),
                 "device": self._param_str("yoloe.device", "cuda"),
                 "confidence_threshold": float(self.get_parameter("yoloe.confidence_threshold").value),
+                "sam2_checkpoint": self._param_str("yoloe.sam2_checkpoint", "") or None,
+                "sam2_model_cfg": self._param_str("yoloe.sam2_model_cfg", "") or None,
             }
         if backend in ("groundingdino", "grounding_dino", "gdino"):
             return {
