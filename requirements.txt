@@ -1,0 +1,19 @@
+# Core
+numpy>=1.24
+scipy>=1.10
+PyYAML>=6.0
+opencv-python>=4.8
+
+# Offline example visualization (optional; --live)
+rerun-sdk>=0.18
+
+# Detector backends (install the ones you plan to use; see config/semantic_mapping.yaml)
+ultralytics>=8.3          # yoloe
+# groundingdino-py        # groundingdino: install from https://github.com/IDEA-Research/GroundingDINO
+# sam2                    # groundingdino + SAM2 mask refinement: https://github.com/facebookresearch/sam2
+
+# Open-vocabulary label handling
+spacy>=3.7
+
+# Testing
+pytest>=7.4

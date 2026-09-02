@@ -1,0 +1,23 @@
+# Generated example dataset (regenerate with examples/prepare_example_dataset.py)
+/data/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.venv/
+venv/
+
+# ROS2 / colcon
+install/
+log/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

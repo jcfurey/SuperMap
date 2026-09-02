@@ -1,0 +1,25 @@
+# Open-vocabulary detection prompt list consumed by the active detector backend
+# (config/semantic_mapping.yaml -> detector). Edit this list to adapt SuperMap
+# to a new deployment environment without touching any code; the pipeline
+# re-reads it whenever the vocabulary changes.
+prompts:
+  - chair
+  - table
+  - sofa
+  - door
+  - window
+  - refrigerator
+  - whiteboard
+  - painting
+  - monitor
+  - plant
+  - trash can
+  - cart
+  - bucket
+  - safety sign
+  - fire extinguisher
+  - traffic cone
+  - backpack
+  - bag
+  - box
+  - shelf

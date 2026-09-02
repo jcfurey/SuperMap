@@ -18,10 +18,9 @@
   </a>
 </p>
 
-> Announcement: The code will be released after RSS.
-
 ## News
 
+- 2026-09-02: Initial `semantic_mapping` ROS2 package published: instance-level spatio-temporal tracking (Sec. IV-B), 4D scene graph construction (Sec. IV-C), and VLN grounding (Sec. IV-D), with an offline demo and unit tests. See [Setup](#setup) below.
 - 2026-07-15: Project website and teaser video are now live.
 - 2026-07-15: Initial README and project overview published.
 
@@ -60,11 +59,13 @@ python -m spacy download en_core_web_sm
 ## Run (offline)
 
 ```bash
-python examples/prepare_example_dataset.py   # download example dataset (one-time)
+python examples/prepare_example_dataset.py   # generate a synthetic demo sequence (one-time)
 python examples/example.py                   # run the mapping pipeline
 ```
 
-Options: `--detector yoloe|offline`, `--data_dir <path>`, `--config <yaml>`, `--live` (rerun window).
+No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synthesizes a small deterministic RGB-D + odometry + detections sequence (ray-cast against a scripted scene with objects appearing/disappearing, mirroring Sec. V-C) so the pipeline is runnable end-to-end offline. Point `--data_dir` at a real capture once one is available.
+
+Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--config <yaml>`, `--prompts <yaml>`, `--live` (rerun window).
 
 ## Run (live ROS2)
 
@@ -74,7 +75,7 @@ colcon build --packages-select semantic_mapping && source install/setup.bash
 ros2 launch semantic_mapping semantic_mapping.launch.py
 ```
 
-In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic, extrinsic, and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`.
+In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (e.g. [SuperOdometry](https://github.com/superxslam/SuperOdom), Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Topic, extrinsic, and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`.
 
 Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
 

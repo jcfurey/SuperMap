@@ -1,0 +1,71 @@
+semantic_mapping_node:
+  ros__parameters:
+    # --- I/O topics -----------------------------------------------------
+    # SuperMap consumes accurate pose/geometry from an upstream SLAM backbone
+    # (SuperOdometry) rather than estimating it itself; see Sec. IV-A.
+    rgb_topic: /camera/color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    pointcloud_topic: /lidar/points
+    odometry_topic: /super_odometry/odometry
+
+    obj_points_topic: /obj_points
+    obj_boxes_topic: /obj_boxes
+    annotated_image_topic: /semantic_mapping/annotated_image
+
+    world_frame: map
+    body_frame: base_link
+    camera_frame: camera_color_optical_frame
+
+    # Static extrinsic calibration T_BC (body-from-camera), Eq. (3).
+    # [x, y, z, qx, qy, qz, qw]
+    body_from_camera_extrinsics: [0.0, 0.0, 0.0, -0.5, 0.5, -0.5, 0.5]
+
+    # Synchronization slop (seconds) for the RGB/CameraInfo/PointCloud2/Odometry
+    # approximate-time sync used by the live ROS2 node.
+    sync_slop_sec: 0.05
+    sync_queue_size: 30
+
+    # --- Detector backend -------------------------------------------------
+    # One of: offline | yoloe | groundingdino
+    detector: yoloe
+    detector_rate_hz: 1.0   # asynchronous perception runs slower than SLAM (Sec. IV, V-H)
+    prompts_file: config/prompts.yaml
+
+    yoloe:
+      checkpoint: yoloe-v8l-seg.pt
+      device: cuda
+      confidence_threshold: 0.25
+
+    groundingdino:
+      config_path: ""
+      checkpoint_path: ""
+      sam2_checkpoint: ""
+      sam2_model_cfg: ""
+      device: cuda
+      box_threshold: 0.35
+      text_threshold: 0.25
+
+    offline:
+      detections_dir: ""
+
+    # --- Pipeline / mapping parameters (Sec. IV-B, IV-C) ------------------
+    voxel_size: 0.05                       # meters, per-object point fusion resolution
+    tau_eps: 0.15                          # meters, geometric consistency threshold (Eq. 9)
+    max_points_per_object: 20000
+    max_points_per_detection: 4000
+    prune_log_odds: -1.5                   # Eq. (8) clamp; points below this are dropped
+    active_occupied_fraction: 0.6
+    disappeared_occupied_fraction: 0.2
+    max_occlusion_frames: 30
+    min_label_confidence: 0.4              # Eq. (10) instance-level confirmation threshold
+    min_observations_for_confidence_check: 5
+    min_hits_to_confirm: 2
+    association_iou_threshold: 0.3
+    disappeared_prune_grace_frames: 60
+
+    scene_graph_cluster_radius: 2.0        # meters, Sec. IV-C clustering for real-time predicates
+    scene_graph_z_tolerance: 0.1           # meters, "On" predicate z_min ~= z_max tolerance
+    scene_graph_xy_iou_threshold: 0.05     # gamma in Eq. On(A,B) predicate
+    scene_graph_beside_max_distance: 1.0   # meters
+
+    publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
