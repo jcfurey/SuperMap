@@ -11,7 +11,8 @@ Which metrics run depends on the ground truth the sequence carries:
   change-detection recall (TP: 3D IoU > 0.1, centroid < 0.3 m, correct
   label), identity fragmentation, and a final-map precision / recall / F1 in
   the spirit of Sec. V-E (semantic_mapping/evaluation.py).
-* ``gt_points.npz`` or an annotated ScanNet mesh -> Sec. V-B class-level
+* ``gt_points.npz`` or an annotated ScanNet mesh (next to a ``.sens`` capture or
+  a SensReader export) -> Sec. V-B class-level
   mIoU / f-mIoU / accuracy with and without background (Table II) and
   instance-level AP25 / AP50 per class (Table III)
   (semantic_mapping/segmentation_metrics.py).
@@ -37,7 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--detector", choices=["offline", "yoloe", "groundingdino"], default="offline")
     parser.add_argument("--data_dir", default="data/example_scene",
-                        help="Sequence directory (datasets.py layout) or a ScanNet scene export.")
+                        help="Sequence directory (datasets.py layout), a ScanNet scene export, or a raw .sens capture.")
     parser.add_argument("--config", default="config/semantic_mapping.yaml")
     parser.add_argument("--prompts", default="config/prompts.yaml")
     parser.add_argument("--eval_config", default="config/segmentation_eval.yaml",

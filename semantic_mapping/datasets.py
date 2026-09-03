@@ -98,10 +98,13 @@ class SequenceDataset:
 
 def load_dataset(data_dir: str | Path, frame_skip: int = 1, max_frames: int | None = None):
     """Open a sequence directory with whichever loader matches its layout."""
-    from semantic_mapping.datasets_scannet import ScanNetScene, is_scannet_scene
+    from semantic_mapping.datasets_scannet import ScanNetScene, ScanNetSensSequence, find_sens, is_scannet_scene
 
     if is_scannet_scene(data_dir):
         return ScanNetScene(data_dir, frame_skip=frame_skip, max_frames=max_frames)
+    sens = find_sens(data_dir)
+    if sens is not None:
+        return ScanNetSensSequence(sens, frame_skip=frame_skip, max_frames=max_frames)
     return SequenceDataset(data_dir, frame_skip=frame_skip, max_frames=max_frames)
 
 

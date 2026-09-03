@@ -1,7 +1,10 @@
-"""ScanNet scene loader for the Sec. V-B benchmark (Tables II-III).
+"""ScanNet scene loaders for the Sec. V-B benchmark (Tables II-III).
 
-Reads a scene exported with ScanNet's ``SensReader`` (the standard layout
-every ScanNet pipeline consumes) plus the annotated mesh::
+Two inputs are supported: the raw ``<scene>.sens`` capture as downloaded
+(:class:`ScanNetSensSequence`, decoded lazily, no export step needed) and a
+scene exported with ScanNet's ``SensReader`` (:class:`ScanNetScene`, the
+layout most ScanNet pipelines consume). Both read the annotated mesh next to
+the capture::
 
     <scene_dir>/                                 e.g. scans/scene0000_00
       color/<frame>.jpg                           RGB (typically 1296x968)
@@ -25,6 +28,8 @@ from __future__ import annotations
 
 import json
 import re
+import struct
+import zlib
 from pathlib import Path
 from typing import Iterator
 
@@ -217,48 +222,182 @@ class ScanNetScene:
             detections=detections,
         )
 
-    # ------------------------------------------------------------ ground truth
-    def _find(self, *suffixes: str) -> Path | None:
-        for suffix in suffixes:
-            candidates = sorted(self.data_dir.glob(f"*{suffix}"))
-            if candidates:
-                return candidates[0]
+    def ground_truth_points(self) -> GroundTruthPoints | None:
+        return scannet_ground_truth_points(self.data_dir)
+
+
+# ------------------------------------------------------------ ground truth
+def _find_in(scene_dir: Path, *suffixes: str) -> Path | None:
+    for suffix in suffixes:
+        candidates = sorted(scene_dir.glob(f"*{suffix}"))
+        if candidates:
+            return candidates[0]
+    return None
+
+
+def scannet_ground_truth_points(scene_dir: str | Path) -> GroundTruthPoints | None:
+    """Annotated mesh vertices with NYU40 class names and instance ids.
+
+    Returns ``None`` when the scene has no ``*_vh_clean_2.labels.ply``.
+    Instance ids come from the segmentation + aggregation files when both
+    are present, otherwise every point is instance -1 (class-level only).
+    """
+    scene_dir = Path(scene_dir)
+    labels_ply = _find_in(scene_dir, "_vh_clean_2.labels.ply")
+    if labels_ply is None:
         return None
+    vertices = read_ply_vertices(labels_ply)
+    points = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1).astype(np.float64)
+    label_ids = np.asarray(vertices.get("label", np.zeros(points.shape[0])), dtype=np.int64)
+    names = np.array(NYU40_CLASSES, dtype=str)
+    valid = (label_ids > 0) & (label_ids < len(NYU40_CLASSES))
+    labels = np.where(valid, names[np.clip(label_ids, 0, len(NYU40_CLASSES) - 1)], UNLABELED)
+
+    instance_ids = np.full(points.shape[0], -1, dtype=np.int64)
+    segs_json = _find_in(scene_dir, "_vh_clean_2.0.010000.segs.json")
+    aggregation_json = _find_in(scene_dir, "_vh_clean.aggregation.json", ".aggregation.json")
+    if segs_json is not None and aggregation_json is not None:
+        seg_indices = np.asarray(json.loads(segs_json.read_text())["segIndices"], dtype=np.int64)
+        if seg_indices.shape[0] == points.shape[0]:
+            seg_to_object: dict[int, int] = {}
+            for group in json.loads(aggregation_json.read_text())["segGroups"]:
+                for seg in group["segments"]:
+                    seg_to_object[int(seg)] = int(group["objectId"])
+            lookup = np.full(int(seg_indices.max()) + 1, -1, dtype=np.int64)
+            for seg, obj in seg_to_object.items():
+                if seg < lookup.shape[0]:
+                    lookup[seg] = obj
+            instance_ids = lookup[seg_indices]
+    return GroundTruthPoints(points=points, labels=labels, instance_ids=instance_ids)
+
+
+# ---------------------------------------------------------------- .sens
+SENS_COLOR_COMPRESSION = {0: "raw", 1: "png", 2: "jpeg"}
+SENS_DEPTH_COMPRESSION = {0: "raw_ushort", 1: "zlib_ushort", 2: "occi_ushort"}
+
+
+class ScanNetSensSequence:
+    """Read a raw ScanNet ``.sens`` capture without exporting it first.
+
+    The file is a small header (sensor name, colour and depth intrinsics and
+    extrinsics, compression types, image sizes, depth shift, frame count)
+    followed by one record per frame: the camera-to-world pose, two
+    timestamps, and the compressed colour (JPEG) and depth (zlib, 16-bit
+    millimetres) payloads. Construction reads only the fixed-size record
+    heads to index frame offsets and poses; frames are decoded on demand.
+    Colour is resized to the depth resolution and the depth intrinsics are
+    used, as with the exported layout.
+    """
+
+    HEADER_FLOATS = 16
+
+    def __init__(self, sens_path: str | Path, frame_skip: int = 1, max_frames: int | None = None) -> None:
+        self.sens_path = Path(sens_path)
+        self.data_dir = self.sens_path.parent
+        self.scene_id = self.sens_path.stem
+        self.detections_dir = self.data_dir / "detections"
+        with open(self.sens_path, "rb") as f:
+            self._read_header(f)
+            self._index_frames(f)
+        self.intrinsics = CameraIntrinsics(
+            fx=float(self.intrinsic_depth[0, 0]), fy=float(self.intrinsic_depth[1, 1]),
+            cx=float(self.intrinsic_depth[0, 2]), cy=float(self.intrinsic_depth[1, 2]),
+            width=int(self.depth_width), height=int(self.depth_height),
+        )
+        valid = [i for i in range(self.num_frames) if np.all(np.isfinite(self._poses[i]))]
+        self.frame_ids = valid[:: max(int(frame_skip), 1)]
+        if max_frames is not None:
+            self.frame_ids = self.frame_ids[:max_frames]
+
+    def _read_header(self, f) -> None:
+        (self.version,) = struct.unpack("<I", f.read(4))
+        (name_length,) = struct.unpack("<Q", f.read(8))
+        self.sensor_name = f.read(name_length).decode("utf-8", errors="replace")
+        matrices = []
+        for _ in range(4):
+            matrices.append(np.array(struct.unpack("<16f", f.read(64)), dtype=np.float64).reshape(4, 4))
+        self.intrinsic_color, self.extrinsic_color, self.intrinsic_depth, self.extrinsic_depth = matrices
+        color_compression, depth_compression = struct.unpack("<ii", f.read(8))
+        self.color_compression = SENS_COLOR_COMPRESSION.get(color_compression, str(color_compression))
+        self.depth_compression = SENS_DEPTH_COMPRESSION.get(depth_compression, str(depth_compression))
+        self.color_width, self.color_height, self.depth_width, self.depth_height = struct.unpack("<4I", f.read(16))
+        (self.depth_shift,) = struct.unpack("<f", f.read(4))
+        (self.num_frames,) = struct.unpack("<Q", f.read(8))
+        if self.depth_compression not in ("raw_ushort", "zlib_ushort"):
+            raise ValueError(f"{self.sens_path}: unsupported depth compression {self.depth_compression!r}")
+
+    def _index_frames(self, f) -> None:
+        self._poses = np.zeros((self.num_frames, 4, 4), dtype=np.float64)
+        self._stamps = np.zeros(self.num_frames, dtype=np.float64)
+        self._records: list[tuple[int, int, int]] = []  # (offset of colour payload, colour bytes, depth bytes)
+        for i in range(self.num_frames):
+            head = f.read(64 + 8 + 8 + 8 + 8)
+            if len(head) < 96:
+                raise ValueError(f"{self.sens_path}: truncated at frame {i}")
+            self._poses[i] = np.array(struct.unpack("<16f", head[:64]), dtype=np.float64).reshape(4, 4)
+            stamp_color, stamp_depth, color_bytes, depth_bytes = struct.unpack("<QQQQ", head[64:96])
+            self._stamps[i] = (stamp_depth or stamp_color) * 1e-6 if (stamp_depth or stamp_color) else i / SCANNET_FPS
+            self._records.append((f.tell(), color_bytes, depth_bytes))
+            f.seek(color_bytes + depth_bytes, 1)
+
+    def __len__(self) -> int:
+        return len(self.frame_ids)
+
+    def _decode(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        offset, color_bytes, depth_bytes = self._records[index]
+        with open(self.sens_path, "rb") as f:
+            f.seek(offset)
+            color_data = f.read(color_bytes)
+            depth_data = f.read(depth_bytes)
+        if self.color_compression == "raw":
+            rgb = np.frombuffer(color_data, dtype=np.uint8).reshape(self.color_height, self.color_width, -1)[:, :, :3]
+        else:
+            import cv2
+
+            decoded = cv2.imdecode(np.frombuffer(color_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise ValueError(f"{self.sens_path}: could not decode colour frame {index}")
+            rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+        raw = zlib.decompress(depth_data) if self.depth_compression == "zlib_ushort" else depth_data
+        depth = np.frombuffer(raw, dtype="<u2").reshape(self.depth_height, self.depth_width)
+        return rgb, depth.astype(np.float32) / float(self.depth_shift or 1000.0)
+
+    def __iter__(self) -> Iterator[SequenceFrame]:
+        for frame_id in self.frame_ids:
+            rgb, depth = self._decode(frame_id)
+            yield SequenceFrame(
+                frame_id=frame_id,
+                stamp=float(self._stamps[frame_id]),
+                rgb=np.ascontiguousarray(_resize_rgb(rgb, self.intrinsics.width, self.intrinsics.height)),
+                depth=depth,
+                T_world_from_cam=self._poses[frame_id].copy(),
+            )
+
+    def observation(self, frame: SequenceFrame, detections: list[Detection2D]) -> Observation:
+        return Observation(
+            stamp=frame.stamp,
+            pose=StampedPose(stamp=frame.stamp, T_world_from_frame=frame.T_world_from_cam),
+            intrinsics=self.intrinsics,
+            rgb=frame.rgb,
+            depth=frame.depth,
+            detections=detections,
+        )
 
     def ground_truth_points(self) -> GroundTruthPoints | None:
-        """Annotated mesh vertices with NYU40 class names and instance ids.
-
-        Returns ``None`` when the scene has no ``*_vh_clean_2.labels.ply``.
-        Instance ids come from the segmentation + aggregation files when both
-        are present, otherwise every point is instance -1 (class-level only).
-        """
-        labels_ply = self._find("_vh_clean_2.labels.ply")
-        if labels_ply is None:
-            return None
-        vertices = read_ply_vertices(labels_ply)
-        points = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1).astype(np.float64)
-        label_ids = np.asarray(vertices.get("label", np.zeros(points.shape[0])), dtype=np.int64)
-        names = np.array(NYU40_CLASSES, dtype=str)
-        valid = (label_ids > 0) & (label_ids < len(NYU40_CLASSES))
-        labels = np.where(valid, names[np.clip(label_ids, 0, len(NYU40_CLASSES) - 1)], UNLABELED)
-
-        instance_ids = np.full(points.shape[0], -1, dtype=np.int64)
-        segs_json = self._find("_vh_clean_2.0.010000.segs.json")
-        aggregation_json = self._find("_vh_clean.aggregation.json", ".aggregation.json")
-        if segs_json is not None and aggregation_json is not None:
-            seg_indices = np.asarray(json.loads(segs_json.read_text())["segIndices"], dtype=np.int64)
-            if seg_indices.shape[0] == points.shape[0]:
-                seg_to_object: dict[int, int] = {}
-                for group in json.loads(aggregation_json.read_text())["segGroups"]:
-                    for seg in group["segments"]:
-                        seg_to_object[int(seg)] = int(group["objectId"])
-                lookup = np.full(int(seg_indices.max()) + 1, -1, dtype=np.int64)
-                for seg, obj in seg_to_object.items():
-                    if seg < lookup.shape[0]:
-                        lookup[seg] = obj
-                instance_ids = lookup[seg_indices]
-        return GroundTruthPoints(points=points, labels=labels, instance_ids=instance_ids)
+        return scannet_ground_truth_points(self.data_dir)
 
 
 def is_scannet_scene(path: str | Path) -> bool:
     return (Path(path) / "intrinsic" / "intrinsic_depth.txt").exists()
+
+
+def find_sens(path: str | Path) -> Path | None:
+    """The ``.sens`` file a path denotes: the file itself, or the only one in a scene directory."""
+    path = Path(path)
+    if path.is_file() and path.suffix == ".sens":
+        return path
+    if path.is_dir():
+        candidates = sorted(path.glob("*.sens"))
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
