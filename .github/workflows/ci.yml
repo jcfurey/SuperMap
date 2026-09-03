@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: unit tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install offline dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy scipy PyYAML opencv-python-headless "pytest>=7.4,<8"
+      - name: Generate the synthetic scene
+        run: python examples/prepare_example_dataset.py
+      - name: Unit tests
+        run: python -m pytest test -q
+      - name: Offline pipeline, evaluation, query, benchmark
+        run: |
+          python examples/example.py > /dev/null
+          python examples/evaluate.py --json results.json
+          python examples/query.py "go to the sofa, then the shelf"
+          python examples/benchmark.py
+      - name: Metric regression gate (Sec. V-D / V-B on the synthetic scene)
+        run: |
+          python - <<'EOF'
+          import json
+          r = json.load(open("results.json"))
+          temporal, seg = r["temporal"], r["segmentation"]
+          checks = {
+              "mean detection recall >= 0.90": temporal["mean_detection_recall"] >= 0.90,
+              "mean change recall >= 0.90": temporal["mean_change_recall"] >= 0.90,
+              "final-map F1 >= 0.80": temporal["final_map"]["f1"] >= 0.80,
+              "instance IDs created <= 10": temporal["total_instance_ids_created"] <= 10,
+              "mIoU without background >= 0.95": seg["class_level"]["without_background"]["miou"] >= 0.95,
+              "mAP50 >= 0.95": seg["instance_level"]["ap50"]["map"] >= 0.95,
+          }
+          for name, ok in checks.items():
+              print(("PASS " if ok else "FAIL ") + name)
+          assert all(checks.values()), "metric regression"
+          EOF
+
+  docker-lite:
+    name: docker image (ROS 2 Jazzy, no detector stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -f docker/Dockerfile --build-arg INSTALL_DETECTORS=0 -t supermap/semantic_mapping:lite .
+      - name: Tests, offline example, and launch file inside the image
+        run: |
+          docker run --rm supermap/semantic_mapping:lite bash -lc '
+            set -e
+            python3 -m pytest test -q
+            python3 examples/prepare_example_dataset.py
+            python3 examples/example.py > /dev/null
+            ros2 launch semantic_mapping semantic_mapping.launch.py --show-args > /dev/null
+            echo "image OK"'

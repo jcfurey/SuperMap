@@ -113,6 +113,8 @@ docker run --rm -it --gpus all --network host supermap/semantic_mapping         
 # or: docker compose up --build
 ```
 
+Continuous integration (`.github/workflows/ci.yml`) runs the unit tests on Python 3.11 and 3.12, the offline pipeline with a metric regression gate on the synthetic scene (detection recall, change recall, final-map F1, mIoU, mAP50), and builds the lite image to run the tests, the offline example, and the launch file under ROS 2 Jazzy.
+
 ### Query the map (visual-language navigation, Sec. IV-D)
 
 The 4D scene graph is the interface between the map and a VLM: an instruction is answered by serializing a (local) subgraph -- instance IDs, labels, centroids, spatial and temporal relations -- into a prompt, asking the model for target instance IDs inside `<answer>` tags, and resolving those IDs to 3D waypoints from the map.
