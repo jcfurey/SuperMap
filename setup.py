@@ -24,7 +24,7 @@ setup(
         "queryable 4D scene graph for language-guided navigation."
     ),
     license="MIT",
-    tests_require=["pytest"],
+    extras_require={"test": ["pytest>=7.4,<8"]},
     entry_points={
         "console_scripts": [
             "semantic_mapping_node = semantic_mapping.node:main",

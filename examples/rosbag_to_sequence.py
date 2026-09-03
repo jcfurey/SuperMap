@@ -266,7 +266,11 @@ def main() -> None:
                 "quaternion": rotation_matrix_to_quaternion(T_world_from_cam[:3, :3]).tolist()}
         (frames_dir / f"{frame_id:06d}_pose.json").write_text(json.dumps(pose))
         if detector is not None:
-            write_detections(detections_dir, frame_id, detector.detect(rgb, prompts=prompts))
+            write_detections(
+                detections_dir,
+                frame_id,
+                detector.detect(rgb, prompts=prompts, frame_id=frame_id),
+            )
         frame_id += 1
 
     for topic, msg, t_ns in reader.messages([args.rgb_topic, args.camera_info_topic, depth_topic]):
