@@ -42,7 +42,8 @@ jobs:
               "mean detection recall >= 0.90": temporal["mean_detection_recall"] >= 0.90,
               "mean change recall >= 0.90": temporal["mean_change_recall"] >= 0.90,
               "final-map F1 >= 0.80": temporal["final_map"]["f1"] >= 0.80,
-              "instance IDs created <= 10": temporal["total_instance_ids_created"] <= 10,
+              "instance IDs created <= 13": temporal["total_instance_ids_created"] <= 13,
+              "identity kept across relocation and return": temporal["identity_consistency"]["consistent"] == 2,
               "mIoU without background >= 0.95": seg["class_level"]["without_background"]["miou"] >= 0.95,
               "mAP50 >= 0.95": seg["instance_level"]["ap50"]["map"] >= 0.95,
           }

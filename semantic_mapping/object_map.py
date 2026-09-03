@@ -12,6 +12,7 @@ from scipy.spatial import cKDTree
 
 from semantic_mapping import geometric_consistency as gc
 from semantic_mapping import semantic_fusion as sf
+from semantic_mapping.appearance import cosine_similarity, update_running_embedding
 from semantic_mapping.geometry_utils import bbox3d_from_points, clip_bbox_to_image, invert_se3, iou_3d, project_points
 from semantic_mapping.tracking import TrackKalmanState, init_track
 from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus
@@ -215,6 +216,7 @@ class ObjectMap:
         label: str,
         score: float,
         stamp: float,
+        embedding: np.ndarray | None = None,
     ) -> ObjectInstance:
         """Create a new tentative instance from an unmatched detection."""
         instance_id = self._next_id
@@ -236,6 +238,8 @@ class ObjectMap:
             frames_since_seen=0,
             hits=1,
         )
+        if embedding is not None:
+            instance.embedding, instance.embedding_count = update_running_embedding(None, 0, embedding)
         self.objects[instance_id] = instance
         return instance
 
@@ -275,6 +279,36 @@ class ObjectMap:
 
         instance.label_belief = sf.bayesian_label_update(instance.label_belief, detection.label, detection.score)
         instance.label_belief = sf.prune_low_confidence_labels(instance.label_belief)
+        if detection.embedding is not None:
+            instance.embedding, instance.embedding_count = update_running_embedding(
+                instance.embedding, instance.embedding_count, detection.embedding)
+
+    def revive(
+        self,
+        instance: ObjectInstance,
+        new_points_world: np.ndarray,
+        detection: Detection2D,
+        stamp: float,
+        K: np.ndarray,
+        T_world_from_cam: np.ndarray,
+        depth_image: np.ndarray,
+        relocated: bool,
+    ) -> None:
+        """Bring a retired (disappeared) instance back under its own ID.
+
+        Back in the same place, its old points are kept and re-judged by the
+        evidence update like any re-observed object. Relocated, the old
+        geometry describes where it *was*, so the point set restarts from
+        this detection while the ID, label belief, appearance, and trajectory
+        (which now records the move) carry over.
+        """
+        if relocated or instance.points_world.shape[0] == 0:
+            instance.points_world = np.zeros((0, 3), dtype=np.float64)
+            instance.point_log_odds = np.zeros(0, dtype=np.float64)
+            instance.point_membership = np.zeros(0, dtype=np.float64)
+        self.update_matched(
+            instance, init_track(detection.bbox), new_points_world, detection, stamp, K, T_world_from_cam, depth_image,
+        )
 
     def reactivate(
         self,
@@ -363,6 +397,15 @@ class ObjectMap:
         norm = sum(merged_belief.values()) or 1.0
         keep.label_belief = sf.prune_low_confidence_labels({k: v / norm for k, v in merged_belief.items()})
 
+        if drop.embedding is not None:
+            if keep.embedding is None:
+                keep.embedding, keep.embedding_count = drop.embedding, drop.embedding_count
+            else:
+                total = keep.embedding_count + drop.embedding_count
+                mixed = keep.embedding * keep.embedding_count + drop.embedding * drop.embedding_count
+                keep.embedding = (mixed / max(float(np.linalg.norm(mixed)), 1e-8)).astype(np.float32)
+                keep.embedding_count = total
+
         keep.hits = total_hits
         keep.frames_since_seen = min(keep.frames_since_seen, drop.frames_since_seen)
         keep.first_seen_stamp = min(keep.first_seen_stamp, drop.first_seen_stamp)
@@ -419,20 +462,96 @@ class ObjectMap:
                     merged.append((keep.instance_id, drop.instance_id))
         return merged
 
-    def prune_disappeared(self, grace_period_frames: int = 60) -> list[int]:
-        """Drop instances that have been confirmed disappeared for a while, freeing memory.
+    def reconcile_retired(
+        self, newly_retired: list[ObjectInstance], min_similarity: float,
+    ) -> list[tuple[int, int]]:
+        """Fold a relocated object's provisional record under its original ID.
 
-        Their instance IDs are still retired (never reused), preserving the
-        temporal-edge history already recorded in the scene graph.
+        An object moved before its old spot was confirmed empty is, at the
+        time it is detected at the new place, still an *occluded* instance,
+        so the detection spawns a provisional instance. Once the old spot is
+        confirmed empty and the instance retires, this looks for a live
+        instance with a compatible label that first appeared after the
+        retired one was last seen and matches its appearance, and merges the
+        two: the original ID keeps its history and gains the new geometry,
+        and the trajectory records the move. Returns (kept, dropped) ID pairs.
         """
-        to_remove = [
-            instance_id for instance_id, instance in self.objects.items()
-            if instance.status == ObjectStatus.DISAPPEARED
-            and instance.frames_since_seen > grace_period_frames
-        ]
-        for instance_id in to_remove:
-            del self.objects[instance_id]
-        return to_remove
+        merged: list[tuple[int, int]] = []
+        for old in newly_retired:
+            if old.embedding is None or old.instance_id not in self.objects:
+                continue
+            best, best_similarity = None, min_similarity
+            for candidate in self.objects.values():
+                if candidate is old or candidate.status == ObjectStatus.DISAPPEARED or candidate.embedding is None:
+                    continue
+                if candidate.first_seen_stamp <= old.latest_stamp or candidate.points_world.shape[0] == 0:
+                    continue
+                if not (set(candidate.label_belief) & set(old.label_belief)):
+                    continue
+                similarity = cosine_similarity(candidate.embedding, old.embedding)
+                if similarity >= best_similarity:
+                    best, best_similarity = candidate, similarity
+            if best is not None:
+                self._absorb_relocated(old, best)
+                merged.append((old.instance_id, best.instance_id))
+        return merged
+
+    def _absorb_relocated(self, keep: ObjectInstance, moved: ObjectInstance) -> None:
+        """``keep`` (retired) takes over ``moved``'s geometry and tracking state."""
+        keep.points_world = moved.points_world
+        keep.point_log_odds = moved.point_log_odds
+        keep.point_membership = moved.point_membership
+        keep.bbox3d = moved.bbox3d
+        keep.track = moved.track
+        keep.status = ObjectStatus.ACTIVE if moved.status == ObjectStatus.TENTATIVE else moved.status
+        keep.latest_stamp = moved.latest_stamp
+        keep.frames_since_seen = moved.frames_since_seen
+        keep.points_contradicted = moved.points_contradicted
+        total_hits = keep.hits + moved.hits
+        merged_belief: dict[str, float] = {}
+        for belief, weight in ((keep.label_belief, keep.hits), (moved.label_belief, moved.hits)):
+            for label, prob in belief.items():
+                merged_belief[label] = merged_belief.get(label, 0.0) + weight * prob
+        norm = sum(merged_belief.values()) or 1.0
+        keep.label_belief = sf.prune_low_confidence_labels({k: v / norm for k, v in merged_belief.items()})
+        keep.hits = total_hits
+        if moved.embedding is not None and keep.embedding is not None:
+            mixed = keep.embedding * keep.embedding_count + moved.embedding * moved.embedding_count
+            keep.embedding = (mixed / max(float(np.linalg.norm(mixed)), 1e-8)).astype(np.float32)
+            keep.embedding_count += moved.embedding_count
+        # History: where it was until it went missing, a gap, then where it turned up.
+        left_at = moved.first_seen_stamp
+        before = [s for s in keep.trajectory if s[0] < left_at and s[2] != ObjectStatus.DISAPPEARED.value]
+        last_center = before[-1][1] if before else keep.trajectory[-1][1] if keep.trajectory else keep.center
+        keep.trajectory = before + [(left_at, np.array(last_center, dtype=np.float64), ObjectStatus.DISAPPEARED.value)] \
+            + [s for s in moved.trajectory if s[0] >= left_at]
+        del self.objects[moved.instance_id]
+
+    def compact_disappeared(self, grace_period_frames: int = 60, max_retired: int = 1000) -> list[int]:
+        """Retire disappeared instances: keep their identity, release their points.
+
+        A disappeared instance stays in the map -- its ID, label belief, last
+        box, appearance, and trajectory are what re-identification and
+        "where was it" queries need -- but after ``grace_period_frames`` its
+        per-point arrays are released, since the geometry no longer describes
+        anything present. Beyond ``max_retired`` retired instances the least
+        recently seen are evicted (their IDs are never reused). Returns the
+        evicted IDs. Call once per frame: disappeared instances are not
+        visited by the per-frame update, so their age advances here.
+        """
+        retired = [o for o in self.objects.values() if o.status == ObjectStatus.DISAPPEARED]
+        for instance in retired:
+            instance.frames_since_seen += 1
+            if instance.frames_since_seen > grace_period_frames and instance.points_world.shape[0] > 0:
+                instance.points_world = np.zeros((0, 3), dtype=np.float64)
+                instance.point_log_odds = np.zeros(0, dtype=np.float64)
+                instance.point_membership = np.zeros(0, dtype=np.float64)
+        evicted: list[int] = []
+        if len(retired) > max_retired:
+            for instance in sorted(retired, key=lambda o: o.latest_stamp)[: len(retired) - max_retired]:
+                del self.objects[instance.instance_id]
+                evicted.append(instance.instance_id)
+        return evicted
 
     def active_objects(self) -> list[ObjectInstance]:
         return [obj for obj in self.objects.values() if obj.status == ObjectStatus.ACTIVE]

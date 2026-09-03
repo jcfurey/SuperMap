@@ -137,6 +137,13 @@ class ObjectInstance:
     instance's trajectory (Sec. IV-C), used for temporal-edge queries such as
     "where was this object before it disappeared"."""
 
+    embedding: np.ndarray | None = None
+    """Unit-norm running mean of the appearance descriptors of the detections
+    fused into this instance (semantic_mapping.appearance); what lets the
+    same physical object keep its ID after it disappears and turns up elsewhere."""
+
+    embedding_count: int = 0
+
     @property
     def label(self) -> str:
         if not self.label_belief:

@@ -118,3 +118,15 @@ def test_pipeline_continues_from_saved_map_with_the_same_identity(tmp_path):
     assert [o.instance_id for o in result.objects] == [chair_id]  # re-observed, not re-spawned
     assert result.objects[0].status == ObjectStatus.ACTIVE
     assert result.objects[0].hits > hits_before
+
+
+def test_embeddings_round_trip(tmp_path):
+    saved = _populated_map()
+    saved.objects[3].embedding = np.array([0.6, 0.8, 0.0], dtype=np.float32)
+    saved.objects[3].embedding_count = 4
+    persistence.save_map(saved, tmp_path / "map")
+    restored = ObjectMap()
+    persistence.load_map(tmp_path / "map", restored, resume=False)
+    np.testing.assert_allclose(restored.objects[3].embedding, [0.6, 0.8, 0.0], atol=1e-6)
+    assert restored.objects[3].embedding.dtype == np.float32 and restored.objects[3].embedding_count == 4
+    assert restored.objects[5].embedding is None and restored.objects[5].embedding_count == 0

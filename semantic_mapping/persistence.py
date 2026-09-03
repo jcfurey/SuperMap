@@ -57,6 +57,8 @@ def instance_to_record(obj: ObjectInstance) -> dict:
         "hits": int(obj.hits),
         "points_contradicted": int(obj.points_contradicted),
         "trajectory": [[float(stamp), _floats(center), str(status)] for stamp, center, status in obj.trajectory],
+        "embedding": _floats(obj.embedding) if obj.embedding is not None else None,
+        "embedding_count": int(obj.embedding_count),
     }
 
 
@@ -85,6 +87,8 @@ def instance_from_record(
         points_contradicted=int(record.get("points_contradicted", 0)),
         point_membership=np.asarray(membership, dtype=np.float64),
         trajectory=[(float(s), np.asarray(c, dtype=np.float64), str(st)) for s, c, st in record.get("trajectory", [])],
+        embedding=(np.asarray(record["embedding"], dtype=np.float32) if record.get("embedding") is not None else None),
+        embedding_count=int(record.get("embedding_count", 0)),
     )
 
 

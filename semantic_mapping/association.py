@@ -149,6 +149,67 @@ def associate_3d(
     return _solve(cost, rows, cols, lambda i, j: True)
 
 
+def reidentify(
+    detection_bboxes3d: list[np.ndarray | None],
+    detection_labels: list[str],
+    detection_embeddings: list[np.ndarray | None],
+    retired: list[ObjectInstance],
+    min_similarity: float = 0.85,
+    iou_threshold: float = 0.05,
+    containment_margin: float = 0.25,
+    max_age_sec: float = 0.0,
+    now: float = 0.0,
+    candidate_detections: list[int] | None = None,
+) -> tuple[AssociationResult, set[tuple[int, int]]]:
+    """Match still-unmatched detections against retired (disappeared) instances.
+
+    An identity comes back under its old ID in two situations (Sec. IV-B,
+    "stable identities across relocations"): the object is detected again
+    where it used to be (label compatible, 3D box overlapping or containing
+    the old one), or it is detected somewhere else looking the same
+    (label compatible, appearance similarity at least ``min_similarity``).
+    When both sides carry an embedding, a similarity below the threshold
+    vetoes even a same-place match, so a different object put in the old
+    spot gets a new ID. ``max_age_sec`` (0 = unlimited) bounds how long ago
+    the instance was last seen. Returns the assignment and the set of
+    (instance index, detection index) pairs that matched by place.
+    """
+    from semantic_mapping.appearance import cosine_similarity
+
+    rows = list(range(len(retired)))
+    cols = list(range(len(detection_bboxes3d))) if candidate_detections is None else list(candidate_detections)
+    cost = np.full((len(rows), len(cols)), INVALID_COST, dtype=np.float64)
+    by_place: set[tuple[int, int]] = set()
+    for r, i in enumerate(rows):
+        obj = retired[i]
+        if max_age_sec > 0 and now - obj.latest_stamp > max_age_sec:
+            continue
+        has_box = bool(np.any(obj.bbox3d[3:] > obj.bbox3d[:3]))
+        for c, j in enumerate(cols):
+            det_box = detection_bboxes3d[j]
+            if det_box is None or not _labels_compatible(detection_labels[j], obj):
+                continue
+            det_center = centroid(det_box)
+            same_place = has_box and (
+                iou_3d(det_box, obj.bbox3d) > iou_threshold
+                or _inside_expanded(det_center, obj.bbox3d, containment_margin)
+                or _inside_expanded(obj.center, det_box, containment_margin)
+            )
+            similarity = None
+            if detection_embeddings[j] is not None and obj.embedding is not None:
+                similarity = cosine_similarity(detection_embeddings[j], obj.embedding)
+                if similarity < min_similarity:
+                    continue  # looks like a different object, wherever it is
+            if not same_place and similarity is None:
+                continue  # a relocation can only be claimed on appearance
+            appearance_cost = (1.0 - similarity) if similarity is not None else 0.5
+            cost[r, c] = appearance_cost - (0.5 if same_place else 0.0) + 0.01 * float(np.linalg.norm(det_center - obj.center))
+            if same_place:
+                by_place.add((i, j))
+    result = _solve(cost, rows, cols, lambda i, j: True)
+    return result, {pair for pair in by_place if pair in set(result.matches)}
+
+
 def should_reactivate(
     frames_since_seen: int,
     max_occlusion_frames: int,
