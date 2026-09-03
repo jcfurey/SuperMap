@@ -71,15 +71,28 @@ def test_update_unmatched_stays_active_when_still_geometrically_consistent():
     assert obj.status != ObjectStatus.DISAPPEARED
 
 
-def test_prune_disappeared_removes_after_grace_period():
+def test_compact_disappeared_keeps_identity_releases_points_and_evicts_oldest():
     m = ObjectMap()
-    points = np.array([[0.0, 0.0, 2.0]])
-    obj = m.spawn(np.array([40.0, 30.0, 60.0, 50.0]), points, "chair", 0.9, stamp=0.0)
-    obj.status = ObjectStatus.DISAPPEARED
-    obj.frames_since_seen = 100
-    removed = m.prune_disappeared(grace_period_frames=10)
-    assert removed == [obj.instance_id]
-    assert obj.instance_id not in m.objects
+    points = np.random.default_rng(0).uniform(size=(30, 3))
+    gone = [m.spawn(np.array([0, 0, 10, 10.0]), points + i, "box", 0.9, stamp=float(i)) for i in range(3)]
+    for obj in gone:
+        obj.status = ObjectStatus.DISAPPEARED
+    alive = m.spawn(np.array([0, 0, 10, 10.0]), points + 10, "box", 0.9, stamp=9.0)
+    alive.status = ObjectStatus.ACTIVE
+
+    for _ in range(5):
+        assert m.compact_disappeared(grace_period_frames=10, max_retired=10) == []
+    assert all(o.points_world.shape[0] == 30 for o in gone)          # within the grace period: geometry kept
+    for _ in range(6):
+        m.compact_disappeared(grace_period_frames=10, max_retired=10)
+    assert all(o.points_world.shape[0] == 0 and o.instance_id in m.objects for o in gone)
+    assert all(np.all(o.bbox3d[3:] > o.bbox3d[:3]) for o in gone)     # last box survives for re-identification
+    assert alive.points_world.shape[0] == 30 and alive.frames_since_seen == 0
+
+    evicted = m.compact_disappeared(grace_period_frames=10, max_retired=1)
+    assert evicted == [gone[0].instance_id, gone[1].instance_id]     # least recently seen go first
+    assert set(m.objects) == {gone[2].instance_id, alive.instance_id}
+    assert m._next_id == 5                                            # evicted IDs are never reused
 
 
 def test_voxel_downsample_indices_keeps_first_occurrence_ascending():

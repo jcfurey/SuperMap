@@ -64,21 +64,23 @@ python examples/example.py                   # run the mapping pipeline
 python examples/evaluate.py                  # score it with the paper's metrics (Sec. V-D / V-E)
 ```
 
-No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synthesizes a small deterministic RGB-D + odometry + detections sequence (ray-cast against a scripted scene with objects appearing/disappearing, mirroring Sec. V-C) so the pipeline is runnable end-to-end offline. Detections come with instance masks, as the paper's Grounding DINO + SAM2 pairing produces; `--no_masks` emits box-only detections to exercise the harder fallback path. Point `--data_dir` at a real capture once one is available (layout documented in `semantic_mapping/datasets.py`).
+No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synthesizes a small deterministic RGB-D + odometry + detections sequence (ray-cast against a scripted scene with objects appearing, disappearing, being moved, and being brought back, mirroring Sec. V-C) so the pipeline is runnable end-to-end offline. Detections come with instance masks, as the paper's Grounding DINO + SAM2 pairing produces; `--no_masks` emits box-only detections to exercise the harder fallback path. Point `--data_dir` at a real capture once one is available (layout documented in `semantic_mapping/datasets.py`).
 
-`evaluate.py` implements the paper's true-positive criterion (3D IoU > 0.1, centroid < 0.3 m, correct label) and reports per-object detection recall and change-detection recall (Sec. V-D), identity fragmentation, and a final-map precision/recall/F1 in the spirit of the Sec. V-E ablation. On the synthetic sequence (9 objects, 3 removed and 3 introduced mid-sequence):
+`evaluate.py` implements the paper's true-positive criterion (3D IoU > 0.1, centroid < 0.3 m, correct label) and reports per-object detection recall and change-detection recall (Sec. V-D), identity fragmentation, identity consistency across relocation and return events, and a final-map precision/recall/F1 in the spirit of the Sec. V-E ablation. On the synthetic sequence (11 objects: 3 removed, 3 introduced, 1 moved, 1 taken away and brought back):
 
-| detections | detection recall | change recall | instance IDs / objects | final-map F1 |
-|---|---|---|---|---|
-| boxes + masks | 0.97 | 0.96 | 9 / 9 | 0.86 |
-| boxes only (`--no_masks`) | 0.47 | 0.52 | 14 / 9 | 0.53 |
+| detections | detection recall | change recall | identity kept (moved / returned) | instance IDs / objects | final-map F1 |
+|---|---|---|---|---|---|
+| boxes + masks | 0.98 | 0.96 | 2 / 2 | 12 / 11 | 0.89 |
+| boxes only (`--no_masks`) | 0.69 | 0.69 | 0 / 2 | 18 / 11 | 0.53 |
+
+The twelfth ID is the provisional one the moved box holds for the three frames between being seen at its new place and its old spot being confirmed empty; it is then folded into the original identity (see [Identities across relocation](#identities-across-relocation-and-return)).
 
 `evaluate.py` also runs the paper's segmentation benchmark (Sec. V-B): map instances are transferred onto annotated points by nearest neighbour and scored with class-level mIoU / f-mIoU / accuracy, with and without background classes (Table II), and instance-level AP25 / AP50 per class (Table III). The synthetic scene ships annotated surfaces (`gt_points.npz`), so this runs offline too; the mask run above scores:
 
 | setting | mIoU | f-mIoU | Acc | mAP25 | mAP50 |
 |---|---|---|---|---|---|
-| without background | 0.996 | 0.996 | 0.996 | 1.000 | 1.000 |
-| with background (wall / floor / ceiling) | 0.609 | 0.090 | 0.096 | | |
+| without background | 0.996 | 0.997 | 0.997 | 1.000 | 1.000 |
+| with background (wall / floor / ceiling) | 0.628 | 0.095 | 0.103 | | |
 
 The "with background" gap is the map never predicting wall / floor / ceiling, the same effect visible in the paper's Table II. ScanNet scenes are read straight from the standard `SensReader` export plus the annotated mesh (`semantic_mapping/datasets_scannet.py`); vocabulary-to-class aliases and the background set live in `config/segmentation_eval.yaml`:
 
@@ -138,20 +140,24 @@ A two-hour run accumulates far more instances than the camera sees at any moment
 
 | instances | points | map update, culled | map update, exhaustive | full frame, culled |
 |---|---|---|---|---|
-| 7 | 9 k | 20 ms | 20 ms | 30 ms |
-| 77 | 102 k | 20 ms | 38 ms | 30 ms |
-| 357 | 472 k | 26 ms | 139 ms | 41 ms |
-| 707 | 934 k | 34 ms | 287 ms | 56 ms |
+| 9 | 10 k | 22 ms | 19 ms | 37 ms |
+| 99 | 108 k | 25 ms | 44 ms | 37 ms |
+| 459 | 499 k | 25 ms | 134 ms | 40 ms |
+| 909 | 988 k | 35 ms | 356 ms | 56 ms |
 
 ### Sparse LiDAR depth
 
 A LiDAR scan rasterized into the camera covers a few percent of the pixels, and a pixel without a reading carries no evidence for the consistency update and contributes no points when a detection is back-projected. Two settings address this: `depth_fill_radius_px` fills empty pixels from the nearest readings (the geometric evidence uses depth filled from all readings, while each detection is back-projected through depth filled only from readings inside its own mask, so background never leaks into an object), and `pointcloud_accumulate_scans` rasterizes the last N scans carried through TF. On the synthetic scene rendered LiDAR-like (`prepare_example_dataset.py --lidar_like`, 5% of pixels with 2 cm range noise):
 
-| depth | detection recall | change recall | instance IDs / objects | final-map F1 |
-|---|---|---|---|---|
-| dense | 0.97 | 0.96 | 9 / 9 | 0.86 |
-| 5% sparse, no fill | 0.94 | 0.94 | 12 / 9 | 0.75 |
-| 5% sparse, `depth_fill_radius_px: 2` | 0.93 | 0.93 | 9 / 9 | 0.86 |
+| depth | detection recall | change recall | identity kept | instance IDs / objects | final-map F1 |
+|---|---|---|---|---|---|
+| dense | 0.98 | 0.96 | 2 / 2 | 12 / 11 | 0.89 |
+| 5% sparse, no fill | 0.96 | 0.96 | 1 / 2 | 17 / 11 | 0.73 |
+| 5% sparse, `depth_fill_radius_px: 2` | 0.96 | 0.96 | 2 / 2 | 13 / 11 | 0.89 |
+
+### Identities across relocation and return
+
+The paper's instance IDs are meant to be stable "even across relocations", which geometry alone cannot deliver. Every detection therefore carries an appearance descriptor (`appearance_embedder`: a shading-invariant chromaticity histogram by default, which needs no model, or CLIP via `open_clip_torch`), each instance keeps a running mean of the descriptors it was built from, and a disappeared instance stays in the map as a retired identity with its points released after `disappeared_prune_grace_frames`. A detection that no live instance claims is then matched against the retired pool (association stage 4): back in the old place with a compatible label it re-attaches by geometry, anywhere else it re-attaches when the appearance similarity clears `reid_min_similarity`, and a similarity below that vetoes even a same-place match so a different object put in the old spot gets a new ID. An object moved before its old spot is confirmed empty holds a provisional ID until the old instance retires, at which point the two records are reconciled under the original ID with the new geometry. The trajectory records the move, and the VLM prompt reports it ("disappeared at t=2.30s and reappeared at t=3.60s, moved from [...] to [...]"). `evaluate.py` scores this as identity consistency: the fraction of moved or returned objects served by a single instance ID across all their phases.
 
 ### Real captures: rosbag2 to sequence
 

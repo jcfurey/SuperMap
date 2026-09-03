@@ -7,7 +7,10 @@ room containing a handful of labeled axis-aligned "objects" while three of
 them are scripted to disappear partway through and three new ones to
 appear, mirroring the qualitative scenario in Sec. V-C of the paper (a
 plant, trash can, and chair removed; a bucket, cart, and safety sign
-added). Depth, RGB, camera pose, and "boxer" pre-baked 2D detections are
+added), plus a box that is moved to another spot and a backpack that is
+taken away and brought back, the relocation and return cases whose
+identities Sec. IV-B says must persist. Depth, RGB, camera pose, and
+"boxer" pre-baked 2D detections are
 rendered analytically (ray/box intersection) so ``examples/example.py`` can
 run the full pipeline against real geometry without any external downloads
 or GPU models.
@@ -36,42 +39,80 @@ WORLD_UP = np.array([0.0, 0.0, 1.0])
 
 
 @dataclass
+class ScenePhase:
+    """One contiguous presence interval of an object at one place."""
+
+    appear_frac: float
+    """Fraction of the sequence (0-1) at which the object becomes present here."""
+
+    disappear_frac: float
+    """Fraction of the sequence (0-1) at which it is removed from here (1.0 = never)."""
+
+    center_xy: tuple[float, float]
+
+
+@dataclass
 class SceneObject:
     label: str
-    center_xy: tuple[float, float]
     half_extents: tuple[float, float, float]
     z_center: float
     color: tuple[int, int, int]
-    appear_frac: float
-    """Fraction of the sequence (0-1) at which this object becomes present."""
+    phases: list[ScenePhase]
+    """Where and when the object is present. One phase: static, removed, or
+    added; two phases at different places: relocated; two at the same place:
+    taken away and brought back."""
 
-    disappear_frac: float
-    """Fraction of the sequence (0-1) at which this object is removed (1.0 = never)."""
+    def phase_at(self, frac: float) -> ScenePhase | None:
+        return next((p for p in self.phases if p.appear_frac <= frac < p.disappear_frac), None)
 
-    def bbox3d(self) -> np.ndarray:
-        cx, cy = self.center_xy
+    def is_present(self, frac: float) -> bool:
+        return self.phase_at(frac) is not None
+
+    def bbox_for(self, phase: ScenePhase) -> np.ndarray:
+        cx, cy = phase.center_xy
         hx, hy, hz = self.half_extents
         return np.array([cx - hx, cy - hy, self.z_center - hz, cx + hx, cy + hy, self.z_center + hz])
 
-    def is_present(self, frac: float) -> bool:
-        return self.appear_frac <= frac < self.disappear_frac
+
+def _obj(label, center_xy, half_extents, z_center, color, appear=0.0, disappear=1.0) -> SceneObject:
+    return SceneObject(label, half_extents, z_center, color, [ScenePhase(appear, disappear, center_xy)])
 
 
 # Mirrors the paper's qualitative long-horizon change scenario (Sec. V-C):
-# three static fixtures, three objects removed partway through, three added.
+# three static fixtures, three objects removed partway through, three added,
+# one relocated, one taken away and brought back.
 SCENE_OBJECTS: list[SceneObject] = [
-    SceneObject("table", (0.0, 1.6), (0.6, 0.4, 0.4), 0.4, (150, 110, 70), 0.0, 1.0),
-    SceneObject("sofa", (-2.2, -1.0), (0.9, 0.5, 0.4), 0.4, (90, 90, 160), 0.0, 1.0),
-    SceneObject("shelf", (2.4, -1.6), (0.4, 0.3, 1.0), 1.0, (120, 120, 120), 0.0, 1.0),
+    _obj("table", (0.0, 1.6), (0.6, 0.4, 0.4), 0.4, (150, 110, 70)),
+    _obj("sofa", (-2.2, -1.0), (0.9, 0.5, 0.4), 0.4, (90, 90, 160)),
+    _obj("shelf", (2.4, -1.6), (0.4, 0.3, 1.0), 1.0, (120, 120, 120)),
     # Removed partway through:
-    SceneObject("plant", (1.6, 1.4), (0.25, 0.25, 0.5), 0.5, (60, 150, 70), 0.0, 0.55),
-    SceneObject("trash can", (-1.4, 1.7), (0.2, 0.2, 0.35), 0.35, (80, 80, 80), 0.0, 0.55),
-    SceneObject("chair", (0.6, -1.8), (0.25, 0.25, 0.45), 0.45, (170, 130, 90), 0.0, 0.55),
+    _obj("plant", (1.6, 1.4), (0.25, 0.25, 0.5), 0.5, (60, 150, 70), 0.0, 0.55),
+    _obj("trash can", (-1.4, 1.7), (0.2, 0.2, 0.35), 0.35, (80, 80, 80), 0.0, 0.55),
+    _obj("chair", (0.6, -1.8), (0.25, 0.25, 0.45), 0.45, (170, 130, 90), 0.0, 0.55),
     # Newly introduced partway through:
-    SceneObject("bucket", (0.7, 0.3), (0.2, 0.2, 0.25), 0.25, (200, 60, 60), 0.45, 1.0),
-    SceneObject("cart", (-2.0, 0.4), (0.35, 0.5, 0.5), 0.5, (60, 60, 200), 0.45, 1.0),
-    SceneObject("safety sign", (2.0, 0.6), (0.05, 0.3, 0.5), 0.9, (230, 200, 40), 0.45, 1.0),
+    _obj("bucket", (0.7, 0.3), (0.2, 0.2, 0.25), 0.25, (200, 60, 60), 0.45, 1.0),
+    _obj("cart", (-2.0, 0.4), (0.35, 0.5, 0.5), 0.5, (60, 60, 200), 0.45, 1.0),
+    _obj("safety sign", (2.0, 0.6), (0.05, 0.3, 0.5), 0.9, (230, 200, 40), 0.45, 1.0),
+    # Relocated: same physical box, moved to the other side of the room.
+    SceneObject("box", (0.2, 0.25, 0.2), 0.2, (210, 130, 40),
+                [ScenePhase(0.0, 0.4, (-0.6, -0.6)), ScenePhase(0.6, 1.0, (1.2, -0.4))]),
+    # Taken away and brought back to the same place.
+    SceneObject("backpack", (0.2, 0.15, 0.25), 0.25, (160, 40, 160),
+                [ScenePhase(0.0, 0.3, (-0.9, 0.9)), ScenePhase(0.65, 1.0, (-0.9, 0.9))]),
 ]
+
+
+@dataclass
+class PresentObject:
+    """An object as it stands in one frame: its label, colour, and box."""
+
+    label: str
+    color: tuple[int, int, int]
+    bbox3d: np.ndarray
+    scene_index: int
+    in_final_scene: bool
+    """Whether this box is part of the scene at the end of the sequence (the
+    segmentation ground truth scores the final state)."""
 
 # Backdrop "room shell" the camera ray-casts against where it doesn't hit an
 # object; must comfortably contain the whole camera orbit (radius=3.4 below)
@@ -114,7 +155,7 @@ def _ray_box_hit(origin: np.ndarray, directions: np.ndarray, box: np.ndarray) ->
 def render_frame(
     position: np.ndarray,
     R_world_from_cam: np.ndarray,
-    present_objects: list[SceneObject],
+    present_objects: list[PresentObject],
     width: int,
     height: int,
     fx: float,
@@ -136,7 +177,7 @@ def render_frame(
     best_id = np.full(us.size, -1, dtype=np.int32)
 
     for idx, obj in enumerate(present_objects):
-        dist = _ray_box_hit(position, dirs_world, obj.bbox3d())
+        dist = _ray_box_hit(position, dirs_world, obj.bbox3d)
         closer = dist < best_dist
         best_dist = np.where(closer, dist, best_dist)
         best_id = np.where(closer, idx, best_id)
@@ -164,7 +205,7 @@ def render_frame(
 def ground_truth_surfaces(
     depth: np.ndarray,
     object_id_map: np.ndarray,
-    present_objects: list[SceneObject],
+    present_objects: list[PresentObject],
     K: np.ndarray,
     R_world_from_cam: np.ndarray,
     position: np.ndarray,
@@ -190,17 +231,17 @@ def ground_truth_surfaces(
         np.abs(z - ROOM_BOUNDS[2]) < 0.02, "floor", np.where(np.abs(z - ROOM_BOUNDS[5]) < 0.02, "ceiling", "wall"),
     )
     for local_idx, obj in enumerate(present_objects):
-        if not obj.is_present(final_frac):
+        if not obj.in_final_scene:
             continue
         member = ids_local == local_idx
         labels[member] = obj.label
-        instance_ids[member] = SCENE_OBJECTS.index(obj)
+        instance_ids[member] = obj.scene_index
     keep = labels != ""
     return points_world[keep], labels[keep].astype(str), instance_ids[keep]
 
 
 def make_detections(
-    present_objects: list[SceneObject],
+    present_objects: list[PresentObject],
     object_id_map: np.ndarray,
     rng: np.random.Generator,
     detections_dir: Path | None = None,
@@ -267,8 +308,9 @@ def main() -> None:
     target = np.array([0.0, 0.0, 0.9])
     theta0, theta1 = np.deg2rad(200), np.deg2rad(-20)
 
-    visible_frames: dict[str, list[int]] = {o.label: [] for o in SCENE_OBJECTS}
-    present_frames: dict[str, list[int]] = {o.label: [] for o in SCENE_OBJECTS}
+    # Per (object, phase): frames in which it is present / meaningfully visible.
+    visible_frames: dict[tuple[int, int], list[int]] = {}
+    present_frames: dict[tuple[int, int], list[int]] = {}
 
     K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
     final_frac = (args.num_frames - 1) / args.num_frames
@@ -291,7 +333,16 @@ def main() -> None:
         )
         R_world_from_cam = _look_at_rotation(position, target)
 
-        present_objects = [o for o in SCENE_OBJECTS if o.is_present(frac)]
+        present_objects: list[PresentObject] = []
+        phase_keys: list[tuple[int, int]] = []
+        for idx, obj in enumerate(SCENE_OBJECTS):
+            phase = obj.phase_at(frac)
+            if phase is None:
+                continue
+            phase_idx = obj.phases.index(phase)
+            in_final_scene = phase_idx == len(obj.phases) - 1 and obj.is_present(final_frac)
+            present_objects.append(PresentObject(obj.label, obj.color, obj.bbox_for(phase), idx, in_final_scene))
+            phase_keys.append((idx, phase_idx))
         depth, rgb, object_id_map = render_frame(
             position, R_world_from_cam, present_objects, args.width, args.height, fx, fy, cx, cy,
         )
@@ -319,26 +370,33 @@ def main() -> None:
         )
         (detections_dir / f"{frame_id:06d}.json").write_text(json.dumps({"detections": detections}))
 
-        for idx, obj in enumerate(present_objects):
-            present_frames[obj.label].append(frame_id)
-            if int((object_id_map == idx).sum()) >= MIN_VISIBLE_PIXELS:
-                visible_frames[obj.label].append(frame_id)
+        for local_idx, key in enumerate(phase_keys):
+            present_frames.setdefault(key, []).append(frame_id)
+            if int((object_id_map == local_idx).sum()) >= MIN_VISIBLE_PIXELS:
+                visible_frames.setdefault(key, []).append(frame_id)
 
+    # One ground-truth entry per presence phase; entries of the same physical
+    # object share an identity, which is what the identity-consistency metric
+    # scores (the same instance ID must serve every phase).
     scene_meta = {
         "num_frames": args.num_frames,
         "fps": args.fps,
         "objects": [
             {
                 "label": o.label,
-                "bbox3d": o.bbox3d().tolist(),
-                "appear_frac": o.appear_frac,
-                "disappear_frac": o.disappear_frac,
-                # Presence is a single contiguous interval by construction.
-                "appear_frame": present_frames[o.label][0] if present_frames[o.label] else args.num_frames,
-                "disappear_frame": present_frames[o.label][-1] + 1 if present_frames[o.label] else args.num_frames,
-                "visible_frames": visible_frames[o.label],
+                "identity": f"{o.label}#{idx}",
+                "phase": phase_idx,
+                "bbox3d": o.bbox_for(phase).tolist(),
+                "appear_frac": phase.appear_frac,
+                "disappear_frac": phase.disappear_frac,
+                # Each phase is a single contiguous interval by construction.
+                "appear_frame": present_frames.get((idx, phase_idx), [args.num_frames])[0],
+                "disappear_frame": (present_frames[(idx, phase_idx)][-1] + 1
+                                    if (idx, phase_idx) in present_frames else args.num_frames),
+                "visible_frames": visible_frames.get((idx, phase_idx), []),
             }
-            for o in SCENE_OBJECTS
+            for idx, o in enumerate(SCENE_OBJECTS)
+            for phase_idx, phase in enumerate(o.phases)
         ],
     }
     (out_dir / "scene_ground_truth.json").write_text(json.dumps(scene_meta, indent=2))

@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from semantic_mapping import association, persistence, scene_graph as sg, tracking
+from semantic_mapping.appearance import build_embedder
 from semantic_mapping.geometry_utils import (
     back_project_depth,
     bbox3d_from_points,
@@ -53,6 +54,23 @@ class PipelineConfig:
     merge_iou_threshold: float = 0.3
     merge_distance_m: float = 0.25
     disappeared_prune_grace_frames: int = 60
+    """Frames after which a disappeared instance's points are released; its
+    identity stays in the map for re-identification (ObjectMap.compact_disappeared)."""
+
+    max_retired_instances: int = 1000
+    appearance_embedder: str = "color_histogram"
+    """none | color_histogram | clip: descriptor attached to detections and kept
+    per instance for re-identification (semantic_mapping.appearance)."""
+
+    embedder_device: str = "cuda"
+    clip_model: str = "ViT-B-32"
+    clip_pretrained: str = "openai"
+    reid_enabled: bool = True
+    reid_min_similarity: float = 0.85
+    """Appearance similarity below which a retired instance is not the same object."""
+
+    reid_max_age_sec: float = 0.0
+    """How long after it was last seen a retired instance may be re-identified (0 = unlimited)."""
     scene_graph_cluster_radius: float = 2.0
     scene_graph_z_tolerance: float = 0.1
     scene_graph_xy_iou_threshold: float = 0.05
@@ -121,6 +139,10 @@ class SemanticMappingPipeline:
         )
         self._frame_index = 0
         self._edge_cache = sg.SpatialEdgeCache()
+        self.embedder = build_embedder(
+            self.config.appearance_embedder, device=self.config.embedder_device,
+            model_name=self.config.clip_model, pretrained=self.config.clip_pretrained,
+        )
 
     # ------------------------------------------------------------ persistence
     def save(self, path: str | Path, metadata: dict | None = None) -> Path:
@@ -205,6 +227,13 @@ class SemanticMappingPipeline:
         live_objects = [
             obj for obj in self.object_map.objects.values() if obj.status != ObjectStatus.DISAPPEARED
         ]
+        retired_before = {o.instance_id for o in self.object_map.objects.values() if o.status == ObjectStatus.DISAPPEARED}
+
+        if self.embedder is not None and observation.rgb is not None:
+            missing = [d for d in detections if d.embedding is None]
+            if missing:
+                for detection, embedding in zip(missing, self.embedder.embed(observation.rgb, missing)):
+                    detection.embedding = embedding
 
         image_size = (observation.intrinsics.width, observation.intrinsics.height)
         # One batched frustum test decides which instances can be seen at all;
@@ -305,11 +334,32 @@ class SemanticMappingPipeline:
             else:
                 obj.frames_since_seen += 1
 
+        # Stage 4: re-identification against retired instances, so an object
+        # that was removed and comes back -- in place or elsewhere -- keeps its ID.
+        unmatched_detections = stage3.unmatched_detections
+        if cfg.reid_enabled and unmatched_detections:
+            retired = [o for o in self.object_map.objects.values() if o.status == ObjectStatus.DISAPPEARED]
+            if retired:
+                stage4, by_place = association.reidentify(
+                    det_boxes3d, [d.label for d in detections], [d.embedding for d in detections], retired,
+                    min_similarity=cfg.reid_min_similarity, iou_threshold=cfg.reactivation_iou_threshold,
+                    containment_margin=cfg.reactivation_margin_m, max_age_sec=cfg.reid_max_age_sec,
+                    now=observation.stamp, candidate_detections=unmatched_detections,
+                )
+                for obj_idx, det_idx in stage4.matches:
+                    self.object_map.revive(
+                        retired[obj_idx], det_points[det_idx], detections[det_idx], observation.stamp,
+                        K, T_world_from_cam, evidence_depth, relocated=(obj_idx, det_idx) not in by_place,
+                    )
+                    detection_instance_ids[det_idx] = retired[obj_idx].instance_id
+                unmatched_detections = stage4.unmatched_detections
+
         # Only high-confidence detections may start a new object (ByteTrack).
-        for det_idx in stage3.unmatched_detections:
+        for det_idx in unmatched_detections:
             detection = detections[det_idx]
             spawned = self.object_map.spawn(
                 detection.bbox, det_points[det_idx], detection.label, detection.score, observation.stamp,
+                embedding=detection.embedding,
             )
             detection_instance_ids[det_idx] = spawned.instance_id
 
@@ -323,7 +373,22 @@ class SemanticMappingPipeline:
         for obj in self.object_map.objects.values():
             sg.record_trajectory_sample(obj, observation.stamp)
 
-        self.object_map.prune_disappeared(cfg.disappeared_prune_grace_frames)
+        # An object that moved before its old spot was confirmed empty got a
+        # provisional ID meanwhile; now that the old instance has retired,
+        # reconcile the two under the original ID (ObjectMap.reconcile_retired).
+        if cfg.reid_enabled:
+            newly_retired = [
+                o for o in self.object_map.objects.values()
+                if o.status == ObjectStatus.DISAPPEARED and o.instance_id not in retired_before
+            ]
+            if newly_retired:
+                reconciled = dict(
+                    (dropped, kept)
+                    for kept, dropped in self.object_map.reconcile_retired(newly_retired, cfg.reid_min_similarity)
+                )
+                detection_instance_ids = [reconciled.get(i, i) for i in detection_instance_ids]
+
+        self.object_map.compact_disappeared(cfg.disappeared_prune_grace_frames, cfg.max_retired_instances)
         t_update = time.perf_counter()
 
         graph = sg.build_scene_graph(

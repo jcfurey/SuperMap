@@ -81,6 +81,22 @@ def serialize_subgraph_to_text(
                     f"{_format_center(last_center)} at t={last_stamp:.2f}s and has since disappeared."
                 )
                 continue
+            statuses = [s[2] for s in obj.trajectory]
+            if ObjectStatus.DISAPPEARED.value in statuses:
+                gone = max(i for i, s in enumerate(statuses) if s == ObjectStatus.DISAPPEARED.value)
+                gone_stamp = obj.trajectory[gone][0]
+                before = next((obj.trajectory[i] for i in range(gone - 1, -1, -1)
+                               if statuses[i] != ObjectStatus.DISAPPEARED.value), obj.trajectory[gone])
+                back = next((s for s in obj.trajectory[gone + 1:] if s[2] != ObjectStatus.DISAPPEARED.value), None)
+                if back is not None:
+                    moved = float(np.linalg.norm(last_center - before[1])) > MOVED_THRESHOLD_M
+                    where = (f"moved from {_format_center(before[1])} to {_format_center(last_center)}" if moved
+                             else f"back in the same place at {_format_center(last_center)}")
+                    temporal_lines.append(
+                        f"  Instance {obj.instance_id} ({obj.label}) disappeared at t={gone_stamp:.2f}s and "
+                        f"reappeared at t={back[0]:.2f}s, {where}."
+                    )
+                    continue
             settled = [s for s in obj.trajectory if s[0] >= obj.first_seen_stamp + SETTLE_SECONDS]
             if len(settled) < 2:
                 continue

@@ -96,7 +96,19 @@ semantic_mapping_node:
     min_points_for_3d_association: 5
     merge_iou_threshold: 0.3               # duplicate instances (same label) merged when their 3D boxes overlap this much
     merge_distance_m: 0.25                 #   ... or their centroids are this close; the older ID survives
-    disappeared_prune_grace_frames: 60
+    disappeared_prune_grace_frames: 60      # release a disappeared instance's points after N frames; its identity stays
+    max_retired_instances: 1000             # retired identities kept for re-identification (least recently seen evicted)
+    # Re-identification: an unmatched detection re-attaches to a retired
+    # instance with a compatible label when it is back in the same place, or
+    # anywhere if its appearance matches (relocation). Embedders:
+    # color_histogram (no model), clip (open_clip_torch), none.
+    appearance_embedder: color_histogram
+    embedder_device: cuda
+    clip_model: ViT-B-32
+    clip_pretrained: openai
+    reid_enabled: true
+    reid_min_similarity: 0.85               # cosine similarity floor; ~0.85 for histograms, ~0.9 for CLIP
+    reid_max_age_sec: 0.0                   # 0 = re-identify no matter how long ago it was last seen
 
     scene_graph_cluster_radius: 2.0        # meters, Sec. IV-C clustering for real-time predicates
     scene_graph_z_tolerance: 0.1           # meters, "On" predicate z_min ~= z_max tolerance

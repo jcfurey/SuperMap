@@ -7,13 +7,19 @@ Ground truth format (``scene_ground_truth.json``)::
       "objects": [
         {
           "label": "chair",
+          "identity": "chair#5",    # optional: entries of one physical object share it
           "bbox3d": [xmin, ymin, zmin, xmax, ymax, zmax],   # world frame
-          "appear_frame": 0,        # first frame the object is physically present
+          "appear_frame": 0,        # first frame the object is physically present here
           "disappear_frame": 33,    # first frame it is gone again (num_frames if never removed)
           "visible_frames": [0, 1, 2, ...]   # frames where it is in the camera's view
         }, ...
       ]
     }
+
+An object that is moved, or taken away and brought back, has one entry per
+presence phase with the same ``identity``; the identity-consistency metric
+below checks that a single instance ID served every phase (Sec. IV-B,
+identities stable across relocation).
 
 True-positive criterion (paper, Sec. V-D): 3D IoU > 0.1, centroid distance
 < 0.3 m, and the correct semantic label. Metrics per ground-truth object:
@@ -60,6 +66,7 @@ class GroundTruthObject:
     appear_frame: int
     disappear_frame: int
     visible_frames: set[int]
+    identity: str = ""
 
     @property
     def center(self) -> np.ndarray:
@@ -78,8 +85,9 @@ def load_ground_truth(path: str | Path) -> tuple[int, list[GroundTruthObject]]:
             appear_frame=int(o["appear_frame"]),
             disappear_frame=int(o["disappear_frame"]),
             visible_frames=set(int(f) for f in o.get("visible_frames", [])),
+            identity=str(o.get("identity") or f"{o['label']}#{i}"),
         )
-        for o in data["objects"]
+        for i, o in enumerate(data["objects"])
     ]
     return int(data["num_frames"]), objects
 
@@ -194,12 +202,39 @@ class SequenceEvaluator:
                 if matched:
                     stats.appearance_hits += 1
                     stats.matched_ids.update(o.instance_id for o in matched)
-            elif frame_id >= gt.disappear_frame and location_in_view(
+            elif frame_id >= gt.disappear_frame and not self._back_in_place(gt, frame_id) and location_in_view(
                 gt, self.intrinsics, T_world_from_cam, depth_image,
             ):
                 stats.absence_frames += 1
                 if not self._matches(objects, gt, ASSERTING_STATUSES):
                     stats.absence_hits += 1
+
+    def _back_in_place(self, gt: GroundTruthObject, frame_id: int) -> bool:
+        """Whether the same physical object is present again at this entry's
+        place (a later phase of the same identity), in which case asserting
+        presence there is correct, not a missed disappearance."""
+        return any(
+            other is not gt and other.identity == gt.identity and other.present_at(frame_id)
+            and float(np.linalg.norm(other.center - gt.center)) < self.centroid_threshold
+            for other in self.ground_truth
+        )
+
+    def identity_consistency(self) -> dict:
+        """Among identities with several phases that were each matched at least
+        once, the fraction served by one and the same instance ID throughout."""
+        phases: dict[str, list[set[int]]] = {}
+        for gt, stats in zip(self.ground_truth, self.stats):
+            phases.setdefault(gt.identity, []).append(stats.matched_ids)
+        multi = {k: v for k, v in phases.items() if len(v) > 1}
+        evaluated = {k: v for k, v in multi.items() if all(v)}
+        consistent = [k for k, v in evaluated.items() if set.intersection(*v)]
+        return {
+            "identities_with_phases": len(multi),
+            "evaluated": len(evaluated),
+            "consistent": len(consistent),
+            "rate": len(consistent) / len(evaluated) if evaluated else float("nan"),
+            "inconsistent": sorted(k for k in evaluated if k not in consistent),
+        }
 
     def final_map_prf(self) -> tuple[float, float, float, int, int, int]:
         """Precision / recall / F1 of the final map plus (tp, n_predictions, n_gt)."""
@@ -232,13 +267,14 @@ class SequenceEvaluator:
         per_object = [
             {
                 "label": s.label,
+                "identity": gt.identity,
                 "detection_recall": s.detection_recall,
                 "change_recall": s.change_recall,
                 "fragments": s.fragments,
                 "appearance_frames": s.appearance_frames,
                 "absence_frames": s.absence_frames,
             }
-            for s in self.stats
+            for gt, s in zip(self.ground_truth, self.stats)
         ]
         det = [s.detection_recall for s in self.stats if s.appearance_frames]
         chg = [s.change_recall for s in self.stats if (s.appearance_frames + s.absence_frames)]
@@ -248,6 +284,7 @@ class SequenceEvaluator:
             "mean_change_recall": float(np.mean(chg)) if chg else float("nan"),
             "mean_fragments": float(np.mean([s.fragments for s in self.stats])),
             "total_instance_ids_created": self.total_ids_created,
+            "identity_consistency": self.identity_consistency(),
             "final_map": {
                 "precision": precision, "recall": recall, "f1": f1,
                 "tp": tp, "predictions": n_pred, "ground_truth": n_gt,
@@ -256,10 +293,11 @@ class SequenceEvaluator:
 
 
 def format_summary(summary: dict) -> str:
-    lines = [f"{'object':<14} {'det. recall':>11} {'change recall':>13} {'fragments':>9}"]
+    lines = [f"{'object':<16} {'det. recall':>11} {'change recall':>13} {'fragments':>9}"]
     for row in summary["per_object"]:
         lines.append(
-            f"{row['label']:<14} {row['detection_recall']:>11.3f} {row['change_recall']:>13.3f} {row['fragments']:>9d}"
+            f"{row.get('identity', row['label']):<16} {row['detection_recall']:>11.3f} "
+            f"{row['change_recall']:>13.3f} {row['fragments']:>9d}"
         )
     fm = summary["final_map"]
     lines += [
@@ -268,6 +306,10 @@ def format_summary(summary: dict) -> str:
         f"mean change recall    : {summary['mean_change_recall']:.3f}",
         f"mean fragments / obj  : {summary['mean_fragments']:.2f}  "
         f"(total instance IDs created: {summary['total_instance_ids_created']})",
+        (f"identity kept across relocation / return: {summary['identity_consistency']['consistent']} / "
+         f"{summary['identity_consistency']['evaluated']}"
+         + (f"  (lost: {', '.join(summary['identity_consistency']['inconsistent'])})"
+            if summary['identity_consistency']['inconsistent'] else "")),
         f"final map             : precision {fm['precision']:.3f}  recall {fm['recall']:.3f}  F1 {fm['f1']:.3f}  "
         f"(tp {fm['tp']} / {fm['predictions']} predictions / {fm['ground_truth']} ground truth)",
     ]
