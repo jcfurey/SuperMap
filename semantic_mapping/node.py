@@ -89,6 +89,7 @@ class SemanticMappingNode(Node):
         self.depth_from_image = self._param_str("depth_source", "pointcloud") == "depth_image"
         self.depth_scale = float(self.get_parameter("depth_scale").value)
         self._scan_history: deque = deque(maxlen=max(int(self.get_parameter("pointcloud_accumulate_scans").value), 1))
+        self._next_frame_id = 0
         self._last_detector_stamp = -float("inf")
         detector_rate_hz = float(self.get_parameter("detector_rate_hz").value)
         self._detector_period_sec = 1.0 / max(detector_rate_hz, 1e-6)
@@ -131,7 +132,7 @@ class SemanticMappingNode(Node):
         if autosave_sec > 0 and self.map_save_path:
             self.create_timer(autosave_sec, self._autosave)
         elif autosave_sec > 0:
-            self.get_logger().warn("map_autosave_sec is set but map_save_path is empty; autosave disabled")
+            self.get_logger().warning("map_autosave_sec is set but map_save_path is empty; autosave disabled")
 
         # Runtime accounting (Sec. V-H): module rates over each log period.
         self._stats_lock = threading.Lock()
@@ -214,7 +215,7 @@ class SemanticMappingNode(Node):
                 data = yaml.safe_load(f) or {}
             return list(data.get("prompts", []))
         except OSError:
-            self.get_logger().warn(f"Could not read prompts file '{prompts_file}', using empty vocabulary")
+            self.get_logger().warning(f"Could not read prompts file '{prompts_file}', using empty vocabulary")
             return []
 
     def _build_pipeline_config(self) -> PipelineConfig:
@@ -372,7 +373,7 @@ class SemanticMappingNode(Node):
         if not instruction:
             return
         if self._last_result is None:
-            self.get_logger().warn(f"query '{instruction}' received before any map update; ignoring")
+            self.get_logger().warning(f"query '{instruction}' received before any map update; ignoring")
             return
         robot_position = None
         try:
@@ -393,7 +394,7 @@ class SemanticMappingNode(Node):
                 continue
             result = self.grounder.complete(request)
             if result.error:
-                self.get_logger().warn(f"grounding '{request.instruction}': {result.error}")
+                self.get_logger().warning(f"grounding '{request.instruction}': {result.error}")
             else:
                 self.get_logger().info(
                     f"grounding '{request.instruction}' -> instances {result.target_ids}")
@@ -427,7 +428,8 @@ class SemanticMappingNode(Node):
             T_cam_from_cloud = None if self.depth_from_image else self._lookup_se3(
                 self.camera_frame, depth_msg.header.frame_id, depth_msg.header.stamp)
         except tf2_ros.TransformException as exc:
-            self.get_logger().warn(f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
+            self.get_logger().warning(
+                f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
             return
 
         stamp = _stamp_to_seconds(rgb_msg.header.stamp)
@@ -466,10 +468,12 @@ class SemanticMappingNode(Node):
             stamp=stamp,
             pose=StampedPose(stamp=stamp, T_world_from_frame=T_world_from_cam),
             intrinsics=intrinsics,
+            frame_id=self._next_frame_id,
             rgb=rgb,
             depth=depth,
             detections=[],
         )
+        self._next_frame_id += 1
 
         # Fuse any detection frames the worker finished since last time (each
         # under its own buffered pose/depth), then decide what to do with this one.
@@ -490,7 +494,11 @@ class SemanticMappingNode(Node):
             except queue.Empty:
                 continue
             try:
-                observation.detections = self.detector.detect(observation.rgb, prompts=self.prompts)
+                observation.detections = self.detector.detect(
+                    observation.rgb,
+                    prompts=self.prompts,
+                    frame_id=observation.frame_id,
+                )
             except Exception as exc:  # noqa: BLE001 - a detector failure must not kill the mapping loop
                 self.get_logger().error(f"detector failed, fusing frame without detections: {exc}",
                                         throttle_duration_sec=5.0)
@@ -546,7 +554,7 @@ class SemanticMappingNode(Node):
         try:
             import cv2
         except ImportError:
-            self.get_logger().warn("opencv-python not installed; annotated image disabled", once=True)
+            self.get_logger().warning("opencv-python not installed; annotated image disabled", once=True)
             return
 
         image = np.ascontiguousarray(observation.rgb.copy())
@@ -643,9 +651,12 @@ def main(args: list[str] | None = None) -> None:
     node = SemanticMappingNode()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

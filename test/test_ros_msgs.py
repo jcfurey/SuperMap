@@ -33,6 +33,19 @@ def test_depth_image_scaling_and_invalid_values():
     assert np.allclose(ros_msgs.depth_image_to_meters(msg), [[0.0, 2.0]])
 
 
+def test_bayer_rggb8_is_demosaiced_to_rgb():
+    mosaic = np.empty((8, 8), dtype=np.uint8)
+    mosaic[0::2, 0::2] = 240  # R
+    mosaic[0::2, 1::2] = 120  # G
+    mosaic[1::2, 0::2] = 120  # G
+    mosaic[1::2, 1::2] = 20   # B
+    msg = ros_msgs.numpy_to_image(mosaic, "bayer_rggb8")
+    rgb = ros_msgs.image_to_numpy(msg)
+    assert rgb.shape == (8, 8, 3)
+    assert rgb.dtype == np.uint8
+    assert np.array_equal(rgb[3, 3], [240, 120, 20])
+
+
 def test_camera_info_and_transform_conversions():
     info = sensor_msgs.CameraInfo(width=4, height=3, k=[10.0, 0.0, 2.0, 0.0, 12.0, 1.5, 0.0, 0.0, 1.0])
     intr = ros_msgs.camera_info_to_intrinsics(info)

@@ -74,6 +74,9 @@ class Observation:
     stamp: float
     pose: StampedPose
     intrinsics: CameraIntrinsics
+    frame_id: int | None = None
+    """Monotonic source-frame index, used by pre-baked detector backends."""
+
     rgb: np.ndarray | None = None
     depth: np.ndarray | None = None
     """Camera-frame depth image (H, W) in meters, aligned to ``intrinsics``. In

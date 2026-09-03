@@ -90,6 +90,7 @@ class SequenceDataset:
             stamp=frame.stamp,
             pose=StampedPose(stamp=frame.stamp, T_world_from_frame=frame.T_world_from_cam),
             intrinsics=self.intrinsics,
+            frame_id=frame.frame_id,
             rgb=frame.rgb,
             depth=frame.depth,
             detections=detections,

@@ -15,7 +15,18 @@ from semantic_mapping.types import CameraIntrinsics
 _IMAGE_ENCODINGS: dict[str, tuple[type, int]] = {
     "rgb8": (np.uint8, 3), "bgr8": (np.uint8, 3), "rgba8": (np.uint8, 4), "bgra8": (np.uint8, 4),
     "mono8": (np.uint8, 1), "8UC1": (np.uint8, 1), "8UC3": (np.uint8, 3),
+    "bayer_rggb8": (np.uint8, 1), "bayer_bggr8": (np.uint8, 1),
+    "bayer_gbrg8": (np.uint8, 1), "bayer_grbg8": (np.uint8, 1),
     "mono16": (np.uint16, 1), "16UC1": (np.uint16, 1), "32FC1": (np.float32, 1),
+}
+
+_BAYER_ENCODINGS = {
+    # These OpenCV conversion constants yield RGB channel order for the ROS
+    # top-left-pixel pattern named by each sensor_msgs encoding.
+    "bayer_rggb8": "COLOR_BayerRG2BGR",
+    "bayer_bggr8": "COLOR_BayerBG2BGR",
+    "bayer_gbrg8": "COLOR_BayerGB2BGR",
+    "bayer_grbg8": "COLOR_BayerGR2BGR",
 }
 
 
@@ -83,7 +94,11 @@ def image_to_numpy(msg) -> np.ndarray:
     data = np.frombuffer(bytes(msg.data), dtype=dtype).reshape(msg.height, row_values)[:, : msg.width * channels]
     image = data.reshape(msg.height, msg.width, channels) if channels > 1 else data.reshape(msg.height, msg.width)
     image = image.astype(dtype.newbyteorder("="))
-    if msg.encoding in ("bgr8", "bgra8"):
+    if msg.encoding in _BAYER_ENCODINGS:
+        import cv2
+
+        image = cv2.cvtColor(image, getattr(cv2, _BAYER_ENCODINGS[msg.encoding]))
+    elif msg.encoding in ("bgr8", "bgra8"):
         image = image[:, :, :3][:, :, ::-1]
     elif msg.encoding == "rgba8":
         image = image[:, :, :3]
