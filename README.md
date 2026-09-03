@@ -82,10 +82,10 @@ The twelfth ID is the provisional one the moved box holds for the three frames b
 | without background | 0.996 | 0.997 | 0.997 | 1.000 | 1.000 |
 | with background (wall / floor / ceiling) | 0.628 | 0.095 | 0.103 | | |
 
-The "with background" gap is the map never predicting wall / floor / ceiling, the same effect visible in the paper's Table II. ScanNet scenes are read straight from the standard `SensReader` export plus the annotated mesh (`semantic_mapping/datasets_scannet.py`); vocabulary-to-class aliases and the background set live in `config/segmentation_eval.yaml`:
+The "with background" gap is the map never predicting wall / floor / ceiling, the same effect visible in the paper's Table II. ScanNet scenes are read either straight from the raw `.sens` capture (decoded lazily, no export step) or from the standard `SensReader` export, plus the annotated mesh next to it (`semantic_mapping/datasets_scannet.py`); vocabulary-to-class aliases and the background set live in `config/segmentation_eval.yaml`:
 
 ```bash
-python examples/evaluate.py --data_dir scans/scene0000_00 --frame_skip 10 --detector groundingdino
+python examples/evaluate.py --data_dir scans/scene0000_00 --frame_skip 10 --detector groundingdino   # .sens or export
 ```
 
 Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--config <yaml>`, `--prompts <yaml>`, `--live` (rerun window).
