@@ -269,3 +269,17 @@ def test_merge_duplicates_kdtree_candidates_match_exhaustive_pairs():
     merged = object_map.merge_duplicates(iou_threshold=0.3, distance_threshold=0.25)
     assert sorted(merged) == sorted(expected_drops)
     assert len(object_map.objects) == 30 + 3
+
+
+def test_packed_voxel_keys_match_row_wise_unique_and_fall_back_out_of_range():
+    from semantic_mapping.object_map import voxel_downsample_indices
+
+    rng = np.random.default_rng(7)
+    points = np.concatenate([rng.uniform(-5.0, 5.0, size=(5000, 3)), rng.uniform(-5.0, 5.0, size=(200, 3))])
+    points[5000:] = points[:200] + 1e-4  # near-duplicates that share voxels with earlier points
+    reference = np.sort(np.unique(np.floor(points / 0.05).astype(np.int64), axis=0, return_index=True)[1])
+    assert np.array_equal(voxel_downsample_indices(points, 0.05), reference)
+
+    far = points + np.array([80_000.0, 0.0, 0.0])  # beyond +-52 km at 5 cm: exact slow path
+    reference_far = np.sort(np.unique(np.floor(far / 0.05).astype(np.int64), axis=0, return_index=True)[1])
+    assert np.array_equal(voxel_downsample_indices(far, 0.05), reference_far)

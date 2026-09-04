@@ -140,10 +140,10 @@ A two-hour run accumulates far more instances than the camera sees at any moment
 
 | instances | points | map update, culled | map update, exhaustive | full frame, culled |
 |---|---|---|---|---|
-| 9 | 10 k | 22 ms | 19 ms | 37 ms |
-| 99 | 108 k | 25 ms | 44 ms | 37 ms |
-| 459 | 499 k | 25 ms | 134 ms | 40 ms |
-| 909 | 988 k | 35 ms | 356 ms | 56 ms |
+| 9 | 10 k | 12 ms | 12 ms | 41 ms |
+| 99 | 108 k | 16 ms | 55 ms | 35 ms |
+| 459 | 499 k | 30 ms | 227 ms | 58 ms |
+| 909 | 988 k | 48 ms | 480 ms | 84 ms |
 
 ### Sparse LiDAR depth
 
@@ -178,11 +178,11 @@ Every map update records per-stage timings (`FrameResult.timings`), the live nod
 
 | module | mean latency | sustainable rate | paper (onboard, Sec. V-H) |
 |---|---|---|---|
-| 3D mapping (tracklet prediction, back-projection, association, map update) | 38 ms | 26 Hz | 3 Hz |
+| 3D mapping (embedding, tracklet prediction, back-projection, association, map update) | 40 ms | 25 Hz | 3 Hz |
 | 4D scene graph construction | 0.3 ms | > 3 kHz | 5 Hz |
 | 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
 
-The geometric-consistency update over all instance points dominates (27 ms of the 38 ms); memory is 0.5 MiB of point arrays for 9 instances and a 91 MiB process. Latency scales with image resolution and map size, so measure your own sequence:
+Back-projection (14 ms), the geometric-consistency update over all instance points (12 ms), and the appearance embeddings (11 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 94 MiB process. Latency scales with image resolution and map size, so measure your own sequence:
 
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json

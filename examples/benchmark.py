@@ -5,7 +5,7 @@
     python examples/benchmark.py --detector yoloe         # include a real detector's latency
     python examples/benchmark.py --data_dir scans/scene0000_00 --frame_skip 10 --json runtime.json
 
-Reports, per stage of the map update (tracklet prediction, back-projection,
+Reports, per stage of the map update (appearance embedding, tracklet prediction, back-projection,
 association, map update, scene-graph construction) and for the detector,
 the mean / median / p95 latency and the rate that latency sustains, plus
 the map's footprint and the process's peak resident memory. The paper's

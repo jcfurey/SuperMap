@@ -57,6 +57,16 @@ from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
 _LABEL_PALETTE_SEED = 1000003  # arbitrary large prime for a stable pseudo-random per-label hue
 
+_POINT_DTYPE = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<f4")])
+"""Memory layout of one published object point; must match the PointFields in _publish_object_points."""
+
+
+def _packed_rgb_float(label: str) -> np.float32:
+    """The label's colour packed as PCL's float-typed rgb field (0x00RRGGBB reinterpreted as float32)."""
+    r, g, b = _label_color(label)
+    packed = (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
+    return np.frombuffer(np.array([packed], dtype=np.uint32).tobytes(), dtype=np.float32)[0]
+
 
 def _stamp_to_seconds(stamp) -> float:
     return stamp.sec + stamp.nanosec * 1e-9
@@ -588,18 +598,22 @@ class SemanticMappingNode(Node):
             pc2.PointField(name="z", offset=8, datatype=pc2.PointField.FLOAT32, count=1),
             pc2.PointField(name="rgb", offset=12, datatype=pc2.PointField.FLOAT32, count=1),
         ]
-        rows = []
-        for obj in result.objects:
-            if obj.points_world.shape[0] == 0:
+        # One structured array for the whole map, serialized by create_cloud in
+        # a single copy: a Python row per point took 140 ms for a room-sized
+        # map and over a second for a building (doc/audit-2026-09.md, P1).
+        counts = [obj.points_world.shape[0] for obj in result.objects]
+        cloud = np.zeros(int(sum(counts)), dtype=_POINT_DTYPE)
+        offset = 0
+        for obj, n in zip(result.objects, counts):
+            if n == 0:
                 continue
-            r, g, b = _label_color(obj.label)
-            packed_rgb = (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
-            packed_rgb_float = np.frombuffer(np.array([packed_rgb], dtype=np.uint32).tobytes(), dtype=np.float32)[0]
-            for point in obj.points_world:
-                rows.append([point[0], point[1], point[2], packed_rgb_float])
-
-        cloud_msg = pc2.create_cloud(header, fields, rows)
-        self.obj_points_pub.publish(cloud_msg)
+            block = cloud[offset:offset + n]
+            block["x"] = obj.points_world[:, 0]
+            block["y"] = obj.points_world[:, 1]
+            block["z"] = obj.points_world[:, 2]
+            block["rgb"] = _packed_rgb_float(obj.label)
+            offset += n
+        self.obj_points_pub.publish(pc2.create_cloud(header, fields, cloud))
 
     def _publish_object_boxes(self, result: FrameResult, header: Header) -> None:
         marker_array = MarkerArray()

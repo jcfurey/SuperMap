@@ -25,17 +25,32 @@ _STATUS_RANK = {
 }
 
 
+_VOXEL_KEY_BITS = 21
+_VOXEL_KEY_OFFSET = 1 << (_VOXEL_KEY_BITS - 1)
+"""Voxel coordinates are packed three-per-int64 with 21 bits each, i.e. any
+map within +-2^20 voxels of the origin (+-52 km at 5 cm) takes the fast path."""
+
+
 def voxel_downsample_indices(points: np.ndarray, voxel_size: float) -> np.ndarray:
     """Indices (ascending) of one representative point per occupied voxel.
 
     Returning indices rather than points lets callers subset any per-point
     arrays (log-odds, membership) in lockstep, instead of relying on ordering
-    assumptions.
+    assumptions. The three voxel coordinates are packed into one int64 so the
+    de-duplication is a 1-D unique: row-wise ``np.unique(axis=0)`` was the
+    single largest cost of the whole pipeline (doc/audit-2026-09.md, P2) and
+    the packed key gives the same result about nine times faster. Coordinates
+    outside the packable range fall back to the row-wise form.
     """
     if points.shape[0] == 0:
         return np.zeros(0, dtype=np.int64)
     keys = np.floor(points / voxel_size).astype(np.int64)
-    _unique_keys, first_indices = np.unique(keys, axis=0, return_index=True)
+    shifted = keys + _VOXEL_KEY_OFFSET
+    if np.all((shifted >= 0) & (shifted < (1 << _VOXEL_KEY_BITS))):
+        packed = (shifted[:, 0] << (2 * _VOXEL_KEY_BITS)) | (shifted[:, 1] << _VOXEL_KEY_BITS) | shifted[:, 2]
+        _unique_keys, first_indices = np.unique(packed, return_index=True)
+    else:
+        _unique_keys, first_indices = np.unique(keys, axis=0, return_index=True)
     return np.sort(first_indices)
 
 
@@ -447,9 +462,16 @@ class ObjectMap:
         for i, keep in enumerate(live):
             if keep.instance_id not in self.objects:
                 continue
-            for j in sorted(neighbours[i]):
-                if j <= i:
-                    continue
+            # Exact per-pair bound: two boxes can only overlap (or be within the
+            # distance threshold) when their centres are closer than the sum of
+            # their half-diagonals plus the threshold; the global radius above
+            # is the loosest such bound and admits far too many pairs at scale.
+            candidates = np.array(sorted(j for j in neighbours[i] if j > i), dtype=np.int64)
+            if candidates.size == 0:
+                continue
+            distances = np.linalg.norm(centers[candidates] - centers[i], axis=1)
+            candidates = candidates[distances <= half_diagonals[i] + half_diagonals[candidates] + distance_threshold]
+            for j in candidates:
                 drop = live[j]
                 if drop.instance_id not in self.objects:
                     continue

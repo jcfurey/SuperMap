@@ -6,7 +6,7 @@ from semantic_mapping.pipeline import PipelineConfig, SemanticMappingPipeline
 from test.helpers import make_object
 from test.test_pipeline import _observation
 
-STAGES = ("predict", "backproject", "associate", "map_update", "scene_graph", "total")
+STAGES = ("embed", "predict", "backproject", "associate", "map_update", "scene_graph", "total")
 
 
 def test_process_frame_reports_stage_timings_that_add_up():

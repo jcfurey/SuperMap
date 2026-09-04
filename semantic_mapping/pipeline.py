@@ -112,9 +112,9 @@ class FrameResult:
     discarded (e.g. a low-confidence detection with no existing track)."""
 
     timings: dict[str, float] = field(default_factory=dict)
-    """Wall-clock seconds spent in each stage of this update (``predict``,
-    ``backproject``, ``associate``, ``map_update``, ``scene_graph``, ``total``),
-    the raw material for the Sec. V-H runtime accounting."""
+    """Wall-clock seconds spent in each stage of this update (``embed``,
+    ``predict``, ``backproject``, ``associate``, ``map_update``, ``scene_graph``,
+    ``total``), the raw material for the Sec. V-H runtime accounting."""
 
 
 class SemanticMappingPipeline:
@@ -234,6 +234,7 @@ class SemanticMappingPipeline:
             if missing:
                 for detection, embedding in zip(missing, self.embedder.embed(observation.rgb, missing)):
                     detection.embedding = embedding
+        t_embed = time.perf_counter()
 
         image_size = (observation.intrinsics.width, observation.intrinsics.height)
         # One batched frustum test decides which instances can be seen at all;
@@ -408,7 +409,8 @@ class SemanticMappingPipeline:
             scene_graph=graph,
             detection_instance_ids=detection_instance_ids,
             timings={
-                "predict": t_predict - t_start,
+                "embed": t_embed - t_start,
+                "predict": t_predict - t_embed,
                 "backproject": t_backproject - t_predict,
                 "associate": t_associate - t_backproject,
                 "map_update": t_update - t_associate,

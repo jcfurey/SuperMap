@@ -56,11 +56,15 @@ class ColorHistogramEmbedder(Embedder):
 
     name = "color_histogram"
 
-    def __init__(self, bins: int = 8, min_pixels: int = 16, space: str = "chromaticity") -> None:
+    def __init__(self, bins: int = 8, min_pixels: int = 16, space: str = "chromaticity",
+                 max_pixels: int = 4096) -> None:
         if space not in ("chromaticity", "rgb"):
             raise ValueError(f"unknown colour space {space!r} (chromaticity | rgb)")
         self.bins = int(bins)
         self.min_pixels = int(min_pixels)
+        self.max_pixels = int(max_pixels)
+        """A 64-bin histogram is estimated well from a few thousand pixels;
+        larger regions are sampled with a fixed stride (doc/audit-2026-09.md, P3)."""
         self.space = space
         self.dim = self.bins ** (2 if space == "chromaticity" else 3)
 
@@ -85,6 +89,8 @@ class ColorHistogramEmbedder(Embedder):
             if pixels.shape[0] < self.min_pixels:
                 out.append(None)
                 continue
+            if pixels.shape[0] > self.max_pixels:
+                pixels = pixels[:: int(np.ceil(pixels.shape[0] / self.max_pixels))]
             hist = self._histogram(pixels)
             hist = np.sqrt(hist / max(float(hist.sum()), 1.0))
             norm = np.linalg.norm(hist)
@@ -140,7 +146,8 @@ def build_embedder(name: str | None, **kwargs) -> Embedder | None:
     if key in ("none", "", "off"):
         return None
     if key in ("color_histogram", "histogram", "color"):
-        return ColorHistogramEmbedder(**{k: v for k, v in kwargs.items() if k in ("bins", "min_pixels", "space")})
+        return ColorHistogramEmbedder(
+            **{k: v for k, v in kwargs.items() if k in ("bins", "min_pixels", "space", "max_pixels")})
     if key == "clip":
         return CLIPEmbedder(**{k: v for k, v in kwargs.items() if k in ("model_name", "pretrained", "device", "crop_margin")})
     raise ValueError(f"Unknown appearance embedder: {name!r}")
