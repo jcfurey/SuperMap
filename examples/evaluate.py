@@ -51,6 +51,9 @@ def main() -> None:
                         help="Centroid distance threshold in meters for a Sec. V-D true positive (paper: 0.3).")
     parser.add_argument("--max_distance", type=float, default=None,
                         help="Label-transfer radius in meters for the Sec. V-B metrics (overrides --eval_config).")
+    parser.add_argument("--stale_after", type=float, default=None,
+                        help="Score occluded instances unseen for longer than this many seconds at the end as unknown "
+                             "(neither present nor a false positive); default: the paper's convention (present).")
     parser.add_argument("--no_segmentation", action="store_true", help="Skip the Sec. V-B metrics.")
     parser.add_argument("--json", type=Path, default=None, help="Write all results to this JSON file too.")
     args = parser.parse_args()
@@ -76,11 +79,13 @@ def main() -> None:
     if temporal_gt is not None:
         evaluator = evaluation.SequenceEvaluator(
             temporal_gt, dataset.intrinsics, iou_threshold=args.iou, centroid_threshold=args.centroid,
+            stale_after_sec=args.stale_after,
         )
     result = None
     for frame, _detections, result in run_sequence(dataset, pipeline, detector, prompts):
         if evaluator is not None:
-            evaluator.observe(frame.frame_id, frame.T_world_from_cam, result.objects, depth_image=frame.depth)
+            evaluator.observe(frame.frame_id, frame.T_world_from_cam, result.objects, depth_image=frame.depth,
+                              stamp=frame.stamp)
 
     results: dict = {"frames": len(dataset), "data_dir": str(dataset.data_dir)}
     print(f"Evaluated {len(dataset)} frames from {dataset.data_dir}")

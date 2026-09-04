@@ -202,7 +202,7 @@ ros2 service call /semantic_mapping_node/save_map std_srvs/srv/Trigger     # or 
 
 Restored instances resume as *occluded* with a reset 2D tracklet (a tracklet is camera-relative and meaningless after a restart); re-observation runs through the 3D re-activation stage like any object that left the field of view, and the geometric-consistency update retires objects that are gone. New instances keep counting from the saved ID counter, so IDs recorded by downstream consumers stay unique. Format: `map.json` + `map_arrays.npz` (`semantic_mapping/persistence.py`).
 
-Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
+Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, `latest_stamp`, and `seconds_since_seen`, so downstream consumers can use one shared interface. An occluded instance is one the map remembers but has not observed for `seconds_since_seen`; the VLM prompt annotates such nodes with their age and, past `vlm.stale_after_sec`, marks them as possibly gone, RViz labels show the age, and `evaluate.py --stale_after N` scores instances unseen longer than N seconds as unknown rather than present (on the synthetic scene that turns the two removed-but-unconfirmed objects from false positives into unknowns and final-map precision from 0.80 into 1.00).
 
 ## Citation
 

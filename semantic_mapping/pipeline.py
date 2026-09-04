@@ -34,7 +34,7 @@ from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus, Ob
 class PipelineConfig:
     voxel_size: float = 0.05
     tau_eps: float = 0.15
-    max_points_per_object: int = 20000
+    max_points_per_object: int = 5000
     prune_log_odds: float = -1.5
     prune_membership: float = -1.5
     membership_margin_px: float = 2.0
@@ -105,6 +105,9 @@ class PipelineConfig:
 @dataclass
 class FrameResult:
     objects: list[ObjectInstance] = field(default_factory=list)
+    stamp: float = 0.0
+    """Timestamp of the observation this result reflects; the reference for
+    "not seen for N s" ages of occluded instances."""
     scene_graph: sg.SceneGraph | None = None
     detection_instance_ids: list[int] = field(default_factory=list)
     """For each detection in the processed observation, the instance ID it was
@@ -406,6 +409,7 @@ class SemanticMappingPipeline:
 
         return FrameResult(
             objects=list(self.object_map.objects.values()),
+            stamp=float(observation.stamp),
             scene_graph=graph,
             detection_instance_ids=detection_instance_ids,
             timings={

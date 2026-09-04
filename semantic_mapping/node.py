@@ -51,7 +51,7 @@ from semantic_mapping.ros_msgs import (
     transform_to_se3,
 )
 from semantic_mapping.serialization import serialize_frame
-from semantic_mapping.types import CameraIntrinsics, Observation, StampedPose
+from semantic_mapping.types import CameraIntrinsics, ObjectStatus, Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
@@ -128,6 +128,7 @@ class SemanticMappingNode(Node):
             coordinate_frame=self.world_frame,
             local_radius_m=float(self.get_parameter("vlm.local_radius_m").value) or None,
             max_objects=int(self.get_parameter("vlm.max_objects").value) or None,
+            stale_after_sec=float(self.get_parameter("vlm.stale_after_sec").value) or None,
         )
         self._grounding_jobs: queue.Queue[GroundingRequest] = queue.Queue()
         self._grounding_thread = threading.Thread(target=self._grounding_loop, name="grounding", daemon=True)
@@ -183,6 +184,7 @@ class SemanticMappingNode(Node):
             "vlm.api_key_env": "",
             "vlm.local_radius_m": 0.0,
             "vlm.max_objects": 0,
+            "vlm.stale_after_sec": 30.0,
             "map_load_path": "",
             "map_save_path": "",
             "map_autosave_sec": 0.0,
@@ -393,6 +395,7 @@ class SemanticMappingNode(Node):
             pass  # local-subgraph selection just falls back to the whole graph
         request = self.grounder.prepare(
             instruction, self._last_result.objects, self._last_result.scene_graph, robot_position,
+            now=self._last_result.stamp,
         )
         self._grounding_jobs.put(request)
 
@@ -616,6 +619,7 @@ class SemanticMappingNode(Node):
         self.obj_points_pub.publish(pc2.create_cloud(header, fields, cloud))
 
     def _publish_object_boxes(self, result: FrameResult, header: Header) -> None:
+        now = result.stamp or _stamp_to_seconds(header.stamp)
         marker_array = MarkerArray()
         node_ids = set(result.scene_graph.node_ids) if result.scene_graph else set()
         by_id = {obj.instance_id: obj for obj in result.objects}
@@ -654,7 +658,10 @@ class SemanticMappingNode(Node):
             label_marker.pose.position.z = float(zmax + 0.1)
             label_marker.scale.z = 0.15
             label_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            label_marker.text = f"{instance_id}:{obj.label} ({obj.status.value})"
+            status = obj.status.value
+            if obj.status == ObjectStatus.OCCLUDED:
+                status = f"occluded {max(now - obj.latest_stamp, 0.0):.0f}s"
+            label_marker.text = f"{instance_id}:{obj.label} ({status})"
             marker_array.markers.append(label_marker)
 
         self.obj_boxes_pub.publish(marker_array)

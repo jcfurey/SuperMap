@@ -86,11 +86,14 @@ class Grounder:
         coordinate_frame: str = "map",
         local_radius_m: float | None = None,
         max_objects: int | None = None,
+        stale_after_sec: float | None = 30.0,
     ) -> None:
         self.client = client
         self.coordinate_frame = coordinate_frame
         self.local_radius_m = local_radius_m
         self.max_objects = max_objects
+        self.stale_after_sec = stale_after_sec
+        """Occluded instances unseen for longer than this are marked "may no longer be there" in the prompt."""
 
     def prepare(
         self,
@@ -98,11 +101,13 @@ class Grounder:
         objects: list[ObjectInstance],
         scene_graph: SceneGraph,
         robot_position: np.ndarray | None = None,
+        now: float | None = None,
     ) -> GroundingRequest:
         nodes, subgraph = select_local_subgraph(
             objects, scene_graph, robot_position, self.local_radius_m, self.max_objects,
         )
-        prompt = build_prompt(nodes, subgraph, instruction, self.coordinate_frame)
+        prompt = build_prompt(nodes, subgraph, instruction, self.coordinate_frame, now=now,
+                              stale_after_sec=self.stale_after_sec)
         return GroundingRequest(
             instruction=instruction,
             prompt=prompt,
@@ -131,5 +136,6 @@ class Grounder:
         objects: list[ObjectInstance],
         scene_graph: SceneGraph,
         robot_position: np.ndarray | None = None,
+        now: float | None = None,
     ) -> GroundingResult:
-        return self.complete(self.prepare(instruction, objects, scene_graph, robot_position))
+        return self.complete(self.prepare(instruction, objects, scene_graph, robot_position, now))

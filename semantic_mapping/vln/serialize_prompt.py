@@ -25,6 +25,8 @@ You are given a 4D scene graph of a robot's environment.
   "Instance 7 (plant) was last seen at [x, y, z] at t=12.4s and has since disappeared".
 - Instance IDs are stable identities: the same ID always refers to the same physical object,
   even across occlusions, relocations, or long gaps in observation.
+- An instance that is not currently observed is annotated "(not seen for N s)"; one that has
+  not been seen for a long time may no longer be there, and is marked as such.
 
 When answering, reason over the graph and put your final choice of target
 instance ID(s) inside <answer></answer> tags, e.g. <answer>3</answer> or
@@ -52,16 +54,30 @@ def serialize_subgraph_to_text(
     objects: list[ObjectInstance],
     scene_graph: SceneGraph,
     include_temporal_cues: bool = True,
+    now: float | None = None,
+    stale_after_sec: float | None = None,
 ) -> str:
-    """Render nodes, spatial edges, and temporal cues as structured text."""
+    """Render nodes, spatial edges, and temporal cues as structured text.
+
+    Occluded instances carry their age since the last observation (relative
+    to ``now``, defaulting to the freshest observation in the map); past
+    ``stale_after_sec`` they are also marked as possibly gone, so the model
+    does not send the robot to something the map merely remembers.
+    """
     by_id = {obj.instance_id: obj for obj in objects}
+    reference = float(now) if now is not None else max((o.latest_stamp for o in objects), default=0.0)
     lines: list[str] = ["Nodes:"]
 
     for node_id in scene_graph.node_ids:
         obj = by_id.get(node_id)
         if obj is None:
             continue
-        lines.append(f"  Instance {obj.instance_id} ({obj.label}) at {_format_center(obj.center)}")
+        line = f"  Instance {obj.instance_id} ({obj.label}) at {_format_center(obj.center)}"
+        if obj.status == ObjectStatus.OCCLUDED:
+            age = max(reference - obj.latest_stamp, 0.0)
+            stale = stale_after_sec is not None and age > stale_after_sec
+            line += f" (not seen for {age:.1f} s" + (", may no longer be there)" if stale else ")")
+        lines.append(line)
 
     if scene_graph.spatial_edges:
         lines.append("Spatial relations:")
@@ -119,10 +135,12 @@ def build_prompt(
     scene_graph: SceneGraph,
     instruction: str,
     coordinate_frame: str = "map",
+    now: float | None = None,
+    stale_after_sec: float | None = None,
 ) -> str:
     """Assemble the full VLM prompt: schema + serialized graph + user instruction."""
     schema = SCHEMA_PREAMBLE.format(coordinate_frame=coordinate_frame)
-    graph_text = serialize_subgraph_to_text(objects, scene_graph)
+    graph_text = serialize_subgraph_to_text(objects, scene_graph, now=now, stale_after_sec=stale_after_sec)
     return f"{schema}\n{graph_text}\n\nInstruction: {instruction}\n"
 
 
