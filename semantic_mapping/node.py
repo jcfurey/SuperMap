@@ -51,11 +51,21 @@ from semantic_mapping.ros_msgs import (
     transform_to_se3,
 )
 from semantic_mapping.serialization import serialize_frame
-from semantic_mapping.types import CameraIntrinsics, Observation, StampedPose
+from semantic_mapping.types import CameraIntrinsics, ObjectStatus, Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
 _LABEL_PALETTE_SEED = 1000003  # arbitrary large prime for a stable pseudo-random per-label hue
+
+_POINT_DTYPE = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<f4")])
+"""Memory layout of one published object point; must match the PointFields in _publish_object_points."""
+
+
+def _packed_rgb_float(label: str) -> np.float32:
+    """The label's colour packed as PCL's float-typed rgb field (0x00RRGGBB reinterpreted as float32)."""
+    r, g, b = _label_color(label)
+    packed = (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
+    return np.frombuffer(np.array([packed], dtype=np.uint32).tobytes(), dtype=np.float32)[0]
 
 
 def _stamp_to_seconds(stamp) -> float:
@@ -118,6 +128,7 @@ class SemanticMappingNode(Node):
             coordinate_frame=self.world_frame,
             local_radius_m=float(self.get_parameter("vlm.local_radius_m").value) or None,
             max_objects=int(self.get_parameter("vlm.max_objects").value) or None,
+            stale_after_sec=float(self.get_parameter("vlm.stale_after_sec").value) or None,
         )
         self._grounding_jobs: queue.Queue[GroundingRequest] = queue.Queue()
         self._grounding_thread = threading.Thread(target=self._grounding_loop, name="grounding", daemon=True)
@@ -173,6 +184,7 @@ class SemanticMappingNode(Node):
             "vlm.api_key_env": "",
             "vlm.local_radius_m": 0.0,
             "vlm.max_objects": 0,
+            "vlm.stale_after_sec": 30.0,
             "map_load_path": "",
             "map_save_path": "",
             "map_autosave_sec": 0.0,
@@ -383,6 +395,7 @@ class SemanticMappingNode(Node):
             pass  # local-subgraph selection just falls back to the whole graph
         request = self.grounder.prepare(
             instruction, self._last_result.objects, self._last_result.scene_graph, robot_position,
+            now=self._last_result.stamp,
         )
         self._grounding_jobs.put(request)
 
@@ -588,20 +601,25 @@ class SemanticMappingNode(Node):
             pc2.PointField(name="z", offset=8, datatype=pc2.PointField.FLOAT32, count=1),
             pc2.PointField(name="rgb", offset=12, datatype=pc2.PointField.FLOAT32, count=1),
         ]
-        rows = []
-        for obj in result.objects:
-            if obj.points_world.shape[0] == 0:
+        # One structured array for the whole map, serialized by create_cloud in
+        # a single copy: a Python row per point took 140 ms for a room-sized
+        # map and over a second for a building (doc/audit-2026-09.md, P1).
+        counts = [obj.points_world.shape[0] for obj in result.objects]
+        cloud = np.zeros(int(sum(counts)), dtype=_POINT_DTYPE)
+        offset = 0
+        for obj, n in zip(result.objects, counts):
+            if n == 0:
                 continue
-            r, g, b = _label_color(obj.label)
-            packed_rgb = (int(r * 255) << 16) | (int(g * 255) << 8) | int(b * 255)
-            packed_rgb_float = np.frombuffer(np.array([packed_rgb], dtype=np.uint32).tobytes(), dtype=np.float32)[0]
-            for point in obj.points_world:
-                rows.append([point[0], point[1], point[2], packed_rgb_float])
-
-        cloud_msg = pc2.create_cloud(header, fields, rows)
-        self.obj_points_pub.publish(cloud_msg)
+            block = cloud[offset:offset + n]
+            block["x"] = obj.points_world[:, 0]
+            block["y"] = obj.points_world[:, 1]
+            block["z"] = obj.points_world[:, 2]
+            block["rgb"] = _packed_rgb_float(obj.label)
+            offset += n
+        self.obj_points_pub.publish(pc2.create_cloud(header, fields, cloud))
 
     def _publish_object_boxes(self, result: FrameResult, header: Header) -> None:
+        now = result.stamp or _stamp_to_seconds(header.stamp)
         marker_array = MarkerArray()
         node_ids = set(result.scene_graph.node_ids) if result.scene_graph else set()
         by_id = {obj.instance_id: obj for obj in result.objects}
@@ -640,7 +658,10 @@ class SemanticMappingNode(Node):
             label_marker.pose.position.z = float(zmax + 0.1)
             label_marker.scale.z = 0.15
             label_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
-            label_marker.text = f"{instance_id}:{obj.label} ({obj.status.value})"
+            status = obj.status.value
+            if obj.status == ObjectStatus.OCCLUDED:
+                status = f"occluded {max(now - obj.latest_stamp, 0.0):.0f}s"
+            label_marker.text = f"{instance_id}:{obj.label} ({status})"
             marker_array.markers.append(label_marker)
 
         self.obj_boxes_pub.publish(marker_array)

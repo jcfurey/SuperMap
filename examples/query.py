@@ -59,7 +59,7 @@ def main() -> None:
     grounder = Grounder(build_vlm_client(args.client, **client_kwargs), coordinate_frame="map")
 
     for instruction in args.instructions:
-        grounding = grounder.ground(instruction, result.objects, result.scene_graph)
+        grounding = grounder.ground(instruction, result.objects, result.scene_graph, now=result.stamp)
         if args.show_prompt:
             print(grounding.prompt)
         print(f"\nInstruction: {instruction}")

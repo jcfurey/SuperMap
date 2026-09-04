@@ -140,10 +140,10 @@ A two-hour run accumulates far more instances than the camera sees at any moment
 
 | instances | points | map update, culled | map update, exhaustive | full frame, culled |
 |---|---|---|---|---|
-| 9 | 10 k | 22 ms | 19 ms | 37 ms |
-| 99 | 108 k | 25 ms | 44 ms | 37 ms |
-| 459 | 499 k | 25 ms | 134 ms | 40 ms |
-| 909 | 988 k | 35 ms | 356 ms | 56 ms |
+| 9 | 10 k | 12 ms | 12 ms | 41 ms |
+| 99 | 108 k | 16 ms | 55 ms | 35 ms |
+| 459 | 499 k | 30 ms | 227 ms | 58 ms |
+| 909 | 988 k | 48 ms | 480 ms | 84 ms |
 
 ### Sparse LiDAR depth
 
@@ -178,11 +178,11 @@ Every map update records per-stage timings (`FrameResult.timings`), the live nod
 
 | module | mean latency | sustainable rate | paper (onboard, Sec. V-H) |
 |---|---|---|---|
-| 3D mapping (tracklet prediction, back-projection, association, map update) | 38 ms | 26 Hz | 3 Hz |
+| 3D mapping (embedding, tracklet prediction, back-projection, association, map update) | 40 ms | 25 Hz | 3 Hz |
 | 4D scene graph construction | 0.3 ms | > 3 kHz | 5 Hz |
 | 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
 
-The geometric-consistency update over all instance points dominates (27 ms of the 38 ms); memory is 0.5 MiB of point arrays for 9 instances and a 91 MiB process. Latency scales with image resolution and map size, so measure your own sequence:
+Back-projection (14 ms), the geometric-consistency update over all instance points (12 ms), and the appearance embeddings (11 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 94 MiB process. Latency scales with image resolution and map size, so measure your own sequence:
 
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
@@ -202,7 +202,7 @@ ros2 service call /semantic_mapping_node/save_map std_srvs/srv/Trigger     # or 
 
 Restored instances resume as *occluded* with a reset 2D tracklet (a tracklet is camera-relative and meaningless after a restart); re-observation runs through the 3D re-activation stage like any object that left the field of view, and the geometric-consistency update retires objects that are gone. New instances keep counting from the saved ID counter, so IDs recorded by downstream consumers stay unique. Format: `map.json` + `map_arrays.npz` (`semantic_mapping/persistence.py`).
 
-Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, and `latest_stamp`, so downstream consumers can use one shared interface.
+Both offline and live modes emit the same per-frame JSON schema (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, `latest_stamp`, and `seconds_since_seen`, so downstream consumers can use one shared interface. An occluded instance is one the map remembers but has not observed for `seconds_since_seen`; the VLM prompt annotates such nodes with their age and, past `vlm.stale_after_sec`, marks them as possibly gone, RViz labels show the age, and `evaluate.py --stale_after N` scores instances unseen longer than N seconds as unknown rather than present (on the synthetic scene that turns the two removed-but-unconfirmed objects from false positives into unknowns and final-map precision from 0.80 into 1.00).
 
 ## Citation
 

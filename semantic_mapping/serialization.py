@@ -23,8 +23,21 @@ def _relations_for(instance_id: int, scene_graph: SceneGraph) -> list[dict[str, 
     ]
 
 
-def serialize_instance(instance: ObjectInstance, scene_graph: SceneGraph) -> dict[str, Any]:
-    """Serialize a single object instance to the documented per-frame schema."""
+def frame_time(objects: list[ObjectInstance], now: float | None = None) -> float:
+    """The reference time for ages: ``now`` when given, else the freshest observation in the map."""
+    if now is not None:
+        return float(now)
+    return max((obj.latest_stamp for obj in objects), default=0.0)
+
+
+def serialize_instance(instance: ObjectInstance, scene_graph: SceneGraph, now: float | None = None) -> dict[str, Any]:
+    """Serialize a single object instance to the documented per-frame schema.
+
+    ``seconds_since_seen`` is how long ago the instance was last observed
+    (relative to ``now``); consumers can treat a long-unobserved "occluded"
+    instance as uncertain rather than present.
+    """
+    reference = frame_time([instance], now)
     return {
         "id": instance.instance_id,
         "label": instance.label,
@@ -33,18 +46,24 @@ def serialize_instance(instance: ObjectInstance, scene_graph: SceneGraph) -> dic
         "spatial_relations": _relations_for(instance.instance_id, scene_graph),
         "status": instance.status.value,
         "latest_stamp": instance.latest_stamp,
+        "seconds_since_seen": max(reference - instance.latest_stamp, 0.0),
     }
 
 
-def serialize_frame(objects: list[ObjectInstance], scene_graph: SceneGraph) -> list[dict[str, Any]]:
+def serialize_frame(
+    objects: list[ObjectInstance], scene_graph: SceneGraph, now: float | None = None,
+) -> list[dict[str, Any]]:
     """Serialize every node currently in the scene graph, in a stable id order."""
     by_id = {obj.instance_id: obj for obj in objects}
+    reference = frame_time(objects, now)
     return [
-        serialize_instance(by_id[node_id], scene_graph)
+        serialize_instance(by_id[node_id], scene_graph, reference)
         for node_id in scene_graph.node_ids
         if node_id in by_id
     ]
 
 
-def serialize_frame_json(objects: list[ObjectInstance], scene_graph: SceneGraph, **json_kwargs: Any) -> str:
-    return json.dumps(serialize_frame(objects, scene_graph), **json_kwargs)
+def serialize_frame_json(
+    objects: list[ObjectInstance], scene_graph: SceneGraph, now: float | None = None, **json_kwargs: Any,
+) -> str:
+    return json.dumps(serialize_frame(objects, scene_graph, now), **json_kwargs)

@@ -161,11 +161,18 @@ class SequenceEvaluator:
         intrinsics: CameraIntrinsics,
         iou_threshold: float = DEFAULT_IOU_THRESHOLD,
         centroid_threshold: float = DEFAULT_CENTROID_THRESHOLD_M,
+        stale_after_sec: float | None = None,
     ) -> None:
         self.ground_truth = ground_truth
         self.intrinsics = intrinsics
         self.iou_threshold = iou_threshold
         self.centroid_threshold = centroid_threshold
+        self.stale_after_sec = stale_after_sec
+        """When set, an occluded instance unseen for longer than this at the end
+        of the sequence is scored as unknown: neither a prediction (so not a
+        false positive) nor a match (so a still-present object it describes
+        counts as missed). Off by default to keep the paper's convention."""
+        self._last_stamp: float | None = None
         self.stats = [ObjectStats(label=gt.label) for gt in ground_truth]
         self.total_ids_created = 0
         self._last_objects: list[ObjectInstance] = []
@@ -183,14 +190,18 @@ class SequenceEvaluator:
         T_world_from_cam: np.ndarray,
         objects: list[ObjectInstance],
         depth_image: np.ndarray | None = None,
+        stamp: float | None = None,
     ) -> None:
         """Score one frame's map state against ground truth.
 
         ``depth_image`` (optional) lets the disappearance interval exclude
-        frames in which the object's former location is occluded.
+        frames in which the object's former location is occluded; ``stamp``
+        (optional) is what the stale-instance convention measures ages against.
         """
         self._last_objects = objects
         self._last_frame_id = frame_id
+        if stamp is not None:
+            self._last_stamp = float(stamp)
         self.total_ids_created = max(self.total_ids_created, *(o.instance_id for o in objects), 0)
 
         for gt, stats in zip(self.ground_truth, self.stats):
@@ -236,10 +247,16 @@ class SequenceEvaluator:
             "inconsistent": sorted(k for k in evaluated if k not in consistent),
         }
 
+    def is_stale(self, instance: ObjectInstance) -> bool:
+        """Occluded and unseen for longer than ``stale_after_sec`` at the last observed stamp."""
+        if self.stale_after_sec is None or self._last_stamp is None:
+            return False
+        return instance.status == ObjectStatus.OCCLUDED and (self._last_stamp - instance.latest_stamp) > self.stale_after_sec
+
     def final_map_prf(self) -> tuple[float, float, float, int, int, int]:
         """Precision / recall / F1 of the final map plus (tp, n_predictions, n_gt)."""
         present_gt = [gt for gt in self.ground_truth if gt.present_at(self._last_frame_id)]
-        predictions = [o for o in self._last_objects if o.status in PRESENT_STATUSES]
+        predictions = [o for o in self._last_objects if o.status in PRESENT_STATUSES and not self.is_stale(o)]
 
         # Greedy one-to-one assignment by 3D IoU so duplicates count as false positives.
         candidates = []
@@ -285,9 +302,11 @@ class SequenceEvaluator:
             "mean_fragments": float(np.mean([s.fragments for s in self.stats])),
             "total_instance_ids_created": self.total_ids_created,
             "identity_consistency": self.identity_consistency(),
+            "stale_after_sec": self.stale_after_sec,
             "final_map": {
                 "precision": precision, "recall": recall, "f1": f1,
                 "tp": tp, "predictions": n_pred, "ground_truth": n_gt,
+                "stale_excluded": sum(1 for o in self._last_objects if o.status in PRESENT_STATUSES and self.is_stale(o)),
             },
         }
 
@@ -313,4 +332,8 @@ def format_summary(summary: dict) -> str:
         f"final map             : precision {fm['precision']:.3f}  recall {fm['recall']:.3f}  F1 {fm['f1']:.3f}  "
         f"(tp {fm['tp']} / {fm['predictions']} predictions / {fm['ground_truth']} ground truth)",
     ]
+    if summary.get("stale_after_sec") is not None:
+        lines.append(f"stale convention      : occluded instances unseen > {summary['stale_after_sec']:g} s scored as "
+                     f"unknown ({fm.get('stale_excluded', 0)} excluded)")
+    lines = lines
     return "\n".join(lines)

@@ -60,3 +60,25 @@ def test_moved_cue_ignores_early_estimate_refinement_but_reports_real_motion():
     obj.trajectory.append((6.0, np.array([2.5, 0.0, 0.5]), "active"))  # genuinely relocated later
     text = vp.serialize_subgraph_to_text([obj], graph)
     assert "Instance 1 (cart) moved from [0.85, 0.00, 0.50] at t=1.50s to [2.50, 0.00, 0.50] at t=6.00s" in text
+
+
+def test_occluded_nodes_carry_their_age_and_a_stale_warning():
+    from semantic_mapping.types import ObjectStatus
+
+    seen = make_object(1, "table", [0, 0, 0, 1, 1, 1])
+    seen.latest_stamp = 100.0
+    hidden = make_object(2, "plant", [3, 3, 0, 4, 4, 1], status=ObjectStatus.OCCLUDED)
+    hidden.latest_stamp = 88.0
+    long_gone = make_object(3, "chair", [6, 6, 0, 7, 7, 1], status=ObjectStatus.OCCLUDED)
+    long_gone.latest_stamp = 40.0
+    graph = sg.SceneGraph(node_ids=[1, 2, 3], spatial_edges=[])
+    objects = [seen, hidden, long_gone]
+
+    text = vp.serialize_subgraph_to_text(objects, graph, stale_after_sec=30.0)  # now = freshest = 100 s
+    assert "Instance 1 (table) at [0.50, 0.50, 0.50]\n" in text + "\n"
+    assert "Instance 2 (plant) at [3.50, 3.50, 0.50] (not seen for 12.0 s)" in text
+    assert "Instance 3 (chair) at [6.50, 6.50, 0.50] (not seen for 60.0 s, may no longer be there)" in text
+
+    text = vp.serialize_subgraph_to_text(objects, graph, now=130.0, stale_after_sec=30.0)
+    assert "(not seen for 42.0 s, may no longer be there)" in text
+    assert "not seen for" in vp.build_prompt(objects, graph, "go", now=130.0) and "annotated" in vp.SCHEMA_PREAMBLE

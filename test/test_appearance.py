@@ -64,3 +64,16 @@ def test_build_embedder_names():
     with pytest.raises(ValueError):
         appearance.build_embedder("hog")
     assert appearance.cosine_similarity(np.ones(3), np.ones(4)) == 0.0
+
+
+def test_large_regions_are_subsampled_without_changing_the_descriptor():
+    rng = np.random.default_rng(0)
+    rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+    rgb[..., 0] = np.linspace(40, 220, 640, dtype=np.uint8)[None, :]   # a horizontal gradient
+    rgb[..., 1] = 60
+    rgb[..., 2] = np.linspace(200, 30, 480, dtype=np.uint8)[:, None]   # and a vertical one
+    det = Detection2D(bbox=np.array([50.0, 50.0, 600.0, 450.0]), label="x", score=0.9)
+    full = appearance.ColorHistogramEmbedder(max_pixels=10 ** 9).embed(rgb, [det])[0]
+    sampled = appearance.ColorHistogramEmbedder().embed(rgb, [det])[0]
+    assert appearance.cosine_similarity(full, sampled) > 0.995
+    assert appearance.build_embedder("color_histogram", max_pixels=100).max_pixels == 100

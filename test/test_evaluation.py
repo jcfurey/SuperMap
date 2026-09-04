@@ -108,3 +108,32 @@ def test_location_in_view_respects_occlusion_from_depth_image():
     blocked = np.full((80, 100), 1.0)    # something 1 m in front: occluded
     assert ev.location_in_view(gt, INTRINSICS, CAMERA_AT_ORIGIN, clear)
     assert not ev.location_in_view(gt, INTRINSICS, CAMERA_AT_ORIGIN, blocked)
+
+
+def test_stale_convention_scores_long_unseen_occluded_instances_as_unknown():
+    import numpy as np
+
+    from semantic_mapping import evaluation as ev
+    from semantic_mapping.types import CameraIntrinsics, ObjectStatus
+    from test.helpers import make_object
+
+    gt = [ev.GroundTruthObject("table", np.array([0, 0, 0, 1, 1, 1.0]), 0, 10, {0, 1}, "table#0")]
+    intr = CameraIntrinsics(fx=100.0, fy=100.0, cx=80.0, cy=60.0, width=160, height=120)
+    table = make_object(1, "table", [0, 0, 0, 1, 1, 1])
+    table.points_world = np.zeros((5, 3))
+    table.latest_stamp = 0.5
+    ghost = make_object(2, "chair", [5, 5, 0, 6, 6, 1], status=ObjectStatus.OCCLUDED)  # no ground truth: a false positive
+    ghost.points_world = np.zeros((5, 3))
+    ghost.latest_stamp = 0.1
+
+    default = ev.SequenceEvaluator(gt, intr)
+    default.observe(1, np.eye(4), [table, ghost], stamp=9.0)
+    precision, recall, f1 = default.final_map_prf()[:3]
+    assert (precision, recall) == (0.5, 1.0) and abs(f1 - 2 / 3) < 1e-9
+
+    stale = ev.SequenceEvaluator(gt, intr, stale_after_sec=5.0)
+    stale.observe(1, np.eye(4), [table, ghost], stamp=9.0)
+    assert stale.is_stale(ghost) and not stale.is_stale(table)
+    assert stale.final_map_prf()[:3] == (1.0, 1.0, 1.0)
+    assert stale.summary()["final_map"]["stale_excluded"] == 1
+    assert "stale convention" in ev.format_summary(stale.summary())

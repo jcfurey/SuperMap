@@ -74,7 +74,7 @@ semantic_mapping_node:
     # --- Pipeline / mapping parameters (Sec. IV-B, IV-C) ------------------
     voxel_size: 0.05                       # meters, per-object point fusion resolution
     tau_eps: 0.15                          # meters, geometric consistency threshold (Eq. 9)
-    max_points_per_object: 20000
+    max_points_per_object: 5000        # voxels kept per instance (40 bytes each); 5 cm voxels give ~2-3k for furniture
     max_points_per_detection: 4000
     prune_log_odds: -1.5                   # Eq. (8): points whose occupancy log-odds fall below this are dropped
     prune_membership: -1.5                 # Sec. IV-B.4: points visible but repeatedly outside the detected region are dropped
@@ -147,6 +147,7 @@ semantic_mapping_node:
       api_key_env: ""
       local_radius_m: 0.0  # > 0: serialize only objects within this distance of the robot (local subgraph)
       max_objects: 0       # > 0: cap the number of serialized objects (nearest first)
+      stale_after_sec: 30.0  # occluded instances unseen longer than this are marked "may no longer be there"
 
     # --- Persistence (living memory across sessions) ----------------------
     # map_load_path: restore a saved map at startup. Restored objects resume

@@ -34,7 +34,7 @@ from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus, Ob
 class PipelineConfig:
     voxel_size: float = 0.05
     tau_eps: float = 0.15
-    max_points_per_object: int = 20000
+    max_points_per_object: int = 5000
     prune_log_odds: float = -1.5
     prune_membership: float = -1.5
     membership_margin_px: float = 2.0
@@ -105,6 +105,9 @@ class PipelineConfig:
 @dataclass
 class FrameResult:
     objects: list[ObjectInstance] = field(default_factory=list)
+    stamp: float = 0.0
+    """Timestamp of the observation this result reflects; the reference for
+    "not seen for N s" ages of occluded instances."""
     scene_graph: sg.SceneGraph | None = None
     detection_instance_ids: list[int] = field(default_factory=list)
     """For each detection in the processed observation, the instance ID it was
@@ -112,9 +115,9 @@ class FrameResult:
     discarded (e.g. a low-confidence detection with no existing track)."""
 
     timings: dict[str, float] = field(default_factory=dict)
-    """Wall-clock seconds spent in each stage of this update (``predict``,
-    ``backproject``, ``associate``, ``map_update``, ``scene_graph``, ``total``),
-    the raw material for the Sec. V-H runtime accounting."""
+    """Wall-clock seconds spent in each stage of this update (``embed``,
+    ``predict``, ``backproject``, ``associate``, ``map_update``, ``scene_graph``,
+    ``total``), the raw material for the Sec. V-H runtime accounting."""
 
 
 class SemanticMappingPipeline:
@@ -234,6 +237,7 @@ class SemanticMappingPipeline:
             if missing:
                 for detection, embedding in zip(missing, self.embedder.embed(observation.rgb, missing)):
                     detection.embedding = embedding
+        t_embed = time.perf_counter()
 
         image_size = (observation.intrinsics.width, observation.intrinsics.height)
         # One batched frustum test decides which instances can be seen at all;
@@ -405,10 +409,12 @@ class SemanticMappingPipeline:
 
         return FrameResult(
             objects=list(self.object_map.objects.values()),
+            stamp=float(observation.stamp),
             scene_graph=graph,
             detection_instance_ids=detection_instance_ids,
             timings={
-                "predict": t_predict - t_start,
+                "embed": t_embed - t_start,
+                "predict": t_predict - t_embed,
                 "backproject": t_backproject - t_predict,
                 "associate": t_associate - t_backproject,
                 "map_update": t_update - t_associate,

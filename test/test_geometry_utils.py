@@ -119,3 +119,24 @@ def test_fill_sparse_depth_fills_only_empty_pixels_with_neighbourhood_minimum():
     assert fill_sparse_depth(depth, radius_px=3)[4, 0] == 2.0   # wider radius reaches, and takes the minimum
     dense = np.full((3, 3), 1.5)
     assert np.array_equal(fill_sparse_depth(dense, 2), dense)
+
+
+def test_rasterize_depth_keeps_the_nearest_point_per_pixel():
+    from semantic_mapping.geometry_utils import rasterize_depth
+
+    K = np.array([[100.0, 0.0, 8.0], [0.0, 100.0, 6.0], [0.0, 0.0, 1.0]])
+    rng = np.random.default_rng(0)
+    points = rng.uniform([-0.1, -0.1, 0.5], [0.1, 0.1, 5.0], size=(2000, 3))  # many points per pixel
+    points = np.concatenate([points, [[0.0, 0.0, -1.0], [50.0, 0.0, 1.0]]])   # behind the camera, off-image
+    depth = rasterize_depth(points, K, 16, 12)
+
+    z = points[:, 2]
+    front = z > 0
+    us = np.round(100.0 * points[front, 0] / z[front] + 8.0).astype(int)
+    vs = np.round(100.0 * points[front, 1] / z[front] + 6.0).astype(int)
+    expected = np.zeros((12, 16))
+    for u, v, d in sorted(zip(us, vs, z[front]), key=lambda t: -t[2]):  # far-to-near reference
+        if 0 <= u < 16 and 0 <= v < 12:
+            expected[v, u] = d
+    assert np.array_equal(depth, expected)
+    assert rasterize_depth(np.zeros((0, 3)), K, 16, 12).shape == (12, 16)
