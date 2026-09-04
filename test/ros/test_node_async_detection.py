@@ -8,7 +8,7 @@ import numpy as np
 from std_msgs.msg import Header
 
 from semantic_mapping.ros_msgs import pointcloud_to_xyz
-from test.ros.conftest import ReplayDetector, feed_frame, stamp_msg
+from test.ros.helpers import ReplayDetector, feed_frame, stamp_msg
 
 
 def test_deferred_detection_frames_fuse_and_outputs_publish(node_factory, dataset):

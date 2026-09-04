@@ -1,7 +1,7 @@
 """Sparse LiDAR: accumulating the last N scans through TF densifies the rasterized depth."""
 import numpy as np
 
-from test.ros.conftest import feed_frames
+from test.ros.helpers import feed_frames
 
 
 def _raster_densities(node, dataset, frames):

@@ -20,7 +20,7 @@ from semantic_mapping.geometry_utils import (
     back_project_depth, invert_se3, quaternion_to_rotation_matrix, rotation_matrix_to_quaternion, transform_points,
 )
 from semantic_mapping.ros_msgs import numpy_to_image
-from test.ros.conftest import ROOT, camera_info, stamp_msg
+from test.ros.helpers import ROOT, camera_info, stamp_msg
 
 rosbag2_py = pytest.importorskip("rosbag2_py")
 

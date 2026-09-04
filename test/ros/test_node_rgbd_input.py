@@ -10,7 +10,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Header
 
 from semantic_mapping.ros_msgs import numpy_to_image
-from test.ros.conftest import camera_info, set_camera_tf, stamp_msg
+from test.ros.helpers import camera_info, set_camera_tf, stamp_msg
 
 cv2 = pytest.importorskip("cv2")
 

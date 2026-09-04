@@ -6,7 +6,7 @@ import time
 import numpy as np
 from std_msgs.msg import String
 
-from test.ros.conftest import feed_frames
+from test.ros.helpers import feed_frames
 
 
 def _wait(published, count, timeout=5.0):

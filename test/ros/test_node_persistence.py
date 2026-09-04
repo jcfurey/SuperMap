@@ -4,7 +4,7 @@ from pathlib import Path
 
 from std_srvs.srv import Trigger
 
-from test.ros.conftest import feed_frames
+from test.ros.helpers import feed_frames
 
 
 def test_save_and_load_services_keep_identities(node_factory, dataset, tmp_path):
