@@ -86,4 +86,14 @@ def feed_frames(node, dataset, frames, point_fraction: float | None = None, slee
     for frame in frames:
         feed_frame(node, dataset, frame, world_points(dataset, frame, point_fraction, rng))
         time.sleep(sleep)
-    node._drain_detection_results(Header(stamp=stamp_msg(frames[-1].stamp), frame_id="map"))
+    spin_until(node, lambda: not node._pending_frames)
+
+
+def spin_until(node, predicate, timeout: float = 5.0) -> None:
+    """Wait through the real executor, so result draining cannot depend on test-only calls."""
+    import rclpy
+
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.02)
+    assert predicate(), 'node did not reach the expected state before the deadline'

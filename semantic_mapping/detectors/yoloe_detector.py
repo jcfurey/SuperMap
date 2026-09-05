@@ -38,7 +38,8 @@ class YOLOEDetector(Detector):
             self._set_vocabulary(prompts)
 
         results = self.model.predict(
-            rgb_image, device=self.device, conf=self.confidence_threshold, verbose=False,
+            np.ascontiguousarray(rgb_image[:, :, ::-1]),  # Ultralytics numpy inputs are BGR.
+            device=self.device, conf=self.confidence_threshold, verbose=False, retina_masks=True,
         )
         if not results:
             return []
@@ -58,6 +59,8 @@ class YOLOEDetector(Detector):
             class_id = int(boxes.cls[i].cpu().numpy())
             label = names.get(class_id, str(class_id)) if isinstance(names, dict) else names[class_id]
             mask = masks[i] > 0.5 if masks is not None else None
-            detections.append(Detection2D(bbox=bbox, label=label, score=score, mask=mask))
+            detection = Detection2D(bbox=bbox, label=label, score=score, mask=mask)
+            detection.validate_mask(rgb_image.shape[:2])
+            detections.append(detection)
 
         return detections

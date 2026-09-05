@@ -4,8 +4,8 @@ The map M_t is abstracted into a graph G = (V, E_s, E_t): nodes V are object
 instances, spatial edges E_s are class-dependent geometric predicates
 (on/under/beside) evaluated between nearby objects, and temporal edges E_t
 trace each instance's own trajectory over time via the association result.
-For real-time operation, objects are first clustered by centroid distance so
-predicates are only evaluated between nearby pairs instead of all O(N^2).
+For real-time operation, a spatial index selects nearby centroid pairs so
+predicates are evaluated without losing neighbors across cluster boundaries.
 """
 from __future__ import annotations
 
@@ -33,27 +33,12 @@ class SceneGraph:
     spatial_edges: list[SpatialEdge] = field(default_factory=list)
 
 
-def _cluster_by_centroid(objects: list[ObjectInstance], cluster_radius: float) -> list[list[int]]:
-    """Greedily group object indices whose centroids lie within ``cluster_radius``
-    of a cluster's seed point, so spatial predicates are only evaluated within
-    clusters rather than over every object pair.
-    """
-    n = len(objects)
-    if n == 0:
+def _neighbor_pairs(objects: list[ObjectInstance], radius: float) -> list[tuple[int, int]]:
+    """Every pair within the configured centroid radius, once, in stable order."""
+    if len(objects) < 2:
         return []
     centers = np.array([obj.center for obj in objects])
-    tree = cKDTree(centers)
-    assigned = np.zeros(n, dtype=bool)
-    clusters: list[list[int]] = []
-
-    for i in range(n):
-        if assigned[i]:
-            continue
-        members = sorted(int(j) for j in tree.query_ball_point(centers[i], cluster_radius) if not assigned[j])
-        assigned[members] = True
-        clusters.append(members)
-
-    return clusters
+    return sorted(cKDTree(centers).query_pairs(radius))
 
 
 def _on_predicate(a: ObjectInstance, b: ObjectInstance, z_tolerance: float, xy_iou_threshold: float) -> bool:
@@ -88,21 +73,21 @@ supports."""
 
 
 class SpatialEdgeCache:
-    """Remembers each cluster's edges keyed by what the predicates depend on.
+    """Remembers each neighboring pair's edges keyed by the predicate inputs.
 
     Objects that were not touched this frame keep the same box and label, so
-    a cluster whose members are all unchanged yields exactly the edges it
-    yielded last time. Re-evaluating only clusters with a changed member
-    keeps graph construction proportional to what moved, not to map size.
+    a pair whose members are all unchanged yields exactly the edges it
+    yielded last time. Only pairs with changed predicate inputs need their
+    geometric relations evaluated again.
     """
 
     def __init__(self) -> None:
         self._edges: dict[tuple, list[SpatialEdge]] = {}
 
     @staticmethod
-    def signature(objects: list[ObjectInstance], members: list[int]) -> tuple:
+    def signature(objects: list[ObjectInstance], members: tuple[int, int]) -> tuple:
         return tuple(
-            (objects[i].instance_id, objects[i].label, tuple(np.round(objects[i].bbox3d, 4).tolist())) for i in members
+            (objects[i].instance_id, objects[i].label, tuple(objects[i].bbox3d.tolist())) for i in members
         )
 
     def get(self, key: tuple) -> list[SpatialEdge] | None:
@@ -112,24 +97,20 @@ class SpatialEdgeCache:
         self._edges[key] = edges
 
     def retain(self, keys: set[tuple]) -> None:
-        """Drop entries for clusters that no longer exist."""
+        """Drop entries for pairs that no longer exist."""
         self._edges = {k: v for k, v in self._edges.items() if k in keys}
 
 
-def _cluster_edges(objects, members, z_tolerance, xy_iou_threshold, beside_max_distance, supports) -> list[SpatialEdge]:
+def _pair_edges(a, b, z_tolerance, xy_iou_threshold, beside_max_distance, supports) -> list[SpatialEdge]:
     edges: list[SpatialEdge] = []
-    for i in members:
-        for j in members:
-            if i == j:
-                continue
-            a, b = objects[i], objects[j]
-            can_support = supports is None or b.label in supports
-            if can_support and _on_predicate(a, b, z_tolerance, xy_iou_threshold):
-                edges.append(SpatialEdge(a.instance_id, "on", b.instance_id))
-                edges.append(SpatialEdge(b.instance_id, "under", a.instance_id))
-            elif i < j and _beside_predicate(a, b, z_tolerance, xy_iou_threshold, beside_max_distance):
-                edges.append(SpatialEdge(a.instance_id, "beside", b.instance_id))
-                edges.append(SpatialEdge(b.instance_id, "beside", a.instance_id))
+    for subject, support in ((a, b), (b, a)):
+        can_support = supports is None or support.label in supports
+        if can_support and _on_predicate(subject, support, z_tolerance, xy_iou_threshold):
+            edges.append(SpatialEdge(subject.instance_id, "on", support.instance_id))
+            edges.append(SpatialEdge(support.instance_id, "under", subject.instance_id))
+    if not edges and _beside_predicate(a, b, z_tolerance, xy_iou_threshold, beside_max_distance):
+        edges.append(SpatialEdge(a.instance_id, "beside", b.instance_id))
+        edges.append(SpatialEdge(b.instance_id, "beside", a.instance_id))
     return edges
 
 
@@ -142,30 +123,31 @@ def build_spatial_edges(
     support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
     cache: SpatialEdgeCache | None = None,
 ) -> list[SpatialEdge]:
-    """Evaluate class-dependent geometric predicates within centroid clusters.
+    """Evaluate predicates for every pair within ``cluster_radius`` of each other.
 
     Emits ``on`` (A on B, with B's class in ``support_classes``; pass an empty
     collection to make it purely geometric), its inverse ``under`` (B under
-    A), and symmetric ``beside`` edges. With a ``cache``, clusters whose
+    A), and symmetric ``beside`` edges. With a ``cache``, pairs whose
     members are unchanged since the last call reuse their edges.
     """
     edges: list[SpatialEdge] = []
-    clusters = _cluster_by_centroid(objects, cluster_radius)
+    objects = sorted(objects, key=lambda obj: obj.instance_id)
+    pairs = _neighbor_pairs(objects, cluster_radius)
     supports = set(support_classes) if support_classes else None
     keys: set[tuple] = set()
+    parameters = (z_tolerance, xy_iou_threshold, beside_max_distance,
+                  tuple(sorted(supports)) if supports is not None else None)
 
-    for members in clusters:
-        if len(members) < 2:
-            continue
-        key = SpatialEdgeCache.signature(objects, members) if cache is not None else None
-        cluster_edges = cache.get(key) if cache is not None else None
-        if cluster_edges is None:
-            cluster_edges = _cluster_edges(objects, members, z_tolerance, xy_iou_threshold, beside_max_distance, supports)
+    for i, j in pairs:
+        key = (parameters, SpatialEdgeCache.signature(objects, (i, j))) if cache is not None else None
+        pair_edges = cache.get(key) if cache is not None else None
+        if pair_edges is None:
+            pair_edges = _pair_edges(objects[i], objects[j], z_tolerance, xy_iou_threshold, beside_max_distance, supports)
             if cache is not None:
-                cache.put(key, cluster_edges)
+                cache.put(key, pair_edges)
         if cache is not None:
             keys.add(key)
-        edges.extend(cluster_edges)
+        edges.extend(pair_edges)
 
     if cache is not None:
         cache.retain(keys)

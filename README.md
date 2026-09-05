@@ -48,12 +48,11 @@ git clone https://github.com/superxslam/SuperMap.git
 cd SuperMap
 conda create -n supermap python=3.11 && conda activate supermap
 
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
 conda install cuda -c nvidia/label/cuda-12.4.0
 export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
 
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
 ```
 
 ## Run (offline)
@@ -98,7 +97,9 @@ colcon build --packages-select semantic_mapping && source install/setup.bash
 ros2 launch semantic_mapping semantic_mapping.launch.py
 ```
 
-In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. Perception is asynchronous, as in the paper (Sec. V-H): the detector runs in its own thread at `detector_rate_hz` (default 1 Hz) while geometric updates continue at the sensor rate; a frame handed to the detector is fused once, under its own pose and depth, when its detections return. Map outputs are published at `publish_rate_hz`. Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 rather than a fixed parameter, so a `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration).
+In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. The detector runs in its own thread at `detector_rate_hz` (default 1 Hz). Sensor frames are fused exactly once in timestamp order, under their own pose and depth. Later frames wait behind a pending detection for at most `detector_timeout_sec` (default 2 seconds of steady time), with a buffer of `max_pending_frames` (default 30). A timeout or overflow releases the waiting frame without detections; late results are discarded. This bounds detector-induced mapping latency and prevents old observations from reversing newer map state. A steady-clock timer delivers completed results even when inputs or bag playback stop. Duplicate and out-of-order input stamps are skipped; loading a map starts a new input timestamp sequence and invalidates pending observations. Map outputs are published at `publish_rate_hz`; annotated images retain their original camera frame and timestamp.
+
+Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 at the RGB timestamp; each point cloud is first transformed into the world at its own timestamp, then projected into that RGB-time camera. A `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration). Detector masks must be boolean arrays at camera resolution; the YOLOE adapter requests original-resolution masks and converts RGB to the backend's BGR input convention.
 
 Sensor inputs subscribe best-effort by default (`sensor_qos`), which matches both best-effort and reliable drivers; RGB can arrive as `CompressedImage` (`rgb_compressed: true`), and RGB-D cameras can feed their color-aligned depth stream directly (`depth_source: depth_image`, `depth_topic`, `depth_scale`) instead of a point cloud. Images are decoded with plain numpy, so the node does not depend on cv_bridge.
 
@@ -136,7 +137,7 @@ The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `ope
 
 ### Scaling to long deployments
 
-A two-hour run accumulates far more instances than the camera sees at any moment, so the per-frame cost has to follow the view rather than the map. One batched frustum test on every instance's 3D box decides which instances can be seen at all; the rest skip tracklet prediction, association, and the per-point evidence update for that frame (`cull_out_of_view`, on by default and equivalent in outcome, since an out-of-view point carries no evidence). Duplicate merging and scene-graph clustering draw their candidate pairs from a KD-tree, and scene-graph edges are cached per cluster and re-evaluated only when a member changed. Timing the map update on the 640x480 synthetic scene with the room's instances cloned far outside the view (this 4-core CPU sandbox):
+A two-hour run accumulates far more instances than the camera sees at any moment, so the per-frame cost has to follow the view rather than the map. One batched frustum test on every instance's 3D box decides which instances can be seen at all; the rest skip tracklet prediction, association, and the per-point evidence update for that frame (`cull_out_of_view`, on by default and equivalent in outcome, since an out-of-view point carries no evidence). Duplicate merging and scene-graph construction draw their candidate pairs from a KD-tree. The graph checks every pair within `scene_graph_cluster_radius`, caches each pair's edges, and re-evaluates them when either member or a predicate parameter changes. Historical timing of the map update on the 640x480 synthetic scene with the room's instances cloned far outside the view (this 4-core CPU sandbox):
 
 | instances | points | map update, culled | map update, exhaustive | full frame, culled |
 |---|---|---|---|---|

@@ -1,5 +1,5 @@
 """The node's asynchronous perception path: frames handed to the detector
-thread are fused once their detections return, other frames fuse at once,
+thread are fused in sensor order once their detections return,
 map outputs are published at the publish rate, and the published point
 cloud carries the map's points."""
 import time
@@ -8,7 +8,7 @@ import numpy as np
 from std_msgs.msg import Header
 
 from semantic_mapping.ros_msgs import pointcloud_to_xyz
-from test.ros.helpers import ReplayDetector, feed_frame, stamp_msg
+from test.ros.helpers import ReplayDetector, feed_frame, spin_until, stamp_msg
 
 
 def test_deferred_detection_frames_fuse_and_outputs_publish(node_factory, dataset):
@@ -28,7 +28,7 @@ def test_deferred_detection_frames_fuse_and_outputs_publish(node_factory, datase
         while node._detection_results.empty() and not node._detection_jobs.empty() and time.time() < deadline:
             time.sleep(0.05)
     time.sleep(0.5)
-    node._drain_detection_results(Header(stamp=stamp_msg(frames[-1].stamp), frame_id="map"))
+    spin_until(node, lambda: not node._pending_frames)
 
     assert node.detector.calls, "detector thread never ran"
     assert node.detector.calls[0] == 0, "the first frame goes to the detector"

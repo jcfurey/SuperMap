@@ -47,6 +47,8 @@ semantic_mapping_node:
     # One of: offline | yoloe | groundingdino
     detector: yoloe
     detector_rate_hz: 1.0   # asynchronous perception runs slower than SLAM (Sec. IV, V-H)
+    detector_timeout_sec: 2.0  # steady-clock deadline; overdue detections are discarded
+    max_pending_frames: 30     # later frames wait in order; overflow releases the oldest without detections
     prompts_file: config/prompts.yaml
 
     # Any backend accepts sam2_checkpoint + sam2_model_cfg: boxes are then
@@ -110,7 +112,7 @@ semantic_mapping_node:
     reid_min_similarity: 0.85               # cosine similarity floor; ~0.85 for histograms, ~0.9 for CLIP
     reid_max_age_sec: 0.0                   # 0 = re-identify no matter how long ago it was last seen
 
-    scene_graph_cluster_radius: 2.0        # meters, Sec. IV-C clustering for real-time predicates
+    scene_graph_cluster_radius: 2.0        # meters, maximum centroid distance for candidate relation pairs
     scene_graph_z_tolerance: 0.1           # meters, "On" predicate z_min ~= z_max tolerance
     scene_graph_xy_iou_threshold: 0.05     # gamma in Eq. On(A,B) predicate
     scene_graph_beside_max_distance: 1.0   # meters

@@ -16,9 +16,6 @@ ultralytics>=8.3          # yoloe
 # groundingdino-py        # groundingdino: install from https://github.com/IDEA-Research/GroundingDINO
 # sam2                    # groundingdino + SAM2 mask refinement: https://github.com/facebookresearch/sam2
 
-# Open-vocabulary label handling
-spacy>=3.7
-
 # Testing
 # Capped below 8: ROS2's own launch_testing pytest plugin registers a pytest11
 # hookimpl against the pre-pytest-8 hookspec (path arg, not collection_path)

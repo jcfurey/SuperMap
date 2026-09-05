@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from semantic_mapping.pipeline import PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.types import CameraIntrinsics, Detection2D, ObjectStatus, Observation, StampedPose
@@ -38,6 +39,53 @@ def test_static_object_becomes_and_stays_active():
     record = pipeline_json_record(result)
     assert record["label"] == "chair"
     assert record["status"] == "active"
+
+
+def test_confirmation_threshold_is_honored_by_matching_and_reidentification():
+    pipeline = SemanticMappingPipeline(PipelineConfig(min_hits_to_confirm=5))
+    for i in range(2):
+        result = pipeline.process_frame(_observation(i * 0.1, 2.0, True))
+        assert result.objects[0].status == ObjectStatus.TENTATIVE
+    for i in range(2, 8):
+        result = pipeline.process_frame(_observation(i * 0.1, 8.0, False))
+    assert result.objects[0].status == ObjectStatus.DISAPPEARED
+    for i in range(8, 11):
+        result = pipeline.process_frame(_observation(i * 0.1, 2.0, True))
+        assert len(result.objects) == 1 and result.objects[0].instance_id == 1
+        obj = result.objects[0]
+        assert obj.status == (ObjectStatus.ACTIVE if obj.hits >= 5 else ObjectStatus.TENTATIVE)
+    assert result.objects[0].hits == 5
+    for i in range(11, 18):
+        result = pipeline.process_frame(_observation(i * 0.1, 8.0, False))
+    assert result.objects[0].status == ObjectStatus.DISAPPEARED
+    result = pipeline.process_frame(_observation(1.8, 2.0, True))
+    assert result.objects[0].instance_id == 1 and result.objects[0].hits == 6
+    assert result.objects[0].status == ObjectStatus.ACTIVE  # a confirmed identity resumes immediately
+
+
+@pytest.mark.parametrize('stamp', [0.0, 0.1])
+def test_stale_or_duplicate_frames_cannot_change_the_map(stamp):
+    pipeline = SemanticMappingPipeline()
+    pipeline.process_frame(_observation(0.0, 2.0, True))
+    pipeline.process_frame(_observation(0.1, 2.0, True))
+    obj = pipeline.object_map.objects[1]
+    points, evidence, hits = obj.points_world.copy(), obj.point_log_odds.copy(), obj.hits
+    with pytest.raises(ValueError, match='timestamp order'):
+        pipeline.process_frame(_observation(stamp, 8.0, False))
+    assert pipeline._frame_index == 2 and obj.hits == hits
+    np.testing.assert_array_equal(obj.points_world, points)
+    np.testing.assert_array_equal(obj.point_log_odds, evidence)
+
+
+def test_invalid_masks_are_rejected_before_mutating_the_map():
+    pipeline = SemanticMappingPipeline()
+    observation = _observation(0.0, 2.0, True)
+    observation.detections[0].mask = np.ones((60, 80), dtype=bool)
+    with pytest.raises(ValueError, match='boolean mask of shape'):
+        pipeline.process_frame(observation)
+    assert pipeline._frame_index == 0 and not pipeline.object_map.objects
+    observation.detections[0].mask = None
+    assert len(pipeline.process_frame(observation).objects) == 1
 
 
 def test_object_confirmed_disappeared_after_surface_moves_away():

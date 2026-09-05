@@ -1,3 +1,5 @@
+from itertools import permutations
+
 import numpy as np
 
 from semantic_mapping import scene_graph as sg
@@ -28,11 +30,11 @@ def test_beside_predicate_symmetric_for_similar_height_nearby_objects():
     assert (2, "beside", 1) in predicates
 
 
-def test_clustering_skips_far_apart_pairs():
+def test_neighbor_search_skips_far_apart_pairs():
     near_a = make_object(1, "chair", [0.0, 0.0, 0.0, 0.4, 0.4, 0.8])
     far_b = make_object(2, "chair", [100.0, 100.0, 0.0, 100.4, 100.4, 0.8])
     edges = sg.build_spatial_edges([near_a, far_b], cluster_radius=2.0, beside_max_distance=50.0)
-    assert edges == []  # never even compared: different clusters
+    assert edges == []  # outside the candidate pair radius
 
 
 def test_build_scene_graph_includes_disappeared_nodes_without_edges():
@@ -82,26 +84,26 @@ def test_on_is_class_dependent():
     assert sg.SpatialEdge(2, "on", 1) in sg.build_spatial_edges([rug, table], support_classes=("rug",))
 
 
-def test_centroid_clustering_matches_exhaustive_greedy_reference():
-    from semantic_mapping.scene_graph import _cluster_by_centroid
+def test_nearby_relations_survive_cluster_boundaries_and_input_order():
+    objects = [make_object(i + 1, 'chair', [x - 0.05, 0, 0, x + 0.05, 0.1, 0.1])
+               for i, x in enumerate([0.0, 1.9, 2.1])]
+    expected = [(2, 'beside', 3), (3, 'beside', 2)]
+    cache = sg.SpatialEdgeCache()
+    for scene in permutations(objects):
+        assert _edge_set(sg.build_spatial_edges(list(scene), cache=cache)) == expected
+    assert _edge_set(sg.build_spatial_edges(objects[1:], cache=cache)) == expected
+    assert sg.build_spatial_edges([], cache=cache) == []
 
-    rng = np.random.default_rng(3)
-    objects = []
-    for i, center in enumerate(rng.uniform(-6.0, 6.0, size=(80, 3))):
-        objects.append(make_object(i + 1, "thing", np.concatenate([center - 0.1, center + 0.1])))
 
-    centers = np.array([o.center for o in objects])
-    assigned = np.zeros(len(objects), dtype=bool)
-    reference = []
-    for i in range(len(objects)):
-        if assigned[i]:
-            continue
-        members = np.nonzero((np.linalg.norm(centers - centers[i], axis=1) <= 2.0) & ~assigned)[0].tolist()
-        assigned[members] = True
-        reference.append(members)
-
-    assert _cluster_by_centroid(objects, 2.0) == reference
-    assert _cluster_by_centroid([], 2.0) == []
+def test_edge_cache_tracks_predicate_parameters_and_small_boundary_crossings():
+    table = make_object(1, 'table', [0, 0, 0, 1, 1, 0.5])
+    mug = make_object(2, 'mug', [0.1, 0.1, 0.60001, 0.9, 0.9, 0.8])
+    cache = sg.SpatialEdgeCache()
+    assert sg.build_spatial_edges([table, mug], cache=cache) == []
+    mug.bbox3d[2] = 0.59999
+    assert sg.SpatialEdge(2, 'on', 1) in sg.build_spatial_edges([table, mug], cache=cache)
+    assert sg.build_spatial_edges([table, mug], z_tolerance=0.09, cache=cache) == []
+    assert sg.build_spatial_edges([table, mug], support_classes=['chair'], cache=cache) == []
 
 
 def _edge_set(edges):

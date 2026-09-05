@@ -141,6 +141,7 @@ class SemanticMappingPipeline:
             cull_out_of_view=self.config.cull_out_of_view,
         )
         self._frame_index = 0
+        self._last_stamp: float | None = None
         self._edge_cache = sg.SpatialEdgeCache()
         self.embedder = build_embedder(
             self.config.appearance_embedder, device=self.config.embedder_device,
@@ -163,6 +164,8 @@ class SemanticMappingPipeline:
         """
         header = persistence.load_map(path, self.object_map, resume=resume)
         self._frame_index = int(header.get("metadata", {}).get("frame_index", 0))
+        self._last_stamp = None  # the new session may use a different clock epoch
+        self._edge_cache = sg.SpatialEdgeCache()
         return header
 
     @staticmethod
@@ -213,6 +216,14 @@ class SemanticMappingPipeline:
         that pose P_t was already estimated upstream (Sec. IV-A) and is
         carried on ``observation.pose``.
         """
+        if not np.isfinite(observation.stamp):
+            raise ValueError("observation timestamp must be finite")
+        if self._last_stamp is not None and observation.stamp <= self._last_stamp:
+            raise ValueError("observations must be fused in strictly increasing timestamp order")
+        image_shape = (observation.intrinsics.height, observation.intrinsics.width)
+        for detection in observation.detections:
+            detection.validate_mask(image_shape)
+        self._last_stamp = observation.stamp
         self._frame_index += 1
         t_start = time.perf_counter()
         K = observation.intrinsics.K
@@ -391,6 +402,10 @@ class SemanticMappingPipeline:
                     for kept, dropped in self.object_map.reconcile_retired(newly_retired, cfg.reid_min_similarity)
                 )
                 detection_instance_ids = [reconciled.get(i, i) for i in detection_instance_ids]
+                for kept in set(reconciled.values()):
+                    obj = self.object_map.objects[kept]
+                    self.object_map.confirm_tentative(obj, cfg.min_hits_to_confirm)
+                    sg.record_trajectory_sample(obj, observation.stamp)
 
         self.object_map.compact_disappeared(cfg.disappeared_prune_grace_frames, cfg.max_retired_instances)
         t_update = time.perf_counter()

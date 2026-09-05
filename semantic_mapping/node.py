@@ -26,6 +26,7 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import rclpy
@@ -35,6 +36,7 @@ import yaml
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image, PointCloud2
@@ -51,7 +53,7 @@ from semantic_mapping.ros_msgs import (
     transform_to_se3,
 )
 from semantic_mapping.serialization import serialize_frame
-from semantic_mapping.types import CameraIntrinsics, ObjectStatus, Observation, StampedPose
+from semantic_mapping.types import CameraIntrinsics, Detection2D, ObjectStatus, Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest
 
@@ -81,6 +83,14 @@ def _label_color(label: str) -> tuple[float, float, float]:
     return r, g, b
 
 
+@dataclass
+class _PendingFrame:
+    observation: Observation
+    header: Header
+    detector_started_at: float | None = None
+    annotate: bool = False
+
+
 class SemanticMappingNode(Node):
     def __init__(self) -> None:
         super().__init__("semantic_mapping_node")
@@ -106,18 +116,27 @@ class SemanticMappingNode(Node):
         publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self._publish_period_sec = 1.0 / max(publish_rate_hz, 1e-6)
         self._last_publish_stamp = -float("inf")
+        self._last_input_stamp = -float("inf")
+        self._published_marker_ids: set[int] = set()
 
-        # Asynchronous perception (Sec. IV, V-H): detection runs in its own
-        # thread at detector_rate_hz while geometric updates continue at the
-        # sensor rate. A frame handed to the detector is *deferred* -- its
-        # geometry is fused together with its detections once they return,
-        # under that frame's own pose and depth -- rather than fused now and
-        # again later, which would double-count its geometric evidence.
-        # Frames in between are fused immediately with no detections.
+        # Commit observations exactly once, in sensor timestamp order. Later
+        # geometry waits behind a detection frame for a bounded interval;
+        # a timeout or full buffer releases that frame without detections.
+        # The worker returns independent results so a late answer cannot
+        # mutate an observation that has already been committed.
+        self._detector_timeout_sec = float(self.get_parameter("detector_timeout_sec").value)
+        self._max_pending_frames = int(self.get_parameter("max_pending_frames").value)
+        if not np.isfinite(self._detector_timeout_sec) or self._detector_timeout_sec <= 0:
+            raise ValueError("detector_timeout_sec must be finite and positive")
+        if self._max_pending_frames < 1:
+            raise ValueError("max_pending_frames must be positive")
+        self._pending_frames: deque[_PendingFrame] = deque()
+        self._pending_by_id: dict[int, _PendingFrame] = {}
+        self._detector_in_flight: int | None = None
+        self._stop_event = threading.Event()
         self._detection_jobs: queue.Queue[Observation] = queue.Queue(maxsize=1)
-        self._detection_results: queue.Queue[Observation] = queue.Queue()
+        self._detection_results: queue.Queue[tuple[int, list[Detection2D], float]] = queue.Queue()
         self._detector_thread = threading.Thread(target=self._detector_loop, name="detector", daemon=True)
-        self._detector_thread.start()
 
         # Language grounding (Sec. IV-D): the query callback snapshots and
         # serializes the current graph on the executor thread (so it never
@@ -132,7 +151,6 @@ class SemanticMappingNode(Node):
         )
         self._grounding_jobs: queue.Queue[GroundingRequest] = queue.Queue()
         self._grounding_thread = threading.Thread(target=self._grounding_loop, name="grounding", daemon=True)
-        self._grounding_thread.start()
 
         # Persistence: restore yesterday's memory, keep today's on disk.
         self.map_save_path = self._param_str("map_save_path", "")
@@ -154,7 +172,19 @@ class SemanticMappingNode(Node):
             self.create_timer(stats_period, self._log_runtime_stats)
 
         self._setup_io()
+        # A steady-clock timer drains results and expires pending work even
+        # when sensor input or a bag's /clock has stopped.
+        self._detection_timer = self.create_timer(
+            0.02, self._drain_detection_results, clock=Clock(clock_type=ClockType.STEADY_TIME))
+        self._detector_thread.start()
+        self._grounding_thread.start()
         self.get_logger().info("semantic_mapping_node initialized")
+
+    def destroy_node(self) -> None:
+        self._stop_event.set()
+        for worker in (self._detector_thread, self._grounding_thread):
+            worker.join(timeout=0.6)
+        super().destroy_node()
 
     # ------------------------------------------------------------------ setup
     def _declare_parameters(self) -> None:
@@ -172,6 +202,8 @@ class SemanticMappingNode(Node):
             "sync_queue_size": 30,
             "detector": "offline",
             "detector_rate_hz": 1.0,
+            "detector_timeout_sec": 2.0,
+            "max_pending_frames": 30,
             "prompts_file": "config/prompts.yaml",
             "publish_rate_hz": 5.0,
             "query_topic": "/semantic_mapping/query",
@@ -326,6 +358,10 @@ class SemanticMappingNode(Node):
     def _load_map(self, path: str) -> str:
         header = self.pipeline.load(path)
         self._last_result = None  # the next frame re-derives the graph from the restored map
+        self._pending_frames.clear()
+        self._pending_by_id.clear()  # results from the previous map are discarded by frame ID
+        self._scan_history.clear()
+        self._last_input_stamp = self._last_detector_stamp = self._last_publish_stamp = -float("inf")
         return f"restored {header['num_instances']} instances from {path}"
 
     def _on_save_map(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
@@ -400,12 +436,14 @@ class SemanticMappingNode(Node):
         self._grounding_jobs.put(request)
 
     def _grounding_loop(self) -> None:
-        while rclpy.ok():
+        while not self._stop_event.is_set() and rclpy.ok():
             try:
                 request = self._grounding_jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
             result = self.grounder.complete(request)
+            if self._stop_event.is_set():
+                return
             if result.error:
                 self.get_logger().warning(f"grounding '{request.instruction}': {result.error}")
             else:
@@ -436,16 +474,20 @@ class SemanticMappingNode(Node):
         # The message is still subscribed to keep the four-topic sync
         # documented in the README and to pace processing at the SLAM
         # backbone's pose-update rate.
+        self._drain_detection_results()
+        stamp = _stamp_to_seconds(rgb_msg.header.stamp)
+        if stamp <= self._last_input_stamp:
+            self.get_logger().warning("skipping duplicate or out-of-order sensor frame", throttle_duration_sec=5.0)
+            return
         try:
             T_world_from_cam = self._lookup_se3(self.world_frame, self.camera_frame, rgb_msg.header.stamp)
-            T_cam_from_cloud = None if self.depth_from_image else self._lookup_se3(
-                self.camera_frame, depth_msg.header.frame_id, depth_msg.header.stamp)
+            T_world_from_cloud = None if self.depth_from_image else self._lookup_se3(
+                self.world_frame, depth_msg.header.frame_id, depth_msg.header.stamp)
         except tf2_ros.TransformException as exc:
             self.get_logger().warning(
                 f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
             return
 
-        stamp = _stamp_to_seconds(rgb_msg.header.stamp)
         intrinsics = camera_info_to_intrinsics(info_msg)
         try:
             rgb = self._decode_rgb(rgb_msg, intrinsics)
@@ -466,15 +508,16 @@ class SemanticMappingNode(Node):
             # Rasterize the synchronized point cloud into the camera frame to
             # obtain the raw sensor depth D(u) needed by geometric consistency.
             points_cloud_frame = pointcloud_to_xyz(depth_msg)
-            points_cam = transform_points(T_cam_from_cloud, points_cloud_frame) if points_cloud_frame.shape[0] \
-                else points_cloud_frame
+            points_world = transform_points(T_world_from_cloud, points_cloud_frame)
             if self._scan_history.maxlen > 1:
                 # A single sparse LiDAR scan covers few pixels; the last N scans,
                 # carried in the world frame and re-projected under the current
                 # pose, give the consistency update a denser depth image.
-                self._scan_history.append(transform_points(T_world_from_cam, points_cam))
-                points_cam = transform_points(
-                    invert_se3(T_world_from_cam), np.concatenate(list(self._scan_history), axis=0))
+                self._scan_history.append(points_world)
+                points_world = np.concatenate(list(self._scan_history), axis=0)
+            # The source cloud is placed in the world at its own stamp; every
+            # scan is then projected through the camera at the RGB stamp.
+            points_cam = transform_points(invert_se3(T_world_from_cam), points_world)
             depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
 
         observation = Observation(
@@ -487,47 +530,80 @@ class SemanticMappingNode(Node):
             detections=[],
         )
         self._next_frame_id += 1
-
-        # Fuse any detection frames the worker finished since last time (each
-        # under its own buffered pose/depth), then decide what to do with this one.
-        self._drain_detection_results(rgb_msg.header)
+        self._last_input_stamp = stamp
+        pending = _PendingFrame(observation, Header(stamp=rgb_msg.header.stamp, frame_id=rgb_msg.header.frame_id))
+        self._pending_frames.append(pending)
+        self._pending_by_id[observation.frame_id] = pending
 
         detection_due = stamp - self._last_detector_stamp >= self._detector_period_sec
-        if detection_due and not self._detection_jobs.full():
+        if detection_due and self._detector_in_flight is None:
+            pending.detector_started_at = time.monotonic()
+            self._detector_in_flight = observation.frame_id
             self._detection_jobs.put(observation)
             self._last_detector_stamp = stamp
-            return  # deferred: processed in _drain_detection_results once detections arrive
-
-        self._process_and_publish(observation, rgb_msg.header)
+        self._flush_pending_frames()
 
     def _detector_loop(self) -> None:
-        while rclpy.ok():
+        while not self._stop_event.is_set() and rclpy.ok():
             try:
                 observation = self._detection_jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
-                observation.detections = self.detector.detect(
+                detections = self.detector.detect(
                     observation.rgb,
                     prompts=self.prompts,
                     frame_id=observation.frame_id,
                 )
+                for detection in detections:
+                    detection.validate_mask((observation.intrinsics.height, observation.intrinsics.width))
             except Exception as exc:  # noqa: BLE001 - a detector failure must not kill the mapping loop
+                if self._stop_event.is_set():
+                    return
                 self.get_logger().error(f"detector failed, fusing frame without detections: {exc}",
                                         throttle_duration_sec=5.0)
-                observation.detections = []
+                detections = []
+            if self._stop_event.is_set():
+                return
             with self._stats_lock:
                 self._stats["detections"] += 1
-            self._detection_results.put(observation)
+            self._detection_results.put((observation.frame_id, detections, time.monotonic()))
 
-    def _drain_detection_results(self, header: Header) -> None:
+    def _drain_detection_results(self) -> None:
         while True:
             try:
-                observation = self._detection_results.get_nowait()
+                frame_id, detections, finished_at = self._detection_results.get_nowait()
             except queue.Empty:
-                return
-            result = self._process_and_publish(observation, header)
-            self._publish_annotated_image(observation, result, header)
+                break
+            if self._detector_in_flight == frame_id:
+                self._detector_in_flight = None
+            pending = self._pending_by_id.get(frame_id)
+            if pending is None or pending.detector_started_at is None:
+                continue  # timed out, forced through by the buffer limit, or invalidated by load
+            if finished_at - pending.detector_started_at <= self._detector_timeout_sec:
+                pending.observation.detections = detections
+                pending.annotate = True
+                pending.detector_started_at = None
+            # An overdue result leaves the frame waiting, so the flush below
+            # expires it and reports the timeout consistently.
+        self._flush_pending_frames()
+
+    def _flush_pending_frames(self) -> None:
+        while self._pending_frames:
+            pending = self._pending_frames[0]
+            if pending.detector_started_at is not None:
+                timed_out = time.monotonic() - pending.detector_started_at >= self._detector_timeout_sec
+                full = len(self._pending_frames) > self._max_pending_frames
+                if not timed_out and not full:
+                    break
+                self.get_logger().warning(
+                    "detector deadline or frame buffer limit reached; fusing without detections",
+                    throttle_duration_sec=5.0)
+            self._pending_frames.popleft()
+            self._pending_by_id.pop(pending.observation.frame_id)
+            result = self._process_and_publish(pending.observation, pending.header)
+            if pending.annotate:
+                self._publish_annotated_image(pending.observation, result, pending.header)
 
     def _process_and_publish(self, observation: Observation, header: Header) -> FrameResult:
         result = self.pipeline.process_frame(observation)
@@ -584,7 +660,7 @@ class SemanticMappingNode(Node):
         self.annotated_image_pub.publish(numpy_to_image(image, "rgb8", header))
 
     def _publish_result(self, result: FrameResult, header: Header) -> None:
-        header.frame_id = self.world_frame
+        header = Header(stamp=header.stamp, frame_id=self.world_frame)
         self._publish_object_points(result, header)
         self._publish_object_boxes(result, header)
         # The per-frame JSON schema (bbox3d, label, id, center, spatial_relations,
@@ -623,8 +699,13 @@ class SemanticMappingNode(Node):
         marker_array = MarkerArray()
         node_ids = set(result.scene_graph.node_ids) if result.scene_graph else set()
         by_id = {obj.instance_id: obj for obj in result.objects}
+        node_ids.intersection_update(by_id)
 
-        for marker_index, instance_id in enumerate(sorted(node_ids)):
+        for instance_id in sorted(self._published_marker_ids - node_ids):
+            for namespace in ("obj_boxes", "obj_labels"):
+                marker_array.markers.append(Marker(header=header, ns=namespace, id=instance_id, action=Marker.DELETE))
+
+        for instance_id in sorted(node_ids):
             obj = by_id.get(instance_id)
             if obj is None:
                 continue
@@ -634,7 +715,7 @@ class SemanticMappingNode(Node):
             box = Marker()
             box.header = header
             box.ns = "obj_boxes"
-            box.id = marker_index * 2
+            box.id = instance_id
             box.type = Marker.CUBE
             box.action = Marker.ADD
             box.pose.position.x = float((xmin + xmax) / 2.0)
@@ -650,7 +731,7 @@ class SemanticMappingNode(Node):
             label_marker = Marker()
             label_marker.header = header
             label_marker.ns = "obj_labels"
-            label_marker.id = marker_index * 2 + 1
+            label_marker.id = instance_id
             label_marker.type = Marker.TEXT_VIEW_FACING
             label_marker.action = Marker.ADD
             label_marker.pose.position.x = box.pose.position.x
@@ -665,6 +746,7 @@ class SemanticMappingNode(Node):
             marker_array.markers.append(label_marker)
 
         self.obj_boxes_pub.publish(marker_array)
+        self._published_marker_ids = node_ids
 
 
 def main(args: list[str] | None = None) -> None:

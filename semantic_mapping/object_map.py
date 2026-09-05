@@ -283,7 +283,13 @@ class ObjectMap:
         instance.latest_stamp = stamp
         instance.frames_since_seen = 0
         instance.hits += 1
-        instance.status = ObjectStatus.ACTIVE
+        # Newly matched tentative tracks still need the configured hit check.
+        # Retired tracks also pass through it: a retired identity may have
+        # expired before it was ever confirmed. Confirmed ones already have
+        # enough hits and are promoted again at the end of this frame.
+        instance.status = (ObjectStatus.TENTATIVE
+                           if instance.status in (ObjectStatus.TENTATIVE, ObjectStatus.DISAPPEARED)
+                           else ObjectStatus.ACTIVE)
         instance.points_contradicted = 0  # re-detected: contradiction bookkeeping starts over
 
         corroborated = self._apply_evidence(instance, K, T_world_from_cam, depth_image, detection)
@@ -525,7 +531,7 @@ class ObjectMap:
         keep.point_membership = moved.point_membership
         keep.bbox3d = moved.bbox3d
         keep.track = moved.track
-        keep.status = ObjectStatus.ACTIVE if moved.status == ObjectStatus.TENTATIVE else moved.status
+        keep.status = moved.status  # the pipeline confirms tentative reconciliations using the combined hits
         keep.latest_stamp = moved.latest_stamp
         keep.frames_since_seen = moved.frames_since_seen
         keep.points_contradicted = moved.points_contradicted
