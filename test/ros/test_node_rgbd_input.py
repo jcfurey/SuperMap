@@ -10,7 +10,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Header
 
 from semantic_mapping.ros_msgs import numpy_to_image
-from test.ros.helpers import camera_info, set_camera_tf, stamp_msg
+from test.ros.helpers import camera_info, set_camera_tf, spin_until, stamp_msg
 
 cv2 = pytest.importorskip("cv2")
 
@@ -53,7 +53,7 @@ def test_compressed_rgb_with_aligned_depth_image(node_factory, dataset):
         odom = Odometry(header=Header(stamp=stamp_msg(frame.stamp), frame_id="map"), child_frame_id="sensor")
         node._on_synced_frame(rgb_msg, camera_info(intr, header), depth_msg, odom)
         time.sleep(0.15)
-    node._drain_detection_results(Header(stamp=stamp_msg(frames[-1].stamp), frame_id="map"))
+    spin_until(node, lambda: not node._pending_frames)
 
     objects = node.pipeline.object_map.objects.values()
     assert len(objects) >= 5 and all(o.status.value == "active" for o in objects)

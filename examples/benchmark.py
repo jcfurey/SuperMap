@@ -38,7 +38,7 @@ def main() -> None:
     parser.add_argument("--prompts", default="config/prompts.yaml")
     parser.add_argument("--frame_skip", type=int, default=1)
     parser.add_argument("--max_frames", type=int, default=None)
-    parser.add_argument("--repeat", type=int, default=1, help="Run the sequence this many times back to back.")
+    parser.add_argument("--repeat", type=int, default=1, help="Run the sequence this many times, each with a fresh map.")
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -51,10 +51,11 @@ def main() -> None:
         detector = build_detector(args.detector, **params.get(args.detector, {}))
 
     stats = runtime.RuntimeStats()
-    pipeline = SemanticMappingPipeline(PipelineConfig.from_dict(params))
     frames = 0
     wall_start = time.perf_counter()
     for _ in range(max(args.repeat, 1)):
+        # Each replay starts a new timestamp epoch and an independent map.
+        pipeline = SemanticMappingPipeline(PipelineConfig.from_dict(params))
         for frame in dataset:
             t0 = time.perf_counter()
             detections = detector.detect(frame.rgb, prompts=prompts, frame_id=frame.frame_id)

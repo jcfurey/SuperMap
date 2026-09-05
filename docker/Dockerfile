@@ -68,22 +68,21 @@ COPY package.xml requirements.txt ./
 # its numpy-ABI coupling are not needed.
 RUN pip3 install --no-cache-dir --break-system-packages "pytest>=7.4,<8"
 
-# Detector backends (large: torch + CUDA runtime wheels, ultralytics, spacy).
+# Detector backends (large: torch + CUDA runtime wheels, ultralytics).
 # GroundingDINO/SAM2 are not on PyPI as installable packages by their
 # canonical names -- install them from source per their own READMEs
 # (https://github.com/IDEA-Research/GroundingDINO,
 #  https://github.com/facebookresearch/sam2) if you need that backend.
 # "numpy<2" is pinned on both installs below (not just left to whatever
-# torch/ultralytics/spacy would pull in) so the apt-provided numpy stays the
+# torch/ultralytics would pull in) so the apt-provided numpy stays the
 # one in use -- pip resolves a whole command's requirements together, so
 # this constrains any transitive numpy pull, not just a direct one.
 RUN if [ "$INSTALL_DETECTORS" = "1" ]; then \
         pip3 install --no-cache-dir --break-system-packages \
-            "numpy<2" torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+            "numpy<2" torch==2.5.1 torchvision==0.20.1 \
             --index-url https://download.pytorch.org/whl/cu124 \
         && pip3 install --no-cache-dir --break-system-packages \
-            "numpy<2" ultralytics rerun-sdk spacy \
-        && python3 -m spacy download en_core_web_sm; \
+            "numpy<2" ultralytics rerun-sdk; \
     fi
 
 WORKDIR /workspace/src/semantic_mapping

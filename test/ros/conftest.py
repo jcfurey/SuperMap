@@ -6,8 +6,8 @@ collected at all (``collect_ignore_glob`` below); a skip raised while
 importing this conftest would make pytest 7 skip the entire ``test``
 package, which is what CI runs. The Docker CI job runs them inside the
 Jazzy image. Frames of the synthetic scene are turned into real messages
-and handed to the node's synchronized callback directly, so no topics,
-bags, or executors are involved and each test runs in a few seconds.
+and handed to the node's synchronized callback directly; executor-driven
+tests also check result delivery and deadlines when input or /clock stops.
 """
 from __future__ import annotations
 

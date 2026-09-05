@@ -57,6 +57,14 @@ class Detection2D:
     embedding: np.ndarray | None = None
     """Optional open-vocabulary embedding (e.g. CLIP) for label-free matching."""
 
+    def validate_mask(self, image_shape: tuple[int, int]) -> None:
+        """Masks must address pixels in the original image, not a resized model input."""
+        if self.mask is not None:
+            if self.mask.shape != image_shape or self.mask.dtype != np.bool_:
+                raise ValueError(
+                    f"detection {self.label!r} needs a boolean mask of shape {image_shape}; "
+                    f"got {self.mask.shape} with dtype {self.mask.dtype}")
+
 
 @dataclass
 class StampedPose:
