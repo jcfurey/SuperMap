@@ -75,6 +75,9 @@ def test_depth_limits_reject_saturated_geometry_without_false_removal_evidence()
 @pytest.mark.parametrize('params', [
     {'min_depth_m': -1}, {'max_depth_m': float('nan')},
     {'min_depth_m': 2, 'max_depth_m': 1}, {'bbox_trim_percentile': 50},
+    {'foreground_depth_gap_m': -1}, {'foreground_depth_gap_m': float('nan')},
+    {'foreground_depth_min_points': 0}, {'foreground_depth_min_points': 1.5},
+    {'foreground_depth_min_fraction': -0.1}, {'foreground_depth_min_fraction': float('nan')},
 ])
 def test_invalid_geometry_limits_are_rejected(params):
     with pytest.raises(ValueError):
@@ -93,6 +96,63 @@ def test_mask_depth_gate_rejects_background_speckles_without_changing_mask():
     assert raw.bbox3d[5] > 4.9
     assert filtered.bbox3d[5] < 2.1
     np.testing.assert_array_equal(mask, original_mask)
+
+
+def test_foreground_depth_selection_precedes_filling_and_preserves_other_classes():
+    depth = np.zeros((120, 160))
+    depth[45:75:3, 65:95:3] = 25.0  # most returns inside the person mask hit the far wall
+    depth[50:70:3, 78] = 8.0
+    depth[47, 69] = 1.0  # isolated foreground noise must not expand into a supported layer
+    mask = np.zeros(depth.shape, dtype=bool)
+    mask[40:80, 60:100] = True
+    original = depth.copy()
+    config = PipelineConfig(foreground_depth_gap_m=.75, foreground_depth_min_fraction=.05,
+                            depth_fill_radius_px=2)
+    pipeline = SemanticMappingPipeline(config)
+    detection = Detection2D(bbox=np.array([60., 40., 100., 80.]), label='person', score=.9, mask=mask)
+    points = pipeline._detection_points_world(detection, depth, K, np.eye(4))
+    assert len(points) > 7  # filling still provides usable foreground geometry
+    np.testing.assert_allclose(points[:, 2], 8.0)
+    np.testing.assert_array_equal(depth, original)
+    assert mask.sum() == 1600
+    detection.label = 'pipe'  # extended objects retain their full depth range
+    points = pipeline._detection_points_world(detection, depth, K, np.eye(4))
+    assert points[:, 2].min() == 1.0 and points[:, 2].max() == 25.0
+
+
+def test_foreground_depth_does_not_invent_geometry_from_unsupported_returns():
+    obs = _observation(0, 2, True)
+    obs.depth[:] = 0
+    obs.depth[60, 80] = 2
+    obs.detections[0].label = 'person'
+    pipeline = SemanticMappingPipeline(PipelineConfig(foreground_depth_gap_m=.75, depth_fill_radius_px=3))
+    obj = pipeline.process_frame(obs).objects[0]
+    assert obj.points_world.shape == (0, 3)
+
+
+@pytest.mark.parametrize('label, dynamic, replaces', [('person', True, True), ('chair', True, False), ('person', False, False)])
+def test_dynamic_geometry_keeps_latest_position_with_identity_and_history(label, dynamic, replaces):
+    pipeline = SemanticMappingPipeline(PipelineConfig(dynamic_geometry_enabled=dynamic))
+    for i, distance in enumerate([5., 4., 3.]):
+        obs = _observation(i*.1, distance, True)
+        obs.detections[0].label = label
+        result = pipeline.process_frame(obs)
+        assert len(result.objects) == 1
+    obj = result.objects[0]
+    assert obj.instance_id == 1 and obj.hits == 3 and obj.status == ObjectStatus.ACTIVE
+    assert len(obj.trajectory) == 3
+    assert obj.trajectory[0][1][2] == pytest.approx(5.)
+    if replaces:
+        np.testing.assert_allclose(obj.points_world[:, 2], 3.)
+        assert obj.bbox3d[5]-obj.bbox3d[2] < .1
+    else:
+        assert obj.points_world[:, 2].max() == 5.
+    # No return is unknown: preserve the last supported geometry.
+    previous = obj.points_world.copy()
+    obs = _observation(.3, 0., True)
+    obs.detections[0].label = label
+    pipeline.process_frame(obs)
+    np.testing.assert_array_equal(obj.points_world, previous)
 
 
 def test_confirmation_threshold_is_honored_by_matching_and_reidentification():

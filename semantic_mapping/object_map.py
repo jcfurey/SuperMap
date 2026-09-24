@@ -93,6 +93,7 @@ class ObjectMap:
         tentative_max_age: int = 10,
         cull_out_of_view: bool = True,
         bbox_trim_percentile: float = 0.0,
+        dynamic_geometry_labels: tuple[str, ...] | list[str] = (),
     ) -> None:
         self.voxel_size = voxel_size
         self.tau_eps = tau_eps
@@ -108,6 +109,7 @@ class ObjectMap:
         self.tentative_max_age = tentative_max_age
         self.cull_out_of_view = cull_out_of_view
         self.bbox_trim_percentile = bbox_trim_percentile
+        self.dynamic_geometry_labels = frozenset(dynamic_geometry_labels)
 
         self.objects: dict[int, ObjectInstance] = {}
         self._next_id = 1
@@ -300,6 +302,13 @@ class ObjectMap:
         if corroborated:
             instance.label_belief = sf.bayesian_label_update(instance.label_belief, detection.label, detection.score)
 
+        if detection.label in self.dynamic_geometry_labels and len(new_points_world):
+            # A moving object's past locations belong in its trajectory, not
+            # in its current volume. Missing depth must not erase the last
+            # supported geometry, and identity/semantic evidence stay intact.
+            instance.points_world = np.zeros((0, 3), dtype=np.float64)
+            instance.point_log_odds = np.zeros(0)
+            instance.point_membership = np.zeros(0)
         self._fuse_points(instance, new_points_world)
 
         instance.label_belief = sf.bayesian_label_update(instance.label_belief, detection.label, detection.score)
@@ -406,16 +415,22 @@ class ObjectMap:
 
     # ---------------------------------------------------------------- merging
     def _merge_into(self, keep: ObjectInstance, drop: ObjectInstance) -> None:
-        # Concatenate keeping both instances' per-point evidence, then dedupe;
-        # `keep` comes first so its points win shared voxels.
-        keep.points_world = np.concatenate([keep.points_world, drop.points_world], axis=0)
-        keep.point_log_odds = np.concatenate([keep.point_log_odds, drop.point_log_odds])
-        keep.point_membership = np.concatenate([keep.point_membership, drop.point_membership])
-        idx = voxel_downsample_indices(keep.points_world, self.voxel_size)
-        if idx.size > self.max_points_per_object:
-            rng = np.random.default_rng(keep.instance_id)
-            idx = np.sort(rng.choice(idx, size=self.max_points_per_object, replace=False))
-        self._subset_points(keep, idx)
+        if keep.label in self.dynamic_geometry_labels and drop.label in self.dynamic_geometry_labels:
+            # Preserve the oldest ID without reviving an older body position.
+            newest = max((keep, drop), key=lambda o: (o.latest_stamp, len(o.points_world)))
+            for name in ('points_world', 'point_log_odds', 'point_membership', 'bbox3d'):
+                setattr(keep, name, getattr(newest, name).copy())
+        else:
+            # Keep both instances' per-point evidence, then dedupe; `keep`
+            # comes first so its points win shared voxels.
+            keep.points_world = np.concatenate([keep.points_world, drop.points_world], axis=0)
+            keep.point_log_odds = np.concatenate([keep.point_log_odds, drop.point_log_odds])
+            keep.point_membership = np.concatenate([keep.point_membership, drop.point_membership])
+            idx = voxel_downsample_indices(keep.points_world, self.voxel_size)
+            if idx.size > self.max_points_per_object:
+                rng = np.random.default_rng(keep.instance_id)
+                idx = np.sort(rng.choice(idx, size=self.max_points_per_object, replace=False))
+            self._subset_points(keep, idx)
 
         total_hits = keep.hits + drop.hits
         merged_belief: dict[str, float] = {}

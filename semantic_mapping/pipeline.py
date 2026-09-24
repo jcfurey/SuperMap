@@ -23,6 +23,7 @@ from semantic_mapping.geometry_utils import (
     bbox3d_from_points,
     clip_bbox_to_image,
     fill_sparse_depth,
+    foreground_depth_mask,
     transform_points,
 )
 from semantic_mapping.object_map import ObjectMap
@@ -40,6 +41,14 @@ class PipelineConfig:
     mask_depth_mad_factor: float = 0.0
     """Optional robust depth gate inside instance masks; 0 disables it for full-depth objects."""
     mask_depth_min_tolerance_m: float = 0.15
+    foreground_depth_gap_m: float = 0.0
+    """Separate masked sensor depths into layers; 0 disables foreground selection."""
+    foreground_depth_min_points: int = 5
+    foreground_depth_min_fraction: float = 0.1
+    foreground_depth_labels: list[str] = field(default_factory=lambda: ["person"])
+    dynamic_geometry_enabled: bool = False
+    dynamic_geometry_labels: list[str] = field(default_factory=lambda: ["person"])
+    """Use the latest supported geometry for these moving classes; keep identity/history."""
     tau_eps: float = 0.15
     max_points_per_object: int = 5000
     prune_log_odds: float = -1.5
@@ -97,7 +106,8 @@ class PipelineConfig:
     for a LiDAR scan rasterized into the camera. The geometric-consistency
     evidence uses the image filled from all readings; a detection is
     back-projected through depth filled only from readings inside its own
-    mask (or box), so background never leaks into an object's point set."""
+    mask (or box). Background returns already inside the silhouette require
+    separate foreground selection."""
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.min_depth_m) or self.min_depth_m < 0:
@@ -112,6 +122,12 @@ class PipelineConfig:
             raise ValueError("mask_depth_mad_factor must be finite and nonnegative")
         if not np.isfinite(self.mask_depth_min_tolerance_m) or self.mask_depth_min_tolerance_m <= 0:
             raise ValueError("mask_depth_min_tolerance_m must be finite and positive")
+        if not np.isfinite(self.foreground_depth_gap_m) or self.foreground_depth_gap_m < 0:
+            raise ValueError("foreground_depth_gap_m must be finite and nonnegative")
+        if self.foreground_depth_min_points < 1 or int(self.foreground_depth_min_points) != self.foreground_depth_min_points:
+            raise ValueError("foreground_depth_min_points must be a positive integer")
+        if not 0 <= self.foreground_depth_min_fraction <= 1:
+            raise ValueError("foreground_depth_min_fraction must be in [0, 1]")
 
     @classmethod
     def from_dict(cls, params: dict) -> "PipelineConfig":
@@ -161,6 +177,7 @@ class SemanticMappingPipeline:
             tentative_max_age=self.config.tentative_max_age,
             cull_out_of_view=self.config.cull_out_of_view,
             bbox_trim_percentile=self.config.bbox_trim_percentile,
+            dynamic_geometry_labels=self.config.dynamic_geometry_labels if self.config.dynamic_geometry_enabled else (),
         )
         self._frame_index = 0
         self._last_stamp: float | None = None
@@ -218,6 +235,16 @@ class SemanticMappingPipeline:
             x2, y2 = min(x2, depth.shape[1]), min(y2, depth.shape[0])
             mask[y1:y2, x1:x2] = True
 
+        cfg = self.config
+        if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
+            # Count real returns, not pixels synthesized by sparse filling.
+            selected = foreground_depth_mask(
+                depth[mask], cfg.foreground_depth_gap_m,
+                cfg.foreground_depth_min_points, cfg.foreground_depth_min_fraction,
+            )
+            filtered = np.zeros_like(depth)
+            filtered[mask] = np.where(selected, depth[mask], 0.0)
+            depth = filtered
         if self.config.depth_fill_radius_px > 0:
             depth = self._fill_within(depth, mask, self.config.depth_fill_radius_px)
         points_cam = back_project_depth(

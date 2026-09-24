@@ -258,6 +258,33 @@ def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance
     return np.abs(depths - median) <= tolerance
 
 
+def foreground_depth_mask(
+    depths: Array, gap_m: float, min_points: int = 5, min_fraction: float = 0.1,
+) -> Array:
+    """Keep the nearest supported depth layer, even when background dominates.
+
+    Split sorted positive, finite sensor readings at depth gaps larger than
+    ``gap_m``. Ignore isolated returns and select the first layer supported by
+    both ``min_points`` and ``min_fraction`` of valid readings. No supported
+    layer means unknown geometry. Call before filling sparse depth: invented
+    neighbours must not count as independent support. This is intended for
+    compact foreground objects, not structures extending through many depths.
+    """
+    keep = np.zeros(depths.shape, dtype=bool)
+    valid_indices = np.flatnonzero(np.isfinite(depths) & (depths > 0))
+    if valid_indices.size == 0:
+        return keep
+    order = valid_indices[np.argsort(depths[valid_indices], kind="stable")]
+    splits = np.flatnonzero(np.diff(depths[order]) > gap_m) + 1
+    boundaries = np.concatenate(([0], splits, [order.size]))
+    required = max(min_points, int(np.ceil(min_fraction * order.size)))
+    supported = np.flatnonzero(np.diff(boundaries) >= required)
+    if supported.size:
+        i = supported[0]
+        keep[order[boundaries[i]:boundaries[i + 1]]] = True
+    return keep
+
+
 def iou_xyxy(box_a: Array, box_b: Array) -> float:
     """Intersection-over-union of two axis-aligned 2D boxes in (x1, y1, x2, y2) form."""
     xa1, ya1, xa2, ya2 = box_a

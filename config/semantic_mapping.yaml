@@ -81,6 +81,12 @@ semantic_mapping_node:
     bbox_trim_percentile: 0.0             # 0: full bounds; e.g. 2: per-axis 2nd–98th percentile bounds
     mask_depth_mad_factor: 0.0            # optional depth outlier rejection inside masks; 0 disables
     mask_depth_min_tolerance_m: 0.15      # minimum median-depth tolerance when the mask gate is enabled
+    foreground_depth_gap_m: 0.0          # 0 disables; split raw masked depths at larger gaps and keep nearest supported layer
+    foreground_depth_min_points: 5       # real depth pixels before filling, not synthesized neighbours
+    foreground_depth_min_fraction: 0.1   # fraction of valid masked readings supporting a layer
+    foreground_depth_labels: [person]    # apply only to compact foreground classes; preserve deep structures
+    dynamic_geometry_enabled: false      # latest supported geometry instead of unioning past positions
+    dynamic_geometry_labels: [person]    # identity and trajectory survive each geometry replacement
     tau_eps: 0.15                          # meters, geometric consistency threshold (Eq. 9)
     max_points_per_object: 5000        # voxels kept per instance (40 bytes each); 5 cm voxels give ~2-3k for furniture
     max_points_per_detection: 4000

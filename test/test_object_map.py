@@ -19,6 +19,19 @@ def test_spawn_creates_tentative_instance():
     assert 1 in m.objects
 
 
+def test_merging_dynamic_duplicates_keeps_newest_geometry_and_oldest_id():
+    m = ObjectMap(dynamic_geometry_labels=['person'])
+    box = np.array([0., 0., 10., 10.])
+    old = m.spawn(box, np.array([[0., 0., 2.], [.1, .1, 2.]]), 'person', .9, 1.)
+    new = m.spawn(box, np.array([[0., 0., 2.1], [.1, .1, 2.1]]), 'person', .9, 2.)
+    new.point_log_odds[:] = 2.
+    expected = new.points_world.copy()
+    assert m.merge_duplicates(distance_threshold=.25) == [(old.instance_id, new.instance_id)]
+    np.testing.assert_array_equal(old.points_world, expected)
+    np.testing.assert_array_equal(old.point_log_odds, np.full(len(expected), 2.))
+    assert old.latest_stamp == 2. and old.first_seen_stamp == 1. and old.hits == 2
+
+
 def _identity_camera_looking_at_z():
     K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
     T_world_from_cam = np.eye(4)

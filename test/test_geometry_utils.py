@@ -5,6 +5,7 @@ from semantic_mapping.geometry_utils import (
     bbox3d_from_points,
     centroid,
     depth_consistency_mask,
+    foreground_depth_mask,
     invert_se3,
     iou_xy,
     iou_xyxy,
@@ -128,6 +129,24 @@ def test_depth_consistency_mask_rejects_outlier():
 
 def test_depth_consistency_mask_empty():
     assert depth_consistency_mask(np.zeros(0)).shape == (0,)
+
+
+def test_foreground_layer_survives_majority_background_and_near_speckles():
+    # The median belongs to the wall; the sparse person is the first supported layer.
+    depths = np.concatenate(([1.0, 1.1, 0.0, np.nan, np.inf, -2.0],
+                             np.linspace(12.0, 12.3, 8), np.linspace(30, 30.4, 50)))
+    selected = depths[foreground_depth_mask(depths, .75, 5, .1)]
+    np.testing.assert_array_equal(selected, depths[6:14])
+
+
+def test_foreground_layer_requires_sensor_support():
+    for depths in [np.array([]), np.array([0, np.nan]), np.array([2., 2.1, 10., 10.1])]:
+        assert not foreground_depth_mask(depths, .75, 5, .1).any()
+
+
+def test_foreground_layer_preserves_input_order_and_single_surface():
+    depths = np.array([4.2, 4.0, 4.3, 4.1, 4.4])
+    np.testing.assert_array_equal(depths[foreground_depth_mask(depths, .75)], depths)
 
 
 def test_fill_sparse_depth_fills_only_empty_pixels_with_neighbourhood_minimum():
