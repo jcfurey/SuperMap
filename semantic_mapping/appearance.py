@@ -28,10 +28,15 @@ class Embedder(ABC):
         raise NotImplementedError
 
 
-def _detection_pixels(rgb: np.ndarray, detection: Detection2D) -> np.ndarray:
+def _detection_pixels(rgb: np.ndarray, detection: Detection2D, max_pixels: int | None = None) -> np.ndarray:
     """(N, 3) pixels inside the detection's mask, or its box when there is no mask."""
     if detection.mask is not None and detection.mask.shape == rgb.shape[:2]:
-        return rgb[detection.mask]
+        if max_pixels is None:
+            return rgb[detection.mask]
+        indices = np.flatnonzero(detection.mask)
+        stride = max(1, int(np.ceil(indices.size / max_pixels)))
+        indices = indices[::stride]
+        return rgb[indices // rgb.shape[1], indices % rgb.shape[1]]
     h, w = rgb.shape[:2]
     x1, y1, x2, y2 = detection.bbox
     x1, y1 = int(max(np.floor(x1), 0)), int(max(np.floor(y1), 0))
@@ -85,7 +90,10 @@ class ColorHistogramEmbedder(Embedder):
     def embed(self, rgb: np.ndarray, detections: list[Detection2D]) -> list[np.ndarray | None]:
         out: list[np.ndarray | None] = []
         for detection in detections:
-            pixels = _detection_pixels(rgb, detection)
+            # Subsample mask locations before copying RGB, rather than copying
+            # every foreground pixel and immediately discarding almost all.
+            sample_limit = self.max_pixels if self.max_pixels >= 2 * self.min_pixels else None
+            pixels = _detection_pixels(rgb, detection, sample_limit)
             if pixels.shape[0] < self.min_pixels:
                 out.append(None)
                 continue

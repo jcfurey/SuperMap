@@ -8,6 +8,7 @@ semantic_mapping_node:
     camera_info_topic: /camera/color/camera_info
     pointcloud_topic: /lidar/points
     odometry_topic: /odometry
+    sync_odometry: true  # false: synchronize RGB/CameraInfo/depth only; camera pose still requires TF
 
     obj_points_topic: /obj_points
     obj_boxes_topic: /obj_boxes
@@ -75,6 +76,11 @@ semantic_mapping_node:
 
     # --- Pipeline / mapping parameters (Sec. IV-B, IV-C) ------------------
     voxel_size: 0.05                       # meters, per-object point fusion resolution
+    min_depth_m: 0.0                      # optical depth limits; rejected readings carry no evidence
+    max_depth_m: 0.0                      # 0 disables the upper limit (set for the sensor/deployment)
+    bbox_trim_percentile: 0.0             # 0: full bounds; e.g. 2: per-axis 2nd–98th percentile bounds
+    mask_depth_mad_factor: 0.0            # optional depth outlier rejection inside masks; 0 disables
+    mask_depth_min_tolerance_m: 0.15      # minimum median-depth tolerance when the mask gate is enabled
     tau_eps: 0.15                          # meters, geometric consistency threshold (Eq. 9)
     max_points_per_object: 5000        # voxels kept per instance (40 bytes each); 5 cm voxels give ~2-3k for furniture
     max_points_per_detection: 4000
@@ -87,7 +93,7 @@ semantic_mapping_node:
     min_label_confidence: 0.4              # Eq. (10) instance-level confirmation threshold
     min_observations_for_confidence_check: 5
     min_hits_to_confirm: 2
-    tentative_max_age: 10                  # frames an uncorroborated detection may linger before it's dropped
+    tentative_max_age: 10                  # missed detector observations; geometry-only frames do not count
     # Staged association (Sec. IV-B): 2D high-confidence -> 2D low-confidence
     # (ByteTrack) -> 3D-aware re-activation -> spawn.
     association_iou_threshold: 0.3
@@ -126,6 +132,7 @@ semantic_mapping_node:
     cull_out_of_view: true                 # skip per-point evidence for instances entirely outside the view
 
     publish_rate_hz: 5.0                   # 4D scene graph update rate (Sec. V-H)
+    publish_disappeared_objects: true      # false hides retired geometry in RViz; history/query data remain intact
     stats_log_period_sec: 10.0             # log module rates (detector / 3D mapping / scene graph) every N s; 0 = off
 
     # --- Language grounding (Sec. IV-D) ----------------------------------

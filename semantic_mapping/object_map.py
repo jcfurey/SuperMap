@@ -92,6 +92,7 @@ class ObjectMap:
         min_observations_for_confidence_check: int = 5,
         tentative_max_age: int = 10,
         cull_out_of_view: bool = True,
+        bbox_trim_percentile: float = 0.0,
     ) -> None:
         self.voxel_size = voxel_size
         self.tau_eps = tau_eps
@@ -106,6 +107,7 @@ class ObjectMap:
         self.min_observations_for_confidence_check = min_observations_for_confidence_check
         self.tentative_max_age = tentative_max_age
         self.cull_out_of_view = cull_out_of_view
+        self.bbox_trim_percentile = bbox_trim_percentile
 
         self.objects: dict[int, ObjectInstance] = {}
         self._next_id = 1
@@ -116,7 +118,7 @@ class ObjectMap:
         side: each stored point stands for its whole cell, and a surface seen
         from one side would otherwise be a zero-volume slab."""
         pad = self.voxel_size / 2.0
-        return bbox3d_from_points(points) + np.array([-pad, -pad, -pad, pad, pad, pad])
+        return bbox3d_from_points(points, self.bbox_trim_percentile) + np.array([-pad, -pad, -pad, pad, pad, pad])
 
     def _subset_points(self, instance: ObjectInstance, keep: np.ndarray) -> None:
         instance.points_world = instance.points_world[keep]
@@ -220,7 +222,8 @@ class ObjectMap:
         contradicted = gc.prune_mask(instance.point_log_odds, self.prune_log_odds)
         instance.points_contradicted += int(contradicted.sum())
         keep = ~(contradicted | (instance.point_membership < self.prune_membership))
-        self._subset_points(instance, keep)
+        if not np.all(keep):
+            self._subset_points(instance, keep)
         return bool(np.any(observable))
 
     # -------------------------------------------------------------- lifecycle
@@ -282,6 +285,7 @@ class ObjectMap:
         instance.track = track
         instance.latest_stamp = stamp
         instance.frames_since_seen = 0
+        instance.missed_detection_frames = 0
         instance.hits += 1
         # Newly matched tentative tracks still need the configured hit check.
         # Retired tracks also pass through it: a retired identity may have
@@ -358,15 +362,18 @@ class ObjectMap:
         T_world_from_cam: np.ndarray,
         depth_image: np.ndarray,
         in_view: bool | None = None,
+        detections_evaluated: bool = True,
     ) -> None:
         """Advance an instance with no detection this frame: re-evaluate geometric
         evidence only (Sec. IV-B.3), which is how disappearances are detected
         even though no 2D detection ever fires "removed".
         """
         instance.frames_since_seen += 1
+        if detections_evaluated:
+            instance.missed_detection_frames += 1
         self._apply_evidence(instance, K, T_world_from_cam, depth_image, in_view=in_view)
 
-        if instance.status == ObjectStatus.TENTATIVE and instance.frames_since_seen > self.tentative_max_age:
+        if instance.status == ObjectStatus.TENTATIVE and instance.missed_detection_frames > self.tentative_max_age:
             # Never corroborated: a one-off false detection, not an object.
             instance.status = ObjectStatus.DISAPPEARED
             return
@@ -428,6 +435,7 @@ class ObjectMap:
                 keep.embedding_count = total
 
         keep.hits = total_hits
+        keep.missed_detection_frames = min(keep.missed_detection_frames, drop.missed_detection_frames)
         keep.frames_since_seen = min(keep.frames_since_seen, drop.frames_since_seen)
         keep.first_seen_stamp = min(keep.first_seen_stamp, drop.first_seen_stamp)
         if drop.latest_stamp > keep.latest_stamp:
@@ -534,6 +542,7 @@ class ObjectMap:
         keep.status = moved.status  # the pipeline confirms tentative reconciliations using the combined hits
         keep.latest_stamp = moved.latest_stamp
         keep.frames_since_seen = moved.frames_since_seen
+        keep.missed_detection_frames = moved.missed_detection_frames
         keep.points_contradicted = moved.points_contradicted
         total_hits = keep.hits + moved.hits
         merged_belief: dict[str, float] = {}

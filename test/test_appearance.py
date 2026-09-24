@@ -77,3 +77,13 @@ def test_large_regions_are_subsampled_without_changing_the_descriptor():
     sampled = appearance.ColorHistogramEmbedder().embed(rgb, [det])[0]
     assert appearance.cosine_similarity(full, sampled) > 0.995
     assert appearance.build_embedder("color_histogram", max_pixels=100).max_pixels == 100
+
+
+def test_mask_pixel_sampling_matches_the_original_pixel_order_for_strided_rgb():
+    rng = np.random.default_rng(42)
+    rgb = rng.integers(0, 256, (120, 320, 3), dtype=np.uint8)[:, ::2]
+    mask = rng.random(rgb.shape[:2]) > .2
+    det = Detection2D(bbox=np.array([0, 0, 1, 1]), label='box', score=.9, mask=mask)
+    full = rgb[mask]
+    expected = full[::int(np.ceil(len(full) / 100))]
+    np.testing.assert_array_equal(appearance._detection_pixels(rgb, det, 100), expected)

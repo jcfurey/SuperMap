@@ -1,6 +1,7 @@
 import numpy as np
 
 from semantic_mapping.geometry_utils import (
+    back_project_depth,
     bbox3d_from_points,
     centroid,
     depth_consistency_mask,
@@ -14,6 +15,30 @@ from semantic_mapping.geometry_utils import (
     se3_from_translation_quaternion,
     transform_points,
 )
+
+
+def test_robust_bbox_rejects_sparse_depth_outliers_without_changing_default_bounds():
+    points = np.random.default_rng(2).uniform(0, 1, (1000, 3))
+    points = np.vstack([points, [65.535, 30.0, 15.0]])
+    full = bbox3d_from_points(points)
+    robust = bbox3d_from_points(points, trim_percentile=2.0)
+    np.testing.assert_allclose(full[3:], [65.535, 30.0, 15.0])
+    assert np.all(robust[:3] >= 0) and np.all(robust[3:] <= 1)
+    assert np.all(robust[3:] - robust[:3] > .9)
+
+
+def test_early_backprojection_sampling_preserves_the_filtered_point_sample():
+    rng = np.random.default_rng(12)
+    depth = rng.uniform(1.8, 2.2, (120, 160))
+    depth[::8, ::8] = 5.0
+    depth[::9, ::9] = np.nan
+    mask = rng.random(depth.shape) > .3
+    K = np.array([[100., 0, 80], [0, 100., 60], [0, 0, 1.]])
+    full = back_project_depth(K, depth, mask)
+    full = full[depth_consistency_mask(full[:, 2])]
+    indices = np.random.default_rng(0).choice(len(full), size=400, replace=False)
+    actual = back_project_depth(K, depth, mask, max_points=400, depth_mad_factor=3)
+    np.testing.assert_array_equal(actual, full[indices])
 
 
 def test_invert_se3_round_trip():

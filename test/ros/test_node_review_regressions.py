@@ -221,3 +221,23 @@ def test_markers_keep_stable_ids_and_delete_removed_instances(node_factory):
         expected = {(ns, o.instance_id) for o in selected for ns in ['obj_boxes', 'obj_labels']}
         assert set(registry) == expected
     assert registry == {}
+
+
+def test_live_display_removes_retired_geometry_but_keeps_memory(node_factory):
+    node = node_factory('-p', 'publish_disappeared_objects:=false')
+    markers, clouds = [], []
+    node.obj_boxes_pub.publish = markers.append
+    node.obj_points_pub.publish = clouds.append
+    obj = make_object(1, 'chair', [0, 0, 1, 1, 1, 2])
+    obj.points_world = np.array([[.1, .2, 1.5]])
+    result = FrameResult(objects=[obj], stamp=10., scene_graph=SceneGraph(node_ids=[1]))
+    header = Header(stamp=stamp_msg(10.), frame_id='map')
+    node._publish_result(result, header)
+    assert clouds[-1].width == 1
+    obj.status = ObjectStatus.DISAPPEARED
+    node._publish_result(result, header)
+    assert clouds[-1].width == 0
+    assert {(m.ns, m.id, m.action) for m in markers[-1].markers} == {
+        ('obj_boxes', 1, Marker.DELETE), ('obj_labels', 1, Marker.DELETE)}
+    assert result.objects == [obj] and len(obj.points_world) == 1
+    assert result.scene_graph.node_ids == [1]

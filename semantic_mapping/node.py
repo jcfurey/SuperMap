@@ -52,7 +52,6 @@ from semantic_mapping.ros_msgs import (
     camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy, numpy_to_image, pointcloud_to_xyz,
     transform_to_se3,
 )
-from semantic_mapping.serialization import serialize_frame
 from semantic_mapping.types import CameraIntrinsics, Detection2D, ObjectStatus, Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest
@@ -72,6 +71,20 @@ def _packed_rgb_float(label: str) -> np.float32:
 
 def _stamp_to_seconds(stamp) -> float:
     return stamp.sec + stamp.nanosec * 1e-9
+
+
+def _advance_schedule(previous: float, stamp: float, period: float) -> float:
+    """Retain the rate's phase across input jitter; skip missed slots without bursts."""
+    if not np.isfinite(previous):
+        return stamp
+    return min(stamp, previous + max(1, int((stamp - previous) / period)) * period)
+
+
+def _rate_due(previous: float, stamp: float, period: float) -> bool:
+    # Camera timestamps jitter around their nominal period. Allow at most
+    # 1 ms (and at most 1% of a period) early, instead of dropping a whole
+    # camera frame for a sub-millisecond difference at the requested rate.
+    return stamp - previous >= period - min(0.001, 0.01 * period)
 
 
 def _label_color(label: str) -> tuple[float, float, float]:
@@ -135,7 +148,7 @@ class SemanticMappingNode(Node):
         self._detector_in_flight: int | None = None
         self._stop_event = threading.Event()
         self._detection_jobs: queue.Queue[Observation] = queue.Queue(maxsize=1)
-        self._detection_results: queue.Queue[tuple[int, list[Detection2D], float]] = queue.Queue()
+        self._detection_results: queue.Queue[tuple[int, list[Detection2D], float, bool]] = queue.Queue()
         self._detector_thread = threading.Thread(target=self._detector_loop, name="detector", daemon=True)
 
         # Language grounding (Sec. IV-D): the query callback snapshots and
@@ -165,13 +178,17 @@ class SemanticMappingNode(Node):
 
         # Runtime accounting (Sec. V-H): module rates over each log period.
         self._stats_lock = threading.Lock()
-        self._stats = {"frames": 0, "detections": 0, "publishes": 0, "stage_seconds": {}}
+        self._stats = {"frames": 0, "detections": 0, "publishes": 0, "stage_seconds": {},
+                       "detector_seconds": 0.0, "publish_seconds": 0.0}
         self._stats_since = time.monotonic()
         stats_period = float(self.get_parameter("stats_log_period_sec").value)
         if stats_period > 0:
             self.create_timer(stats_period, self._log_runtime_stats)
 
         self._setup_io()
+        # Wake the executor as soon as inference finishes. Polling alone adds
+        # up to 20 ms before fusion, enough to miss the next camera frame.
+        self._detection_ready = self.create_guard_condition(self._drain_detection_results)
         # A steady-clock timer drains results and expires pending work even
         # when sensor input or a bag's /clock has stopped.
         self._detection_timer = self.create_timer(
@@ -193,6 +210,7 @@ class SemanticMappingNode(Node):
             "camera_info_topic": "/camera/color/camera_info",
             "pointcloud_topic": "/lidar/points",
             "odometry_topic": "/odometry",
+            "sync_odometry": True,
             "obj_points_topic": "/obj_points",
             "obj_boxes_topic": "/obj_boxes",
             "annotated_image_topic": "/semantic_mapping/annotated_image",
@@ -206,6 +224,7 @@ class SemanticMappingNode(Node):
             "max_pending_frames": 30,
             "prompts_file": "config/prompts.yaml",
             "publish_rate_hz": 5.0,
+            "publish_disappeared_objects": True,
             "query_topic": "/semantic_mapping/query",
             "answer_topic": "/semantic_mapping/answer",
             "goal_topic": "/semantic_mapping/goal",
@@ -319,11 +338,15 @@ class SemanticMappingNode(Node):
         else:
             depth_sub = Subscriber(self, PointCloud2, self._param_str("pointcloud_topic", "/lidar/points"),
                                    qos_profile=qos)
-        odom_sub = Subscriber(self, Odometry, self._param_str("odometry_topic", "/odometry"), qos_profile=qos)
-        self._sensor_subscribers = [rgb_sub, info_sub, depth_sub, odom_sub]
+        self._sensor_subscribers = [rgb_sub, info_sub, depth_sub]
+        if bool(self.get_parameter("sync_odometry").value):
+            self._sensor_subscribers.append(Subscriber(
+                self, Odometry, self._param_str("odometry_topic", "/odometry"), qos_profile=qos))
+        else:
+            self.get_logger().info("Odometry synchronization disabled; camera poses still come from TF")
 
         self._sync = ApproximateTimeSynchronizer(
-            [rgb_sub, info_sub, depth_sub, odom_sub],
+            self._sensor_subscribers,
             queue_size=int(self.get_parameter("sync_queue_size").value),
             slop=float(self.get_parameter("sync_slop_sec").value),
         )
@@ -403,7 +426,10 @@ class SemanticMappingNode(Node):
             elapsed = max(now - self._stats_since, 1e-6)
             frames, detections, publishes = (self._stats[k] for k in ("frames", "detections", "publishes"))
             stage_seconds = dict(self._stats["stage_seconds"])
-            self._stats = {"frames": 0, "detections": 0, "publishes": 0, "stage_seconds": {}}
+            detector_seconds = self._stats["detector_seconds"]
+            publish_seconds = self._stats["publish_seconds"]
+            self._stats = {"frames": 0, "detections": 0, "publishes": 0, "stage_seconds": {},
+                           "detector_seconds": 0.0, "publish_seconds": 0.0}
             self._stats_since = now
         if frames == 0 and detections == 0:
             return
@@ -411,7 +437,9 @@ class SemanticMappingNode(Node):
         objects = len(self.pipeline.object_map.objects)
         self.get_logger().info(
             f"runtime: detector {detections / elapsed:.2f} Hz, 3D mapping {frames / elapsed:.2f} Hz, "
-            f"scene graph published {publishes / elapsed:.2f} Hz, {objects} instances | per frame: {stages}"
+            f"scene graph published {publishes / elapsed:.2f} Hz, {objects} instances | per frame: {stages} | "
+            f"per detection: {1e3 * detector_seconds / max(detections, 1):.1f}ms; "
+            f"per publish: {1e3 * publish_seconds / max(publishes, 1):.1f}ms"
         )
 
     # ------------------------------------------------------------- grounding
@@ -464,16 +492,16 @@ class SemanticMappingNode(Node):
             self.goal_pub.publish(path.poses[0])
 
     # ---------------------------------------------------------------- callback
-    def _on_synced_frame(self, rgb_msg, info_msg: CameraInfo, depth_msg, odom_msg: Odometry) -> None:
+    def _on_synced_frame(self, rgb_msg, info_msg: CameraInfo, depth_msg, odom_msg: Odometry | None = None) -> None:
         # odom_msg's own pose fields are not read directly: a well-behaved
         # SLAM backbone also broadcasts the same pose as a dynamic TF
         # transform, so resolving world_frame -> camera_frame (and
         # <point cloud frame> -> camera_frame) through TF2 handles the full
         # chain -- dynamic odometry composed with whatever static camera
         # extrinsic is in the TF tree -- without this node hardcoding either.
-        # The message is still subscribed to keep the four-topic sync
-        # documented in the README and to pace processing at the SLAM
-        # backbone's pose-update rate.
+        # By default, Odometry paces processing at the backbone's pose-update
+        # rate. With sync_odometry=false, only RGB/CameraInfo/depth are synced;
+        # TF is still required (including for an explicitly stationary camera).
         self._drain_detection_results()
         stamp = _stamp_to_seconds(rgb_msg.header.stamp)
         if stamp <= self._last_input_stamp:
@@ -528,6 +556,7 @@ class SemanticMappingNode(Node):
             rgb=rgb,
             depth=depth,
             detections=[],
+            detections_evaluated=False,
         )
         self._next_frame_id += 1
         self._last_input_stamp = stamp
@@ -535,12 +564,13 @@ class SemanticMappingNode(Node):
         self._pending_frames.append(pending)
         self._pending_by_id[observation.frame_id] = pending
 
-        detection_due = stamp - self._last_detector_stamp >= self._detector_period_sec
+        detection_due = _rate_due(self._last_detector_stamp, stamp, self._detector_period_sec)
         if detection_due and self._detector_in_flight is None:
             pending.detector_started_at = time.monotonic()
             self._detector_in_flight = observation.frame_id
             self._detection_jobs.put(observation)
-            self._last_detector_stamp = stamp
+            self._last_detector_stamp = _advance_schedule(
+                self._last_detector_stamp, stamp, self._detector_period_sec)
         self._flush_pending_frames()
 
     def _detector_loop(self) -> None:
@@ -549,6 +579,8 @@ class SemanticMappingNode(Node):
                 observation = self._detection_jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
+            evaluated = True
+            started_at = time.monotonic()
             try:
                 detections = self.detector.detect(
                     observation.rgb,
@@ -563,16 +595,19 @@ class SemanticMappingNode(Node):
                 self.get_logger().error(f"detector failed, fusing frame without detections: {exc}",
                                         throttle_duration_sec=5.0)
                 detections = []
+                evaluated = False
             if self._stop_event.is_set():
                 return
             with self._stats_lock:
                 self._stats["detections"] += 1
-            self._detection_results.put((observation.frame_id, detections, time.monotonic()))
+                self._stats["detector_seconds"] += time.monotonic() - started_at
+            self._detection_results.put((observation.frame_id, detections, time.monotonic(), evaluated))
+            self._detection_ready.trigger()
 
     def _drain_detection_results(self) -> None:
         while True:
             try:
-                frame_id, detections, finished_at = self._detection_results.get_nowait()
+                frame_id, detections, finished_at, evaluated = self._detection_results.get_nowait()
             except queue.Empty:
                 break
             if self._detector_in_flight == frame_id:
@@ -582,6 +617,7 @@ class SemanticMappingNode(Node):
                 continue  # timed out, forced through by the buffer limit, or invalidated by load
             if finished_at - pending.detector_started_at <= self._detector_timeout_sec:
                 pending.observation.detections = detections
+                pending.observation.detections_evaluated = evaluated
                 pending.annotate = True
                 pending.detector_started_at = None
             # An overdue result leaves the frame waiting, so the flush below
@@ -612,11 +648,14 @@ class SemanticMappingNode(Node):
             self._stats["frames"] += 1
             for stage, seconds in result.timings.items():
                 self._stats["stage_seconds"][stage] = self._stats["stage_seconds"].get(stage, 0.0) + seconds
-        if observation.stamp - self._last_publish_stamp >= self._publish_period_sec:
+        if _rate_due(self._last_publish_stamp, observation.stamp, self._publish_period_sec):
+            started_at = time.monotonic()
             self._publish_result(result, header)
-            self._last_publish_stamp = observation.stamp
+            self._last_publish_stamp = _advance_schedule(
+                self._last_publish_stamp, observation.stamp, self._publish_period_sec)
             with self._stats_lock:
                 self._stats["publishes"] += 1
+                self._stats["publish_seconds"] += time.monotonic() - started_at
         return result
 
     def _lookup_se3(self, target_frame: str, source_frame: str, stamp) -> np.ndarray:
@@ -663,12 +702,8 @@ class SemanticMappingNode(Node):
         header = Header(stamp=header.stamp, frame_id=self.world_frame)
         self._publish_object_points(result, header)
         self._publish_object_boxes(result, header)
-        # The per-frame JSON schema (bbox3d, label, id, center, spatial_relations,
-        # status, latest_stamp) is available to any downstream consumer via:
-        #   serialize_frame(result.objects, result.scene_graph)
-        # and is intentionally not published as a ROS message here, keeping the
-        # wire schema identical between offline and live modes (see README).
-        _ = serialize_frame(result.objects, result.scene_graph)
+        # JSON consumers use semantic_mapping.serialization on demand. Do not
+        # serialize the entire history here only to discard it at sensor rate.
 
     def _publish_object_points(self, result: FrameResult, header: Header) -> None:
         fields = [
@@ -680,10 +715,12 @@ class SemanticMappingNode(Node):
         # One structured array for the whole map, serialized by create_cloud in
         # a single copy: a Python row per point took 140 ms for a room-sized
         # map and over a second for a building (doc/audit-2026-09.md, P1).
-        counts = [obj.points_world.shape[0] for obj in result.objects]
+        include_history = bool(self.get_parameter("publish_disappeared_objects").value)
+        objects = [obj for obj in result.objects if include_history or obj.status != ObjectStatus.DISAPPEARED]
+        counts = [obj.points_world.shape[0] for obj in objects]
         cloud = np.zeros(int(sum(counts)), dtype=_POINT_DTYPE)
         offset = 0
-        for obj, n in zip(result.objects, counts):
+        for obj, n in zip(objects, counts):
             if n == 0:
                 continue
             block = cloud[offset:offset + n]
@@ -700,6 +737,8 @@ class SemanticMappingNode(Node):
         node_ids = set(result.scene_graph.node_ids) if result.scene_graph else set()
         by_id = {obj.instance_id: obj for obj in result.objects}
         node_ids.intersection_update(by_id)
+        if not self.get_parameter("publish_disappeared_objects").value:
+            node_ids = {i for i in node_ids if by_id[i].status != ObjectStatus.DISAPPEARED}
 
         for instance_id in sorted(self._published_marker_ids - node_ids):
             for namespace in ("obj_boxes", "obj_labels"):

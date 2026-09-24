@@ -92,6 +92,8 @@ class Observation:
     cloud into the camera frame; see ``node.py``."""
 
     detections: list[Detection2D] = field(default_factory=list)
+    detections_evaluated: bool = True
+    """False on geometry-only frames or failed/timed-out inference; [] alone means a completed empty result."""
 
 
 @dataclass
@@ -154,6 +156,8 @@ class ObjectInstance:
     same physical object keep its ID after it disappears and turns up elsewhere."""
 
     embedding_count: int = 0
+    missed_detection_frames: int = 0
+    """Completed detector observations that did not match this object; geometry-only frames do not count."""
 
     @property
     def label(self) -> str:

@@ -41,6 +41,60 @@ def test_static_object_becomes_and_stays_active():
     assert record["status"] == "active"
 
 
+def test_geometry_only_frames_do_not_expire_a_tentative_object_between_detections():
+    pipeline = SemanticMappingPipeline()
+    for i in range(16):
+        obs = _observation(i / 15, 2.0, i in (0, 15))
+        obs.detections_evaluated = i in (0, 15)
+        result = pipeline.process_frame(obs)
+        assert len(result.objects) == 1
+        assert result.objects[0].status == (ObjectStatus.ACTIVE if i == 15 else ObjectStatus.TENTATIVE)
+    assert result.objects[0].hits == 2
+    assert result.objects[0].missed_detection_frames == 0
+
+
+def test_depth_limits_reject_saturated_geometry_without_false_removal_evidence():
+    pipeline = SemanticMappingPipeline(PipelineConfig(max_depth_m=6.0))
+    for i in range(2):
+        pipeline.process_frame(_observation(i * .1, 2.0, True))
+    # Far/saturated depth means no measurement; it cannot prove the chair is gone.
+    for i in range(2, 8):
+        obs = _observation(i * .1, 65.535, True)
+        obs.detections[0].mask = np.zeros((120, 160), dtype=bool)
+        obs.detections[0].mask[40:80, 60:100] = True
+        result = pipeline.process_frame(obs)
+        assert obs.depth[50, 70] == pytest.approx(65.535)  # caller input preserved
+        assert len(result.objects) == 1 and result.objects[0].status == ObjectStatus.ACTIVE
+        assert np.max(result.objects[0].points_world[:, 2]) <= 2.001
+    # Valid free-space evidence still detects actual removal.
+    for i in range(8, 20):
+        result = pipeline.process_frame(_observation(i * .1, 5.0, False))
+    assert result.objects[0].status == ObjectStatus.DISAPPEARED
+
+
+@pytest.mark.parametrize('params', [
+    {'min_depth_m': -1}, {'max_depth_m': float('nan')},
+    {'min_depth_m': 2, 'max_depth_m': 1}, {'bbox_trim_percentile': 50},
+])
+def test_invalid_geometry_limits_are_rejected(params):
+    with pytest.raises(ValueError):
+        PipelineConfig(**params)
+
+
+def test_mask_depth_gate_rejects_background_speckles_without_changing_mask():
+    obs = _observation(0, 2, True)
+    mask = np.zeros(obs.depth.shape, dtype=bool)
+    mask[40:80, 60:100] = True
+    obs.detections[0].mask = mask
+    obs.depth[45:47, 65:67] = 5.0  # a few mismatched depth pixels inside a correct mask
+    original_mask = mask.copy()
+    raw = SemanticMappingPipeline().process_frame(obs).objects[0]
+    filtered = SemanticMappingPipeline(PipelineConfig(mask_depth_mad_factor=3)).process_frame(obs).objects[0]
+    assert raw.bbox3d[5] > 4.9
+    assert filtered.bbox3d[5] < 2.1
+    np.testing.assert_array_equal(mask, original_mask)
+
+
 def test_confirmation_threshold_is_honored_by_matching_and_reidentification():
     pipeline = SemanticMappingPipeline(PipelineConfig(min_hits_to_confirm=5))
     for i in range(2):
