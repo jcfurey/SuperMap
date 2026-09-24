@@ -1,9 +1,11 @@
 import numpy as np
 
 from semantic_mapping.geometry_utils import (
+    back_project_depth,
     bbox3d_from_points,
     centroid,
     depth_consistency_mask,
+    foreground_depth_mask,
     invert_se3,
     iou_xy,
     iou_xyxy,
@@ -14,6 +16,30 @@ from semantic_mapping.geometry_utils import (
     se3_from_translation_quaternion,
     transform_points,
 )
+
+
+def test_robust_bbox_rejects_sparse_depth_outliers_without_changing_default_bounds():
+    points = np.random.default_rng(2).uniform(0, 1, (1000, 3))
+    points = np.vstack([points, [65.535, 30.0, 15.0]])
+    full = bbox3d_from_points(points)
+    robust = bbox3d_from_points(points, trim_percentile=2.0)
+    np.testing.assert_allclose(full[3:], [65.535, 30.0, 15.0])
+    assert np.all(robust[:3] >= 0) and np.all(robust[3:] <= 1)
+    assert np.all(robust[3:] - robust[:3] > .9)
+
+
+def test_early_backprojection_sampling_preserves_the_filtered_point_sample():
+    rng = np.random.default_rng(12)
+    depth = rng.uniform(1.8, 2.2, (120, 160))
+    depth[::8, ::8] = 5.0
+    depth[::9, ::9] = np.nan
+    mask = rng.random(depth.shape) > .3
+    K = np.array([[100., 0, 80], [0, 100., 60], [0, 0, 1.]])
+    full = back_project_depth(K, depth, mask)
+    full = full[depth_consistency_mask(full[:, 2])]
+    indices = np.random.default_rng(0).choice(len(full), size=400, replace=False)
+    actual = back_project_depth(K, depth, mask, max_points=400, depth_mad_factor=3)
+    np.testing.assert_array_equal(actual, full[indices])
 
 
 def test_invert_se3_round_trip():
@@ -103,6 +129,35 @@ def test_depth_consistency_mask_rejects_outlier():
 
 def test_depth_consistency_mask_empty():
     assert depth_consistency_mask(np.zeros(0)).shape == (0,)
+
+
+def test_foreground_layer_survives_majority_background_and_near_speckles():
+    # The median belongs to the wall; the sparse person is the first supported layer.
+    depths = np.concatenate(([1.0, 1.1, 0.0, np.nan, np.inf, -2.0],
+                             np.linspace(12.0, 12.3, 8), np.linspace(30, 30.4, 50)))
+    selected = depths[foreground_depth_mask(depths, .75, 5, .1)]
+    np.testing.assert_array_equal(selected, depths[6:14])
+
+
+def test_foreground_layer_requires_sensor_support():
+    for depths in [np.array([]), np.array([0, np.nan]), np.array([2., 2.1, 10., 10.1])]:
+        assert not foreground_depth_mask(depths, .75, 5, .1).any()
+
+
+def test_foreground_layer_preserves_input_order_and_single_surface():
+    depths = np.array([4.2, 4.0, 4.3, 4.1, 4.4])
+    np.testing.assert_array_equal(depths[foreground_depth_mask(depths, .75)], depths)
+
+
+def test_foreground_layer_requires_spatial_support_not_just_many_foot_returns():
+    feet = np.column_stack((np.linspace(0, 30, 30), np.full(30, 39)))
+    x, y = np.meshgrid(np.arange(0, 31, 5), np.arange(0, 40, 5))
+    body = np.column_stack((x.ravel(), y.ravel()))
+    pixels = np.vstack((feet, body))
+    depths = np.concatenate((np.full(len(feet), 2.), np.full(len(body), 3.)))
+    keep = foreground_depth_mask(depths, .75, pixels=pixels, min_span=np.array([15, 20]))
+    assert not keep[:len(feet)].any() and keep[len(feet):].all()
+    assert not foreground_depth_mask(depths[:len(feet)], .75, pixels=feet, min_span=np.array([15, 20])).any()
 
 
 def test_fill_sparse_depth_fills_only_empty_pixels_with_neighbourhood_minimum():

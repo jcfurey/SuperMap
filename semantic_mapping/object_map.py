@@ -92,6 +92,9 @@ class ObjectMap:
         min_observations_for_confidence_check: int = 5,
         tentative_max_age: int = 10,
         cull_out_of_view: bool = True,
+        bbox_trim_percentile: float = 0.0,
+        dynamic_geometry_labels: tuple[str, ...] | list[str] = (),
+        dynamic_geometry_min_extent_fraction: float = 0.0,
     ) -> None:
         self.voxel_size = voxel_size
         self.tau_eps = tau_eps
@@ -106,6 +109,9 @@ class ObjectMap:
         self.min_observations_for_confidence_check = min_observations_for_confidence_check
         self.tentative_max_age = tentative_max_age
         self.cull_out_of_view = cull_out_of_view
+        self.bbox_trim_percentile = bbox_trim_percentile
+        self.dynamic_geometry_labels = frozenset(dynamic_geometry_labels)
+        self.dynamic_geometry_min_extent_fraction = dynamic_geometry_min_extent_fraction
 
         self.objects: dict[int, ObjectInstance] = {}
         self._next_id = 1
@@ -116,7 +122,7 @@ class ObjectMap:
         side: each stored point stands for its whole cell, and a surface seen
         from one side would otherwise be a zero-volume slab."""
         pad = self.voxel_size / 2.0
-        return bbox3d_from_points(points) + np.array([-pad, -pad, -pad, pad, pad, pad])
+        return bbox3d_from_points(points, self.bbox_trim_percentile) + np.array([-pad, -pad, -pad, pad, pad, pad])
 
     def _subset_points(self, instance: ObjectInstance, keep: np.ndarray) -> None:
         instance.points_world = instance.points_world[keep]
@@ -218,10 +224,35 @@ class ObjectMap:
             instance.point_membership = sf.update_point_membership(instance.point_membership, observable, inside)
 
         contradicted = gc.prune_mask(instance.point_log_odds, self.prune_log_odds)
+        if self._preserve_compact_body(instance):
+            # Keep the last supported body intact while accumulating evidence.
+            # Unknown/occluded points retain their prior; contradicted points
+            # can retire the whole body instead of leaving a floor fragment.
+            return bool(np.any(observable))
         instance.points_contradicted += int(contradicted.sum())
         keep = ~(contradicted | (instance.point_membership < self.prune_membership))
-        self._subset_points(instance, keep)
+        if not np.all(keep):
+            self._subset_points(instance, keep)
         return bool(np.any(observable))
+
+    def _preserve_compact_body(self, instance: ObjectInstance) -> bool:
+        return instance.label in self.dynamic_geometry_labels and self.dynamic_geometry_min_extent_fraction > 0
+
+    def _body_contradicted(self, instance: ObjectInstance) -> bool:
+        if not self._preserve_compact_body(instance) or not len(instance.points_world):
+            return False
+        supported = ((instance.point_log_odds >= self.prune_log_odds)
+                     & (instance.point_membership >= self.prune_membership))
+        if supported.all():
+            return False
+        if not supported.any():
+            return True
+        reference = np.ptp(instance.points_world, axis=0)
+        remaining = np.ptp(instance.points_world[supported], axis=0)
+        # Ignore thin/unobserved axes: a single viewed surface is not a full
+        # volume. Compare only axes spanning at least four voxel cells.
+        measured = reference >= 4 * self.voxel_size
+        return bool(np.any(remaining[measured] < reference[measured] * self.dynamic_geometry_min_extent_fraction))
 
     # -------------------------------------------------------------- lifecycle
     def spawn(
@@ -252,6 +283,7 @@ class ObjectMap:
             latest_stamp=stamp,
             frames_since_seen=0,
             hits=1,
+            geometry_stamp=stamp if n else None,
         )
         if embedding is not None:
             instance.embedding, instance.embedding_count = update_running_embedding(None, 0, embedding)
@@ -282,6 +314,7 @@ class ObjectMap:
         instance.track = track
         instance.latest_stamp = stamp
         instance.frames_since_seen = 0
+        instance.missed_detection_frames = 0
         instance.hits += 1
         # Newly matched tentative tracks still need the configured hit check.
         # Retired tracks also pass through it: a retired identity may have
@@ -290,13 +323,29 @@ class ObjectMap:
         instance.status = (ObjectStatus.TENTATIVE
                            if instance.status in (ObjectStatus.TENTATIVE, ObjectStatus.DISAPPEARED)
                            else ObjectStatus.ACTIVE)
-        instance.points_contradicted = 0  # re-detected: contradiction bookkeeping starts over
-
-        corroborated = self._apply_evidence(instance, K, T_world_from_cam, depth_image, detection)
+        has_geometry = len(new_points_world) > 0
+        dynamic = detection.label in self.dynamic_geometry_labels
+        if has_geometry or not dynamic:
+            instance.points_contradicted = 0
+        # A visible 2D silhouette with inadequate depth is not a measurement
+        # of its body or evidence that the last body has become empty space.
+        corroborated = (self._apply_evidence(instance, K, T_world_from_cam, depth_image, detection)
+                        if has_geometry or not dynamic else False)
         if corroborated:
             instance.label_belief = sf.bayesian_label_update(instance.label_belief, detection.label, detection.score)
 
+        if detection.label in self.dynamic_geometry_labels and len(new_points_world):
+            # A moving object's past locations belong in its trajectory, not
+            # in its current volume. Missing depth must not erase the last
+            # supported geometry, and identity/semantic evidence stay intact.
+            instance.points_world = np.zeros((0, 3), dtype=np.float64)
+            instance.point_log_odds = np.zeros(0)
+            instance.point_membership = np.zeros(0)
         self._fuse_points(instance, new_points_world)
+        if has_geometry:
+            instance.geometry_stamp = stamp
+        elif dynamic and instance.status != ObjectStatus.TENTATIVE:
+            instance.status = ObjectStatus.OCCLUDED
 
         instance.label_belief = sf.bayesian_label_update(instance.label_belief, detection.label, detection.score)
         instance.label_belief = sf.prune_low_confidence_labels(instance.label_belief)
@@ -358,15 +407,18 @@ class ObjectMap:
         T_world_from_cam: np.ndarray,
         depth_image: np.ndarray,
         in_view: bool | None = None,
+        detections_evaluated: bool = True,
     ) -> None:
         """Advance an instance with no detection this frame: re-evaluate geometric
         evidence only (Sec. IV-B.3), which is how disappearances are detected
         even though no 2D detection ever fires "removed".
         """
         instance.frames_since_seen += 1
+        if detections_evaluated:
+            instance.missed_detection_frames += 1
         self._apply_evidence(instance, K, T_world_from_cam, depth_image, in_view=in_view)
 
-        if instance.status == ObjectStatus.TENTATIVE and instance.frames_since_seen > self.tentative_max_age:
+        if instance.status == ObjectStatus.TENTATIVE and instance.missed_detection_frames > self.tentative_max_age:
             # Never corroborated: a one-off false detection, not an object.
             instance.status = ObjectStatus.DISAPPEARED
             return
@@ -375,9 +427,12 @@ class ObjectMap:
         # last detection, so pruning contradicted points can't launder an
         # object back to "intact" (see ObjectInstance.points_contradicted).
         alive = instance.points_world.shape[0]
+        if alive == 0 and instance.status == ObjectStatus.TENTATIVE and instance.geometry_stamp is None:
+            return  # retain the 2D-only track until its detector-miss budget expires
         occupied = gc.occupied_fraction(instance.point_log_odds) * alive
-        fraction = occupied / (alive + instance.points_contradicted) if alive + instance.points_contradicted else 0.0
-        if alive == 0 or fraction <= self.disappeared_occupied_fraction:
+        denominator = alive if self._preserve_compact_body(instance) else alive + instance.points_contradicted
+        fraction = occupied / denominator if denominator else 0.0
+        if alive == 0 or fraction <= self.disappeared_occupied_fraction or self._body_contradicted(instance):
             instance.status = ObjectStatus.DISAPPEARED
         elif instance.status != ObjectStatus.TENTATIVE and (
             fraction < self.active_occupied_fraction or instance.frames_since_seen > self.max_occlusion_frames
@@ -395,20 +450,36 @@ class ObjectMap:
             instance.status = ObjectStatus.DISAPPEARED
             return
         if instance.hits >= min_hits:
-            instance.status = ObjectStatus.ACTIVE
+            if instance.label in self.dynamic_geometry_labels:
+                if not len(instance.points_world):
+                    return  # a 2D track has no mapped location yet
+                instance.status = (ObjectStatus.ACTIVE if instance.geometry_stamp == instance.latest_stamp
+                                   else ObjectStatus.OCCLUDED)
+            else:
+                instance.status = ObjectStatus.ACTIVE
 
     # ---------------------------------------------------------------- merging
     def _merge_into(self, keep: ObjectInstance, drop: ObjectInstance) -> None:
-        # Concatenate keeping both instances' per-point evidence, then dedupe;
-        # `keep` comes first so its points win shared voxels.
-        keep.points_world = np.concatenate([keep.points_world, drop.points_world], axis=0)
-        keep.point_log_odds = np.concatenate([keep.point_log_odds, drop.point_log_odds])
-        keep.point_membership = np.concatenate([keep.point_membership, drop.point_membership])
-        idx = voxel_downsample_indices(keep.points_world, self.voxel_size)
-        if idx.size > self.max_points_per_object:
-            rng = np.random.default_rng(keep.instance_id)
-            idx = np.sort(rng.choice(idx, size=self.max_points_per_object, replace=False))
-        self._subset_points(keep, idx)
+        if keep.label in self.dynamic_geometry_labels and drop.label in self.dynamic_geometry_labels:
+            # Preserve the oldest ID without reviving an older body position.
+            newest = max((keep, drop), key=lambda o: (o.geometry_stamp if o.geometry_stamp is not None else -np.inf,
+                                                     len(o.points_world)))
+            for name in ('points_world', 'point_log_odds', 'point_membership', 'bbox3d'):
+                setattr(keep, name, getattr(newest, name).copy())
+            keep.geometry_stamp = newest.geometry_stamp
+        else:
+            # Keep both instances' per-point evidence, then dedupe; `keep`
+            # comes first so its points win shared voxels.
+            keep.points_world = np.concatenate([keep.points_world, drop.points_world], axis=0)
+            keep.point_log_odds = np.concatenate([keep.point_log_odds, drop.point_log_odds])
+            keep.point_membership = np.concatenate([keep.point_membership, drop.point_membership])
+            idx = voxel_downsample_indices(keep.points_world, self.voxel_size)
+            if idx.size > self.max_points_per_object:
+                rng = np.random.default_rng(keep.instance_id)
+                idx = np.sort(rng.choice(idx, size=self.max_points_per_object, replace=False))
+            self._subset_points(keep, idx)
+            stamps = [o.geometry_stamp for o in (keep, drop) if o.geometry_stamp is not None]
+            keep.geometry_stamp = max(stamps, default=None)
 
         total_hits = keep.hits + drop.hits
         merged_belief: dict[str, float] = {}
@@ -428,6 +499,7 @@ class ObjectMap:
                 keep.embedding_count = total
 
         keep.hits = total_hits
+        keep.missed_detection_frames = min(keep.missed_detection_frames, drop.missed_detection_frames)
         keep.frames_since_seen = min(keep.frames_since_seen, drop.frames_since_seen)
         keep.first_seen_stamp = min(keep.first_seen_stamp, drop.first_seen_stamp)
         if drop.latest_stamp > keep.latest_stamp:
@@ -534,7 +606,9 @@ class ObjectMap:
         keep.status = moved.status  # the pipeline confirms tentative reconciliations using the combined hits
         keep.latest_stamp = moved.latest_stamp
         keep.frames_since_seen = moved.frames_since_seen
+        keep.missed_detection_frames = moved.missed_detection_frames
         keep.points_contradicted = moved.points_contradicted
+        keep.geometry_stamp = moved.geometry_stamp
         total_hits = keep.hits + moved.hits
         merged_belief: dict[str, float] = {}
         for belief, weight in ((keep.label_belief, keep.hits), (moved.label_belief, moved.hits)):

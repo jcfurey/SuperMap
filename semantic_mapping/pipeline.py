@@ -22,8 +22,8 @@ from semantic_mapping.geometry_utils import (
     back_project_depth,
     bbox3d_from_points,
     clip_bbox_to_image,
-    depth_consistency_mask,
     fill_sparse_depth,
+    foreground_depth_mask,
     transform_points,
 )
 from semantic_mapping.object_map import ObjectMap
@@ -33,6 +33,28 @@ from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus, Ob
 @dataclass
 class PipelineConfig:
     voxel_size: float = 0.05
+    min_depth_m: float = 0.0
+    max_depth_m: float = 0.0
+    """Usable optical depth interval for geometry and evidence; max 0 disables the upper bound."""
+    bbox_trim_percentile: float = 0.0
+    """Optional per-axis percentile trimming for object bounds; 0 retains full extents."""
+    mask_depth_mad_factor: float = 0.0
+    """Optional robust depth gate inside instance masks; 0 disables it for full-depth objects."""
+    mask_depth_min_tolerance_m: float = 0.15
+    foreground_depth_gap_m: float = 0.0
+    """Separate masked sensor depths into layers; 0 disables foreground selection."""
+    foreground_depth_min_points: int = 5
+    foreground_depth_min_fraction: float = 0.1
+    foreground_depth_min_image_span: float = 0.0
+    """Minimum fraction of the visible mask span covered by real returns in each image axis."""
+    foreground_depth_max_extent_m: float = 0.0
+    """Optional compact-object bound per camera axis; reject implausible layers, never clip them."""
+    foreground_depth_labels: list[str] = field(default_factory=lambda: ["person"])
+    dynamic_geometry_enabled: bool = False
+    dynamic_geometry_labels: list[str] = field(default_factory=lambda: ["person"])
+    """Use the latest supported geometry for these moving classes; keep identity/history."""
+    dynamic_geometry_min_extent_fraction: float = 0.0
+    """Retire a contradicted compact body as a whole when a supported axis collapses; 0 disables."""
     tau_eps: float = 0.15
     max_points_per_object: int = 5000
     prune_log_odds: float = -1.5
@@ -90,7 +112,33 @@ class PipelineConfig:
     for a LiDAR scan rasterized into the camera. The geometric-consistency
     evidence uses the image filled from all readings; a detection is
     back-projected through depth filled only from readings inside its own
-    mask (or box), so background never leaks into an object's point set."""
+    mask (or box). Background returns already inside the silhouette require
+    separate foreground selection."""
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.min_depth_m) or self.min_depth_m < 0:
+            raise ValueError("min_depth_m must be finite and nonnegative")
+        if not np.isfinite(self.max_depth_m) or self.max_depth_m < 0:
+            raise ValueError("max_depth_m must be finite and nonnegative")
+        if self.max_depth_m and self.max_depth_m <= self.min_depth_m:
+            raise ValueError("max_depth_m must exceed min_depth_m (or be zero to disable)")
+        if not 0 <= self.bbox_trim_percentile < 50:
+            raise ValueError("bbox_trim_percentile must be in [0, 50)")
+        if not np.isfinite(self.mask_depth_mad_factor) or self.mask_depth_mad_factor < 0:
+            raise ValueError("mask_depth_mad_factor must be finite and nonnegative")
+        if not np.isfinite(self.mask_depth_min_tolerance_m) or self.mask_depth_min_tolerance_m <= 0:
+            raise ValueError("mask_depth_min_tolerance_m must be finite and positive")
+        if not np.isfinite(self.foreground_depth_gap_m) or self.foreground_depth_gap_m < 0:
+            raise ValueError("foreground_depth_gap_m must be finite and nonnegative")
+        if self.foreground_depth_min_points < 1 or int(self.foreground_depth_min_points) != self.foreground_depth_min_points:
+            raise ValueError("foreground_depth_min_points must be a positive integer")
+        if not 0 <= self.foreground_depth_min_fraction <= 1:
+            raise ValueError("foreground_depth_min_fraction must be in [0, 1]")
+        for name in ('foreground_depth_min_image_span', 'dynamic_geometry_min_extent_fraction'):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not np.isfinite(self.foreground_depth_max_extent_m) or self.foreground_depth_max_extent_m < 0:
+            raise ValueError("foreground_depth_max_extent_m must be finite and nonnegative")
 
     @classmethod
     def from_dict(cls, params: dict) -> "PipelineConfig":
@@ -139,6 +187,9 @@ class SemanticMappingPipeline:
             min_observations_for_confidence_check=self.config.min_observations_for_confidence_check,
             tentative_max_age=self.config.tentative_max_age,
             cull_out_of_view=self.config.cull_out_of_view,
+            bbox_trim_percentile=self.config.bbox_trim_percentile,
+            dynamic_geometry_labels=self.config.dynamic_geometry_labels if self.config.dynamic_geometry_enabled else (),
+            dynamic_geometry_min_extent_fraction=self.config.dynamic_geometry_min_extent_fraction,
         )
         self._frame_index = 0
         self._last_stamp: float | None = None
@@ -196,19 +247,35 @@ class SemanticMappingPipeline:
             x2, y2 = min(x2, depth.shape[1]), min(y2, depth.shape[0])
             mask[y1:y2, x1:x2] = True
 
+        cfg = self.config
+        if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
+            # Count real returns, not pixels synthesized by sparse filling.
+            pixels = min_span = None
+            if cfg.foreground_depth_min_image_span > 0:
+                ys, xs = np.nonzero(mask)
+                pixels = np.column_stack((xs, ys))
+                if len(pixels):
+                    min_span = (np.ptp(pixels, axis=0) + 1) * cfg.foreground_depth_min_image_span
+            selected = foreground_depth_mask(
+                depth[mask], cfg.foreground_depth_gap_m,
+                cfg.foreground_depth_min_points, cfg.foreground_depth_min_fraction,
+                pixels=pixels, min_span=min_span,
+            )
+            filtered = np.zeros_like(depth)
+            filtered[mask] = np.where(selected, depth[mask], 0.0)
+            depth = filtered
         if self.config.depth_fill_radius_px > 0:
             depth = self._fill_within(depth, mask, self.config.depth_fill_radius_px)
-        points_cam = back_project_depth(K, depth, mask=mask)
-        if not has_instance_mask and points_cam.shape[0] > 0:
-            # An axis-aligned box (unlike a segmentation mask) commonly includes
-            # background around the object's true silhouette; reject it so it
-            # doesn't drag the fused 3D point set toward whatever is behind the
-            # object (Sec. IV-B.3 depends on a clean per-instance point set).
-            points_cam = points_cam[depth_consistency_mask(points_cam[:, 2])]
-        if points_cam.shape[0] > self.config.max_points_per_detection:
-            rng = np.random.default_rng(0)
-            idx = rng.choice(points_cam.shape[0], size=self.config.max_points_per_detection, replace=False)
-            points_cam = points_cam[idx]
+        points_cam = back_project_depth(
+            K, depth, mask=mask, max_points=self.config.max_points_per_detection,
+            depth_mad_factor=self.config.mask_depth_mad_factor if has_instance_mask else 3.0,
+            depth_min_tolerance=self.config.mask_depth_min_tolerance_m if has_instance_mask else 0.05,
+        )
+        if (cfg.foreground_depth_max_extent_m > 0 and detection.label in cfg.foreground_depth_labels
+                and len(points_cam)):
+            bounds = bbox3d_from_points(points_cam, cfg.bbox_trim_percentile)
+            if np.any(bounds[3:] - bounds[:3] > cfg.foreground_depth_max_extent_m):
+                return np.zeros((0, 3))
         return transform_points(T_world_from_cam, points_cam)
 
     def process_frame(self, observation: Observation) -> FrameResult:
@@ -231,6 +298,14 @@ class SemanticMappingPipeline:
         detections = observation.detections
         cfg = self.config
         depth = observation.depth
+        if depth is not None and (cfg.min_depth_m > 0 or cfg.max_depth_m > 0):
+            valid = np.isfinite(depth) & (depth > 0) & (depth >= cfg.min_depth_m)
+            if cfg.max_depth_m > 0:
+                valid &= depth <= cfg.max_depth_m
+            # Out-of-range readings mean unknown, not free space. The same
+            # filtered depth must drive both back-projection and contradiction
+            # evidence, and the caller's observation must remain unmodified.
+            depth = np.where(valid, depth, 0.0)
         # Evidence (Eq. 7-9) runs on depth filled from every reading; detections
         # are back-projected through the raw depth, filled per detection from
         # readings inside their own mask (see _detection_points_world).
@@ -271,7 +346,8 @@ class SemanticMappingPipeline:
                 continue
             dt = max(observation.stamp - obj.latest_stamp, 1e-3)
             predicted = tracking.predict(
-                obj.track, dt, K=K, T_world_from_cam=T_world_from_cam, object_centroid_world=obj.center,
+                obj.track, dt, K=K, T_world_from_cam=T_world_from_cam,
+                object_centroid_world=obj.center if len(obj.points_world) else None,
                 object_bbox3d_world=obj.bbox3d if obj.points_world.shape[0] > 0 else None,
                 image_size=image_size, size_prior_weight=cfg.size_prior_weight,
             )
@@ -291,7 +367,8 @@ class SemanticMappingPipeline:
                       if depth is not None else np.zeros((0, 3)))
             det_points.append(points)
             det_boxes3d.append(
-                bbox3d_from_points(points) if points.shape[0] >= cfg.min_points_for_3d_association else None
+                bbox3d_from_points(points, cfg.bbox_trim_percentile)
+                if points.shape[0] >= cfg.min_points_for_3d_association else None
             )
         t_backproject = time.perf_counter()
         detection_bboxes = [d.bbox for d in detections]
@@ -339,13 +416,17 @@ class SemanticMappingPipeline:
             obj = live_objects[track_idx]
             obj.track = predicted_tracks[track_idx]
             if depth is not None:
-                self.object_map.update_unmatched(obj, K, T_world_from_cam, evidence_depth)
+                self.object_map.update_unmatched(
+                    obj, K, T_world_from_cam, evidence_depth,
+                    detections_evaluated=observation.detections_evaluated)
             else:
                 obj.frames_since_seen += 1
         for track_idx in np.nonzero(~in_view)[0]:
             obj = live_objects[track_idx]
             if depth is not None:
-                self.object_map.update_unmatched(obj, K, T_world_from_cam, evidence_depth, in_view=False)
+                self.object_map.update_unmatched(
+                    obj, K, T_world_from_cam, evidence_depth, in_view=False,
+                    detections_evaluated=observation.detections_evaluated)
             else:
                 obj.frames_since_seen += 1
 

@@ -8,13 +8,32 @@ import numpy as np
 from std_msgs.msg import Header
 
 from semantic_mapping.ros_msgs import pointcloud_to_xyz
+from semantic_mapping.node import _advance_schedule, _rate_due
 from test.ros.helpers import ReplayDetector, feed_frame, spin_until, stamp_msg
+
+
+def test_rate_matches_jittering_camera_without_catchup_bursts():
+    period = 1 / 15
+    stamps = 1_790_000_000 + np.arange(450) * period + np.random.default_rng(4).uniform(-.0002, .0002, 450)
+    previous, accepted = -float('inf'), []
+    for stamp in stamps:
+        if _rate_due(previous, stamp, period):
+            previous = _advance_schedule(previous, stamp, period)
+            accepted.append(stamp)
+    assert len(accepted) >= 448
+    # After an input pause, accept only the newest slot, not a burst of old ones.
+    stamp = stamps[-1] + 20
+    previous = _advance_schedule(previous, stamp, period)
+    assert not _rate_due(previous, stamp + .001, period)
 
 
 def test_deferred_detection_frames_fuse_and_outputs_publish(node_factory, dataset):
     frames = list(dataset)[:4]
     node = node_factory("-p", "detector_rate_hz:=5.0", "-p", "publish_rate_hz:=5.0", silence_publishers=False)
     node.detector = ReplayDetector(node.detector)
+    # Completed work must wake the executor without waiting for the periodic
+    # timeout check or another sensor message.
+    node._detection_timer.cancel()
 
     published = {"boxes": [], "points": [], "annotated": []}
     node.obj_boxes_pub.publish = published["boxes"].append

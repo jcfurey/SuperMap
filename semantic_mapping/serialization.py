@@ -34,8 +34,9 @@ def serialize_instance(instance: ObjectInstance, scene_graph: SceneGraph, now: f
     """Serialize a single object instance to the documented per-frame schema.
 
     ``seconds_since_seen`` is how long ago the instance was last observed
-    (relative to ``now``); consumers can treat a long-unobserved "occluded"
-    instance as uncertain rather than present.
+    (relative to ``now``), including 2D-only observations. ``geometry_stamp``
+    and ``seconds_since_geometry`` distinguish the last supported 3D location;
+    both are null when no geometry timestamp is available.
     """
     reference = frame_time([instance], now)
     return {
@@ -47,6 +48,9 @@ def serialize_instance(instance: ObjectInstance, scene_graph: SceneGraph, now: f
         "status": instance.status.value,
         "latest_stamp": instance.latest_stamp,
         "seconds_since_seen": max(reference - instance.latest_stamp, 0.0),
+        "geometry_stamp": instance.geometry_stamp,
+        "seconds_since_geometry": (max(reference - instance.geometry_stamp, 0.0)
+                                   if instance.geometry_stamp is not None else None),
     }
 
 

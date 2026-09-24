@@ -136,7 +136,10 @@ def clip_bbox_to_image(bbox: Array, width: int, height: int) -> Array | None:
     return np.array([x1, y1, x2, y2], dtype=np.float64)
 
 
-def back_project_depth(K: Array, depth: Array, mask: Array | None = None) -> Array:
+def back_project_depth(
+    K: Array, depth: Array, mask: Array | None = None, *,
+    max_points: int | None = None, depth_mad_factor: float = 0.0, depth_min_tolerance: float = 0.05,
+) -> Array:
     """Back-project a depth image (or masked subset) into the camera frame.
 
     Parameters
@@ -144,10 +147,13 @@ def back_project_depth(K: Array, depth: Array, mask: Array | None = None) -> Arr
     K : (3, 3) camera intrinsic matrix.
     depth : (H, W) depth image in meters, 0/NaN entries are treated as invalid.
     mask : optional (H, W) boolean array restricting which pixels to unproject.
+    max_points : optional deterministic sample limit, applied before projection.
+    depth_mad_factor : optional median-absolute-deviation gate; 0 disables it.
+    depth_min_tolerance : minimum depth tolerance in meters when the gate is enabled.
 
     Returns
     -------
-    (N, 3) array of camera-frame 3D points, one per valid pixel.
+    (N, 3) array of camera-frame 3D points after optional filtering/sampling.
     """
     h, w = depth.shape
     valid = np.isfinite(depth) & (depth > 0)
@@ -157,6 +163,14 @@ def back_project_depth(K: Array, depth: Array, mask: Array | None = None) -> Arr
     if us.size == 0:
         return np.zeros((0, 3), dtype=np.float64)
     z = depth[vs, us].astype(np.float64)
+    if depth_mad_factor > 0:
+        keep = depth_consistency_mask(z, mad_factor=depth_mad_factor, min_tolerance=depth_min_tolerance)
+        vs, us, z = vs[keep], us[keep], z[keep]
+    if max_points is not None and us.size > max_points:
+        # Same deterministic sample as subsampling the projected cloud, but
+        # avoid computing and allocating XYZ for pixels that will be discarded.
+        indices = np.random.default_rng(0).choice(us.size, size=max_points, replace=False)
+        vs, us, z = vs[indices], us[indices], z[indices]
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
     x = (us.astype(np.float64) - cx) * z / fx
@@ -226,13 +240,15 @@ def fill_sparse_depth(depth: Array, radius_px: int) -> Array:
 
 
 def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance: float = 0.05) -> Array:
-    """Reject background clutter within a loose detection (box-only, no mask):
+    """Reject depth outliers within a detection region:
     keep only points whose depth lies within ``mad_factor`` median-absolute-
     deviations of the region's median depth. A detector's box commonly
     includes some background around the object's true silhouette (especially
     without SAM-style mask refinement); back-projecting the whole box would
     otherwise pull the fused 3D point set -- and hence the object's centroid
-    and bbox3d -- toward whatever surface is behind it.
+    and bbox3d -- toward whatever surface is behind it. Masked detections can
+    opt into the same gate for mismatched depth pixels, with the tradeoff that
+    a single median may exclude real parts of an object extending in depth.
     """
     if depths.size == 0:
         return np.zeros(0, dtype=bool)
@@ -240,6 +256,43 @@ def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance
     mad = np.median(np.abs(depths - median))
     tolerance = max(mad_factor * mad, min_tolerance)
     return np.abs(depths - median) <= tolerance
+
+
+def foreground_depth_mask(
+    depths: Array, gap_m: float, min_points: int = 5, min_fraction: float = 0.1,
+    *, pixels: Array | None = None, min_span: Array | None = None,
+) -> Array:
+    """Keep the nearest supported depth layer, even when background dominates.
+
+    Split sorted positive, finite sensor readings at depth gaps larger than
+    ``gap_m``. Ignore isolated returns and select the first layer supported by
+    both ``min_points`` and ``min_fraction`` of valid readings. No supported
+    layer means unknown geometry. Call before filling sparse depth: invented
+    neighbours must not count as independent support. This is intended for
+    compact foreground objects, not structures extending through many depths.
+    Optional image coordinates and minimum spans require each candidate to
+    cover the silhouette in both image axes, rather than just its feet.
+    """
+    keep = np.zeros(depths.shape, dtype=bool)
+    valid_indices = np.flatnonzero(np.isfinite(depths) & (depths > 0))
+    if valid_indices.size == 0:
+        return keep
+    order = valid_indices[np.argsort(depths[valid_indices], kind="stable")]
+    splits = np.flatnonzero(np.diff(depths[order]) > gap_m) + 1
+    boundaries = np.concatenate(([0], splits, [order.size]))
+    required = max(min_points, int(np.ceil(min_fraction * order.size)))
+    supported = np.flatnonzero(np.diff(boundaries) >= required)
+    for i in supported:
+        indices = order[boundaries[i]:boundaries[i + 1]]
+        if min_span is not None:
+            if pixels is None:
+                raise ValueError("pixels are required with min_span")
+            span = np.diff(np.percentile(pixels[indices], [5, 95], axis=0), axis=0)[0] + 1
+            if np.any(span < min_span):
+                continue
+        keep[indices] = True
+        break
+    return keep
 
 
 def iou_xyxy(box_a: Array, box_b: Array) -> float:
@@ -259,8 +312,14 @@ def iou_xyxy(box_a: Array, box_b: Array) -> float:
     return float(inter_area / union)
 
 
-def bbox3d_from_points(points: Array) -> Array:
+def bbox3d_from_points(points: Array, trim_percentile: float = 0.0) -> Array:
     """Axis-aligned 3D bounding box [xmin, ymin, zmin, xmax, ymax, zmax] for a point set."""
+    if not 0.0 <= trim_percentile < 50.0:
+        raise ValueError("bbox trim percentile must be in [0, 50)")
+    if trim_percentile > 0:
+        # Optional robust bounds: sparse depth outliers must not drag the
+        # association prior and reported object center across the whole room.
+        return np.percentile(points, [trim_percentile, 100.0 - trim_percentile], axis=0).reshape(6)
     mins = points.min(axis=0)
     maxs = points.max(axis=0)
     return np.concatenate([mins, maxs])
