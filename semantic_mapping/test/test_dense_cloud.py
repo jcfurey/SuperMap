@@ -344,16 +344,16 @@ def test_packed_pairs_give_row_wise_unique_rows_and_counts():
     assert _unique_pairs(np.zeros(0, np.int64), np.zeros(0, np.int32)).shape == (0, 2)
 
 
-def test_kdtree_workers_is_validated_and_does_not_change_results():
+def test_workers_is_validated_and_does_not_change_results():
     for bad in (0, -2, True, 1.5):
-        with pytest.raises(ValueError, match="kdtree_workers"):
-            DenseCloudConfig(kdtree_workers=bad)
+        with pytest.raises(ValueError, match="workers"):
+            DenseCloudConfig(workers=bad)
     rng = np.random.default_rng(2)
     cloud = np.column_stack([rng.uniform(0, 4, 3000), rng.uniform(0, 4, 3000), rng.normal(0, .005, 3000)])
     cloud[:1000, 2] = rng.uniform(0, 1, 1000)
     results = []
     for workers in (1, 2, -1):
-        pipeline = make_pipeline(kdtree_workers=workers, label_propagation_radius=.2)
+        pipeline = make_pipeline(workers=workers, label_propagation_radius=.2)
         pipeline.update(cloud, 1.)
         results.append(pipeline.update(cloud + [[.01, 0, 0]], 2.))
     for other in results[1:]:

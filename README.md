@@ -44,12 +44,13 @@
 ## Repository layout
 
 This fork ([jcfurey/SuperMap](https://github.com/jcfurey/SuperMap), upstream
-[superxslam/SuperMap](https://github.com/superxslam/SuperMap)) holds two colcon packages:
+[superxslam/SuperMap](https://github.com/superxslam/SuperMap)) holds three colcon packages:
 
 | path | package | contents |
 |---|---|---|
 | `semantic_mapping/` | `semantic_mapping` (ament_python) | the library (`semantic_mapping/semantic_mapping/`), ROS 2 nodes, `launch/`, `config/`, `examples/`, `test/` |
 | `supermap_msgs/` | `supermap_msgs` (ament_cmake) | `MaskDetection`, `CameraAnnotations`, `Region`, `RegionArray`; `SaveMap`, `LoadMap` services; `GroundInstruction` action |
+| `supermap_kernels/` | `supermap_kernels` (ament_cmake, C++/pybind11) | optional compiled kernels: dense-cloud surface graph and depth splatting (see [Compiled kernels](#compiled-kernels)) |
 
 Offline commands below run from `semantic_mapping/`. Licensed MIT (see `LICENSE`).
 
@@ -65,6 +66,7 @@ conda install cuda -c nvidia/label/cuda-12.4.0
 export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
 
 pip install -r requirements.txt
+pip install ../supermap_kernels   # optional compiled kernels; needs a C++17 compiler (see Compiled kernels)
 ```
 
 ## Run (offline)
@@ -116,7 +118,7 @@ Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--confi
 
 ```bash
 # Clone this repository into your workspace src/, then:
-colcon build --packages-select supermap_msgs semantic_mapping && source install/setup.bash
+colcon build --packages-select supermap_msgs supermap_kernels semantic_mapping && source install/setup.bash
 ros2 launch semantic_mapping semantic_mapping.launch.py                       # autostart: configures + activates itself
 ros2 launch semantic_mapping semantic_mapping.launch.py namespace:=robot1 use_sim_time:=true
 ros2 launch semantic_mapping semantic_mapping.launch.py autostart:=false      # let nav2_lifecycle_manager drive it
@@ -257,7 +259,7 @@ The image builds both packages in `/workspace` and starts in the package
 directory. `cv2` comes from apt `python3-opencv`; the pip `opencv-python` that
 ultralytics pulls in is removed so it cannot shadow it.
 
-Continuous integration (`.github/workflows/ci.yml`, on pushes to `master`/`main`/`dev` and on pull requests) runs the unit tests on Python 3.11 and 3.12, the offline pipeline with a metric regression gate on the synthetic scene (detection recall, change recall, final-map F1, mIoU, mAP50), and builds the lite image to run `colcon build` + `colcon test` (unit, ROS 2 end-to-end and ament linter tests), the offline example, and the launch file under ROS 2 Jazzy.
+Continuous integration (`.github/workflows/ci.yml`, on pushes to `master`/`main`/`dev` and on pull requests) runs the unit tests on Python 3.11 and 3.12 (with the compiled kernels, and again on the NumPy/SciPy fallback), the offline pipeline with a metric regression gate on the synthetic scene (detection recall, change recall, final-map F1, mIoU, mAP50), and builds the lite image to run `colcon build` + `colcon test` (unit, ROS 2 end-to-end and ament linter tests), the offline example, and the launch file under ROS 2 Jazzy.
 
 Tests locally (from `semantic_mapping/`): `python3 -m pytest test -q` without ROS;
 with ROS sourced, `python3 -m pytest test -q -p no:launch_testing -p no:launch_ros`
@@ -400,6 +402,28 @@ Back-projection (17 ms), the geometric-consistency update over all instance poin
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
 ```
+
+### Compiled kernels
+
+`supermap_kernels` reimplements the hottest NumPy/SciPy loops in C++ (pybind11,
+OpenMP when available): the dense-cloud surface graph (normals, edges,
+connected components, incremental updates) and the footprint z-buffer that
+occlusion-aware LiDAR rasterization and dense camera labelling share. colcon
+builds it with the workspace; offline, `pip install ./supermap_kernels` (from the
+repository root). Without it everything runs on the NumPy/SciPy code, which
+stays the reference: the tests compare every kernel with it, and CI runs the
+suite on both. The z-buffer is bit-identical; the surface graph gives the same
+regions and labels except where equally distant neighbours tie for a voxel's
+k-th neighbour (SciPy breaks such ties by its tree layout, the kernels by point
+index). `SUPERMAP_NATIVE_KERNELS=0` or the dense node's `native_kernels: false`
+selects the fallback, and the dense result reports the backend in
+`stats["segmentation_backend"]`.
+
+On a 4-core Xeon, a 1M-point dense snapshot (630k voxels) segments in about
+1.7 s with the kernels and 7.9 s without, and an update after a local change
+takes 1.6 s instead of 2.6 s. Occlusion-aware rasterization of a 131k-point
+LiDAR scan takes 10 ms instead of 27 ms at 640x480 (17 instead of 25 ms at
+1920x1200, where it already splats on a coarser grid).
 
 ### Persist the map (living memory across sessions)
 

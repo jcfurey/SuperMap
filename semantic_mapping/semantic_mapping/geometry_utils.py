@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from semantic_mapping import native
+
 Array = np.ndarray
 
 
@@ -222,6 +224,8 @@ def splat_depth_buffer(us: Array, vs: Array, z: Array, focal: float, width: int,
     surface. ``us``/``vs`` are integer pixel indices inside the image. Unset
     pixels hold +inf; ``radius_m <= 0`` returns all +inf.
     """
+    if native.kernels is not None:  # the same buffer, computed in one pass per point
+        return native.kernels.splat_depth_buffer(us, vs, z, focal, width, height, radius_m, max_px)
     buffer = np.full(width * height, np.inf)
     if radius_m <= 0 or not len(z):
         return buffer
