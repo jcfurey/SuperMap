@@ -1,0 +1,32 @@
+dense_cloud_mapping:
+  ros__parameters:
+    # snapshot: each message is an authoritative accumulated map/submap.
+    # scan: union registered scans into a persistent world-voxel map.
+    input_mode: snapshot
+    cloud_topic: /points
+    world_frame: map
+    output_cloud_topic: /supermap/dense_cloud
+    voxel_map_topic: /supermap/voxel_map
+    regions_topic: /supermap/regions
+    publish_voxel_map: true
+
+    # Optional camera annotations. No camera or RGB message is needed for geometry.
+    # The tunnel bag is Ouster + Lucid. D435i is a separate indoor depth source.
+    # Messages describe manual masks; this node loads no learned models.
+    camera_annotations_topic: /supermap/camera_annotations
+    camera_info_topic: ""  # optional when annotations include calibrated intrinsics
+
+    voxel_size: 0.05
+    neighbor_radius: 0.15
+    normal_radius: 0.20
+    max_neighbors: 24
+    normal_angle_deg: 25.0
+    plane_tolerance: 0.04
+    min_region_voxels: 4
+    max_map_voxels: 500000  # explicit error at capacity, never a silent crop
+    chunk_size: 4096
+    camera_depth_tolerance: 0.05
+    max_camera_time_delta: 0.20  # image capture time, not annotation arrival time
+    min_camera_score: 0.5
+    label_propagation_radius: 0.0  # metres; 0 keeps unseen geometry semantically unknown
+    label_ttl_sec: 0.0  # 0 preserves labels on surviving world voxels indefinitely

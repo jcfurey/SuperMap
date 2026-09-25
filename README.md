@@ -57,6 +57,11 @@ pip install -r requirements.txt
 
 ## Run (offline)
 
+For full dense clouds with partial or absent camera coverage, use the separate
+[dense-cloud pipeline](doc/dense-cloud-partial-camera.md). It supports accumulated
+map snapshots and registered scans, preserves the complete incoming point cloud,
+and adds optional visibility-tested manual camera labels without loading models.
+
 ```bash
 python examples/prepare_example_dataset.py   # generate a synthetic demo sequence (one-time)
 python examples/example.py                   # run the mapping pipeline
