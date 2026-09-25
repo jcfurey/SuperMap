@@ -108,6 +108,8 @@ python examples/evaluate.py --data_dir scans/scene0000_00 --frame_skip 10 --dete
 
 Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--config <yaml>`, `--prompts <yaml>`, `--live` (rerun window).
 
+`evaluate.py --ablation` re-runs the sequence with each module of the Sec. V-E ablation switched off (`use_2d_tracker`, `use_semantic_fusion`, `use_geometric_consistency`) and prints the final-map precision / recall / F1 of each, as in Table V. On the synthetic scene only the geometric-consistency update changes the final map (precision 0.89 → 0.67, because removed objects are never retired): its labels never flicker and its motion is gentle enough for 3D association alone, so the tracker and fusion ablations need a real capture to separate.
+
 ## Run (live ROS2)
 
 ```bash

@@ -118,3 +118,36 @@ def test_d21_a_relocation_on_appearance_alone_must_be_plausible():
     assert association.reidentify([same_place], ["chair"], other, [retired], now=1.0)[0].matches == [(0, 0)]
     moved = same_place + np.array([3.0, 0, 0] * 2)
     assert association.reidentify([moved], ["chair"], other, [retired], now=1.0)[0].matches == []
+
+
+# ------------------------------------------------------------------ D27
+def _run(config, frames):
+    pipeline = SemanticMappingPipeline(config)
+    for i, (label, depth) in enumerate(frames):
+        result = pipeline.process_frame(_obs(i * 0.1, [_det(label)] if label else [], depth=depth))
+    return pipeline, result
+
+
+def test_d27_without_geometric_consistency_a_removed_object_is_never_retired():
+    frames = [("chair", 2.0)] * 3 + [(None, None)] * 6  # then the chair is gone: background at 8 m
+    with_gc, _ = _run(PipelineConfig(), frames)
+    without, _ = _run(PipelineConfig(use_geometric_consistency=False), frames)
+    assert next(iter(with_gc.object_map.objects.values())).status == ObjectStatus.DISAPPEARED
+    assert next(iter(without.object_map.objects.values())).status != ObjectStatus.DISAPPEARED
+
+
+def test_d27_without_semantic_fusion_the_latest_label_wins():
+    frames = [("chair", 2.0)] * 3 + [("armchair", 2.0)]
+    fused, _ = _run(PipelineConfig(), frames)
+    latest, _ = _run(PipelineConfig(use_semantic_fusion=False), frames)
+    assert next(iter(fused.object_map.objects.values())).label == "chair"
+    (instance,) = latest.object_map.objects.values()
+    assert instance.label_belief == {"armchair": 1.0}
+
+
+def test_d27_without_the_2d_tracker_association_runs_in_3d(monkeypatch):
+    calls = []
+    monkeypatch.setattr(association, "associate", lambda *a, **k: calls.append(1))
+    pipeline, result = _run(PipelineConfig(use_2d_tracker=False), [("chair", 2.0)] * 4)
+    assert not calls and len(pipeline.object_map.objects) == 1
+    assert result.detection_instance_ids == [next(iter(pipeline.object_map.objects))]

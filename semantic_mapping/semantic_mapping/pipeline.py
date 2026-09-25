@@ -172,6 +172,15 @@ class PipelineConfig:
     label-gated association stages to fuse it there, and that a shared label
     must hold in both instances for them to merge or reconcile
     (association.labels_compatible). The relabelling stage is not label-gated."""
+    use_2d_tracker: bool = True
+    """Table V ablation switch ("W/o 2D Tracker"): False associates in 3D only
+    (re-activation and re-identification); the 2D stages and relabelling are skipped."""
+    use_semantic_fusion: bool = True
+    """Table V ablation switch ("W/o Semantic Fusion"): False keeps the latest
+    detection's label instead of Eq. (10) and skips per-point membership pruning."""
+    use_geometric_consistency: bool = True
+    """Table V ablation switch ("W/o Geometric Consistency Update"): False skips
+    Eq. (7)-(9); map points are never judged or pruned and objects never retire by geometry."""
     match_max_gap_m: float = 1.0
     """2D→3D validation (Fig. 2): a 2D match whose detection lifts farther than
     this from the instance's box is split (association.split_depth_inconsistent).
@@ -366,6 +375,8 @@ class SemanticMappingPipeline:
             existence_miss_penalty=self.config.existence_miss_penalty,
             existence_cull_log_odds=self.config.existence_cull_log_odds,
             existence_max_log_odds=self.config.existence_max_log_odds,
+            geometric_consistency=self.config.use_geometric_consistency,
+            semantic_fusion=self.config.use_semantic_fusion,
         )
         self._frame_index = 0
         self._last_stamp: float | None = None
@@ -749,25 +760,30 @@ class SemanticMappingPipeline:
         high = [i for i, d in enumerate(detections) if d.score >= cfg.high_score_threshold]
         low = [i for i, d in enumerate(detections) if d.score < cfg.high_score_threshold]
 
-        # Stage 1: 2D, high-confidence detections, gated by motion and label.
-        stage1 = association.associate(
-            predicted_tracks, predicted_bboxes, detection_bboxes,
-            iou_threshold=cfg.association_iou_threshold, candidate_tracks=visible_indices,
-            candidate_detections=high, track_label_beliefs=track_beliefs, detection_labels=detection_labels,
-            label_min_mass=cfg.label_compatibility_min_mass,
-        )
-        self._refuse_oversized(stage1, live_objects, detections, det_points)
-        self._split_depth_inconsistent(stage1, live_objects, det_boxes3d)
-        # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no motion gate.
-        stage2 = association.associate(
-            predicted_tracks, predicted_bboxes, detection_bboxes,
-            iou_threshold=cfg.low_score_iou_threshold, use_mahalanobis_gate=False,
-            candidate_tracks=stage1.unmatched_tracks, candidate_detections=low,
-            track_label_beliefs=track_beliefs, detection_labels=detection_labels,
-            label_min_mass=cfg.label_compatibility_min_mass,
-        )
-        self._refuse_oversized(stage2, live_objects, detections, det_points)
-        self._split_depth_inconsistent(stage2, live_objects, det_boxes3d)
+        if cfg.use_2d_tracker:
+            # Stage 1: 2D, high-confidence detections, gated by motion and label.
+            stage1 = association.associate(
+                predicted_tracks, predicted_bboxes, detection_bboxes,
+                iou_threshold=cfg.association_iou_threshold, candidate_tracks=visible_indices,
+                candidate_detections=high, track_label_beliefs=track_beliefs, detection_labels=detection_labels,
+                label_min_mass=cfg.label_compatibility_min_mass,
+            )
+            self._refuse_oversized(stage1, live_objects, detections, det_points)
+            self._split_depth_inconsistent(stage1, live_objects, det_boxes3d)
+            # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no motion gate.
+            stage2 = association.associate(
+                predicted_tracks, predicted_bboxes, detection_bboxes,
+                iou_threshold=cfg.low_score_iou_threshold, use_mahalanobis_gate=False,
+                candidate_tracks=stage1.unmatched_tracks, candidate_detections=low,
+                track_label_beliefs=track_beliefs, detection_labels=detection_labels,
+                label_min_mass=cfg.label_compatibility_min_mass,
+            )
+            self._refuse_oversized(stage2, live_objects, detections, det_points)
+            self._split_depth_inconsistent(stage2, live_objects, det_boxes3d)
+        else:
+            # Table V "W/o 2D Tracker": only the 3D stages associate.
+            stage1 = association.AssociationResult(unmatched_tracks=list(visible_indices), unmatched_detections=high)
+            stage2 = association.AssociationResult(unmatched_tracks=list(visible_indices))
         # Stage 3: 3D-aware re-activation for high-confidence detections still unmatched.
         stage3 = association.associate_3d(
             det_boxes3d, detection_labels, live_objects,
@@ -779,7 +795,8 @@ class SemanticMappingPipeline:
         # Stage 4, relabelling: the same object under a label it has not taken yet (Eq. 10 decides).
         relabel = association.associate_relabel(
             predicted_tracks, predicted_bboxes, detection_bboxes, det_boxes3d, live_objects,
-            iou_threshold=cfg.association_iou_threshold, min_overlap=cfg.relabel_min_overlap,
+            iou_threshold=cfg.association_iou_threshold,
+            min_overlap=cfg.relabel_min_overlap if cfg.use_2d_tracker else 0.0,
             pad=cfg.voxel_size / 2, candidate_tracks=stage3.unmatched_tracks,
             candidate_detections=stage3.unmatched_detections,
         )

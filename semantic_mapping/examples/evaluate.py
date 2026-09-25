@@ -4,6 +4,7 @@
     python examples/evaluate.py                                        # synthetic scene, all metrics
     python examples/evaluate.py --data_dir scans/scene0000_00 --frame_skip 10 --detector yoloe   # ScanNet
     python examples/evaluate.py --json results.json                    # also dump machine-readable results
+    python examples/evaluate.py --ablation                             # plus the Table V module ablation
 
 Which metrics run depends on the ground truth the sequence carries:
 
@@ -16,6 +17,10 @@ Which metrics run depends on the ground truth the sequence carries:
   mIoU / f-mIoU / accuracy with and without background (Table II) and
   instance-level AP25 / AP50 per class (Table III)
   (semantic_mapping/segmentation_metrics.py).
+
+``--ablation`` re-runs the sequence with each module of Sec. V-E switched off
+(2D tracker, semantic fusion, geometric consistency update) and reports the
+final-map precision / recall / F1 of each, as in Table V.
 """
 from __future__ import annotations
 
@@ -32,6 +37,31 @@ from semantic_mapping import evaluation, segmentation_metrics as seg  # noqa: E4
 from semantic_mapping.datasets import load_dataset, load_prompts, load_yaml_params, run_sequence  # noqa: E402
 from semantic_mapping.detectors import build_detector  # noqa: E402
 from semantic_mapping.pipeline import PipelineConfig, SemanticMappingPipeline  # noqa: E402
+
+ABLATIONS = [
+    ("W/o 2D Tracker", {"use_2d_tracker": False}),
+    ("W/o Semantic Fusion", {"use_semantic_fusion": False}),
+    ("W/o Geometric Consistency Update", {"use_geometric_consistency": False}),
+    ("All (proposed)", {}),
+]
+"""Table V configurations: PipelineConfig overrides of the configured parameters."""
+
+
+def run_temporal(dataset, detector, prompts, params: dict, temporal_gt, args):
+    """One pass over the sequence; returns the evaluator (Sec. V-D / V-E) and the last frame result."""
+    pipeline = SemanticMappingPipeline(PipelineConfig.from_dict(params))
+    evaluator = None
+    if temporal_gt is not None:
+        evaluator = evaluation.SequenceEvaluator(
+            temporal_gt, dataset.intrinsics, iou_threshold=args.iou, centroid_threshold=args.centroid,
+            stale_after_sec=args.stale_after,
+        )
+    result = None
+    for frame, _detections, result in run_sequence(dataset, pipeline, detector, prompts):
+        if evaluator is not None:
+            evaluator.observe(frame.frame_id, frame.T_world_from_cam, result.objects, depth_image=frame.depth,
+                              stamp=frame.stamp)
+    return evaluator, result
 
 
 def main() -> None:
@@ -55,6 +85,8 @@ def main() -> None:
                         help="Score occluded instances unseen for longer than this many seconds at the end as unknown "
                              "(neither present nor a false positive); default: the paper's convention (present).")
     parser.add_argument("--no_segmentation", action="store_true", help="Skip the Sec. V-B metrics.")
+    parser.add_argument("--ablation", action="store_true",
+                        help="Also run the Table V ablation (needs scene_ground_truth.json).")
     parser.add_argument("--json", type=Path, default=None, help="Write all results to this JSON file too.")
     args = parser.parse_args()
 
@@ -73,19 +105,7 @@ def main() -> None:
         detector = build_detector("offline", detections_dir=dataset.detections_dir)
     else:
         detector = build_detector(args.detector, **params.get(args.detector, {}))
-    pipeline = SemanticMappingPipeline(PipelineConfig.from_dict(params))
-
-    evaluator = None
-    if temporal_gt is not None:
-        evaluator = evaluation.SequenceEvaluator(
-            temporal_gt, dataset.intrinsics, iou_threshold=args.iou, centroid_threshold=args.centroid,
-            stale_after_sec=args.stale_after,
-        )
-    result = None
-    for frame, _detections, result in run_sequence(dataset, pipeline, detector, prompts):
-        if evaluator is not None:
-            evaluator.observe(frame.frame_id, frame.T_world_from_cam, result.objects, depth_image=frame.depth,
-                              stamp=frame.stamp)
+    evaluator, result = run_temporal(dataset, detector, prompts, params, temporal_gt, args)
 
     results: dict = {"frames": len(dataset), "data_dir": str(dataset.data_dir)}
     print(f"Evaluated {len(dataset)} frames from {dataset.data_dir}")
@@ -111,6 +131,21 @@ def main() -> None:
         results["segmentation"] = report
         print(f"\n== Segmentation quality (Sec. V-B): {segmentation_gt.points.shape[0]} annotated points ==\n")
         print(seg.format_segmentation_report(report))
+
+    if args.ablation and temporal_gt is not None:
+        rows = {}
+        for name, overrides in ABLATIONS:
+            if overrides:
+                ablated, _ = run_temporal(dataset, detector, prompts, {**params, **overrides}, temporal_gt, args)
+                final = ablated.summary()["final_map"]
+            else:
+                final = results["temporal"]["final_map"]
+            rows[name] = {"precision": final["precision"], "recall": final["recall"], "f1": final["f1"]}
+        results["ablation"] = rows
+        print("\n== Module ablation (Sec. V-E, Table V): final-map precision / recall / F1 ==\n")
+        print(f"{'configuration':<34} {'precision':>9} {'recall':>7} {'F1':>7}")
+        for name, row in rows.items():
+            print(f"{name:<34} {row['precision']:>9.4f} {row['recall']:>7.4f} {row['f1']:>7.4f}")
 
     if args.json is not None:
         args.json.write_text(json.dumps(results, indent=2))

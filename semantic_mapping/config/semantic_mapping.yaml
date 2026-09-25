@@ -188,6 +188,10 @@
     min_observations_for_confidence_check: 5
     min_hits_to_confirm: 2
     tentative_max_age: 10                  # missed detector observations; geometry-only frames do not count
+    # Table V ablation switches (Sec. V-E; examples/evaluate.py --ablation). All true is the full system.
+    use_2d_tracker: true                   # false: associate in 3D only (re-activation, re-identification)
+    use_semantic_fusion: true              # false: latest detection's label, no Eq. (10), no membership pruning
+    use_geometric_consistency: true        # false: no Eq. (7)-(9); points never pruned, objects never retired
     # Staged association (Sec. IV-B): 2D high-confidence -> 2D low-confidence
     # (ByteTrack) -> 3D-aware re-activation -> relabelling -> re-identification -> spawn.
     association_iou_threshold: 0.3

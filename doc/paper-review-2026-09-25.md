@@ -130,4 +130,19 @@ tests for each item are in `test/test_paper_review_2026_09_25.py`.
     The cost is that a *neutral* object at half the light drops to 0.70. Its relocation is then not claimed, so it gets a new ID, which is the safe direction (Fig. 3). The descriptor grows from 64 to 67 dimensions. Descriptors of different dimension are now treated as not comparable, so older saved maps still re-identify by place; before, they would have been vetoed as dissimilar.
   - **Plausibility.** A relocation claimed on appearance alone must also be plausible: within `reconcile_max_distance_m` (10 m) of where the instance was, and within `reconcile_max_gap_sec` (120 s) of when it was last seen. These are the bounds `reconcile_retired` already applied. Re-identification in the old place is unaffected. A lookalike that turns up far away or much later is a new object.
   - Synthetic-scene metrics are unchanged, and both identities (moved and returned) are still kept.
-- **Open:** D5–D20 and D22–D28.
+- **D27 fixed.** `PipelineConfig.use_2d_tracker`, `use_semantic_fusion` and `use_geometric_consistency` (all true by default) switch off one module each, and `examples/evaluate.py --ablation` prints the Table V precision / recall / F1:
+
+  | Configuration | Precision | Recall | F1 |
+  |---|---|---|---|
+  | W/o 2D Tracker | 0.889 | 1.000 | 0.941 |
+  | W/o Semantic Fusion | 0.889 | 1.000 | 0.941 |
+  | W/o Geometric Consistency Update | 0.667 | 1.000 | 0.800 |
+  | All | 0.889 | 1.000 | 0.941 |
+
+  - The switches take these readings:
+    - Without the tracker, association runs only in 3D, by re-activation and re-identification.
+    - Without fusion, the latest detection's label replaces the belief, and per-point membership pruning is skipped.
+    - Without geometric consistency, Eq. 7–9 are skipped. Points are never judged or pruned, and objects are never retired by geometry.
+  - On the synthetic scene only the geometric-consistency switch changes the final map. Its labels never flicker, and its motion is gentle enough for 3D association alone: without the tracker, all 191 matches go through 3D re-activation with the same IDs. The Table V comparison therefore needs a real capture.
+  - The Sec. V-E metric is still computed on the final frame only.
+- **Open:** D5–D20, D22–D26 and D28.

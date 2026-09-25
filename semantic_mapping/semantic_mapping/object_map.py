@@ -117,6 +117,8 @@ class ObjectMap:
         existence_miss_penalty: float = 1.0,
         existence_cull_log_odds: float = -3.0,
         existence_max_log_odds: float = 6.0,
+        geometric_consistency: bool = True,
+        semantic_fusion: bool = True,
     ) -> None:
         self.voxel_size = voxel_size
         self.tau_eps = tau_eps
@@ -158,6 +160,12 @@ class ObjectMap:
         self.existence_miss_penalty = existence_miss_penalty
         self.existence_cull_log_odds = existence_cull_log_odds
         self.existence_max_log_odds = existence_max_log_odds
+        self.geometric_consistency = geometric_consistency
+        """Table V ablation switch: False skips Eq. (7)-(9), so map points are never judged or pruned and
+        no object is retired by geometry."""
+        self.semantic_fusion = semantic_fusion
+        """Table V ablation switch: False replaces Eq. (10) with the latest detection's label and skips the
+        per-point mask-membership pruning."""
         self.stats = {"size_rejected_observations": 0, "size_refused_associations": 0, "size_refused_merges": 0,
                       "mask_completions": 0, "ground_contact_completions": 0,
                       "support_culled_points": 0, "existence_culled": 0,
@@ -387,7 +395,7 @@ class ObjectMap:
         ``in_view`` passes a visibility verdict computed in batch by the
         caller; ``None`` runs the per-instance test here.
         """
-        if instance.points_world.shape[0] == 0 or depth_image is None:
+        if instance.points_world.shape[0] == 0 or depth_image is None or not self.geometric_consistency:
             return False
         if in_view is False:
             return False
@@ -400,7 +408,7 @@ class ObjectMap:
         )
         observable = states == gc.GeometricState.OBSERVABLE
         instance.point_log_odds = log_odds
-        if detection is not None:
+        if detection is not None and self.semantic_fusion:
             inside = _inside_detection(pixels, detection, self.membership_margin_px)
             instance.point_membership = sf.update_point_membership(instance.point_membership, observable, inside)
 
@@ -535,10 +543,13 @@ class ObjectMap:
         elif dynamic and instance.status != ObjectStatus.TENTATIVE:
             instance.status = ObjectStatus.OCCLUDED
 
-        instance.label_belief = sf.bayesian_label_update(
-            instance.label_belief, detection.label, detection.score,
-            p_self=sf.P_SELF_CORROBORATED if corroborated else sf.P_SELF)
-        instance.label_belief = sf.prune_low_confidence_labels(instance.label_belief)
+        if self.semantic_fusion:
+            instance.label_belief = sf.bayesian_label_update(
+                instance.label_belief, detection.label, detection.score,
+                p_self=sf.P_SELF_CORROBORATED if corroborated else sf.P_SELF)
+            instance.label_belief = sf.prune_low_confidence_labels(instance.label_belief)
+        else:
+            instance.label_belief = sf.new_belief(detection.label, detection.score)  # the latest detection decides
         if detection.embedding is not None:
             instance.embedding, instance.embedding_count = update_running_embedding(
                 instance.embedding, instance.embedding_count, detection.embedding)
@@ -619,7 +630,7 @@ class ObjectMap:
         """
         instance.frames_since_seen += 1
         observed = self._apply_evidence(instance, K, T_world_from_cam, depth_image, in_view=in_view)
-        if depth_image is None or instance.points_world.shape[0] == 0:
+        if depth_image is None or instance.points_world.shape[0] == 0 or not self.geometric_consistency:
             visible = in_view is not False
         else:
             visible = observed
