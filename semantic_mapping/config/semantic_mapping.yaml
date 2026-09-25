@@ -103,6 +103,26 @@
     offline:
       detections_dir: ""
 
+    # --- Platform (robot self) mask ------------------------------------------
+    # A camera on a vehicle sees the vehicle: hood, blade, cab, sensor mounts.
+    # Enabled, the robot's links from robot_description are rendered into each
+    # image at their TF poses (robot_state_publisher broadcasts every link);
+    # frames wait for the description and those transforms like any other TF.
+    # Detections mostly on the robot are dropped, the rest lose those pixels,
+    # and depth there is unknown: the camera cannot see the returns behind it.
+    platform_mask:
+      enabled: false
+      robot_description_topic: robot_description  # latched std_msgs/String (robot_state_publisher)
+      geometry: visual          # visual | collision; a link with none loadable uses the other kind
+      mesh_paths: []            # package://pkg/... is looked up as <path>/pkg/... and <path>/share/pkg/...
+                                # before the ament index; STL and OBJ built in, other formats need trimesh
+      mesh_resolution_m: 0.02   # simplify meshes by merging vertices within cells of this size; 0 keeps them
+      near_clip_m: 0.15         # geometry nearer the image plane is ignored (the camera's own housing and lens)
+      padding_px: 8             # dilate the mask for calibration and model error
+      exclude_links: []         # e.g. the camera's own housing link
+      frame_prefix: ""          # robot_state_publisher frame_prefix
+      max_overlap: 0.5          # drop a detection with more of its mask (box without one) on the robot
+
     # --- Pipeline / mapping parameters (Sec. IV-B, IV-C) ------------------
     voxel_size: 0.05                       # meters, per-object point fusion resolution
     min_depth_m: 0.0                      # optical depth limits; rejected readings carry no evidence

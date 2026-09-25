@@ -135,6 +135,7 @@ have separate callback groups, and one lock guards the map.
 | `camera/color/image_raw`, `camera/color/camera_info` | `sensor_msgs/Image` (or `CompressedImage`), `CameraInfo` | inputs, synchronized |
 | `lidar/points` or `camera/aligned_depth_to_color/image_raw` | `PointCloud2` / `Image` | depth source (`depth_source`) |
 | `odometry` | `nav_msgs/Odometry` | paces processing when `sync_odometry: true`; poses always come from TF |
+| `robot_description` | `std_msgs/String` (latched URDF) | robot self-mask input when `platform_mask.enabled`, see below |
 | `obj_points` | `sensor_msgs/PointCloud2` | label-coloured object points; latched, republished only when the map changes |
 | `obj_boxes` | `visualization_msgs/MarkerArray` | boxes + labels; latched; `DELETEALL` on start and on map load |
 | `objects` | `vision_msgs/Detection3DArray` | per object: `id` = instance ID, map-frame box, label hypotheses with belief scores; latched |
@@ -193,6 +194,35 @@ and `bbox_trim_percentile` gives robust per-axis bounds. Both default to zero
 and percentile bounds can trim thin extremities. The stationary D435i demo
 uses 0.15–6 m, a factor of 3, and 2nd–98th percentile bounds; see the
 [live validation report](doc/live-d435i-2026-09-24.md).
+
+A camera on a vehicle sees the vehicle itself: hood, blade, cab, sensor
+mounts. The detector labels them ("bulldozer", "truck"), and LiDAR depth lifts
+those masks onto the ground behind the body, so an object travels with the
+robot. `platform_mask.enabled: true` prevents this. The node subscribes to the
+URDF on `platform_mask.robot_description_topic` (latched, as
+`robot_state_publisher` publishes it) and renders every link's visual geometry
+(`platform_mask.geometry: collision` for the collision set) into each image at
+the link's TF pose at the image stamp, so articulated parts such as a blade
+follow their joint states. Frames wait for the description and link
+transforms like any other TF. A detection with more than
+`platform_mask.max_overlap` of its mask on the robot is dropped; others lose
+those pixels. Depth on the robot's pixels is unknown, neither lifted into a
+mask nor taken as evidence that an object behind the body is gone. The
+annotated image shows the masked region darkened. Boxes, cylinders, spheres
+and STL/OBJ meshes are supported, and other mesh formats load when `trimesh` is
+installed. `package://` meshes are looked up under `platform_mask.mesh_paths`
+(as `<path>/<pkg>/` or `<path>/share/<pkg>/`) before the ament index, so the
+robot's description package need not be built in this workspace. A link whose
+visual geometry cannot be loaded falls back to its collision geometry; every
+omission is logged. Geometry nearer than `platform_mask.near_clip_m` (0.15 m)
+to the image plane is ignored, as is a primitive enclosing the camera, so a
+camera's own housing and lens do not blank the view. List anything else under
+`platform_mask.exclude_links`. `dense_cloud_mapping_node` accepts the same
+parameters and applies the mask to every annotation source. Diagnostics count
+`platform_detections` (dropped) and `platform_unavailable` (frames skipped
+before a description arrived). The mask is only as accurate as the URDF, its
+meshes and the camera extrinsics; `platform_mask.padding_px` (8) absorbs small
+errors.
 
 `prompts_file` resolves a relative path against the package share directory
 (then the working directory), so the default works under `ros2 run`; a real

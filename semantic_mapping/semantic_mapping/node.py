@@ -73,6 +73,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from semantic_mapping.detectors import build_detector
 from semantic_mapping.geometry_utils import invert_se3, occlusion_grid_for, rasterize_depth, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
+from semantic_mapping.platform_mask import exclude_platform
 from semantic_mapping.ros_msgs import (
     camera_info_has_distortion, camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy, numpy_to_image,
     pointcloud_to_xyz, rectified_camera_info, transform_to_se3,
@@ -80,6 +81,7 @@ from semantic_mapping.ros_msgs import (
 from semantic_mapping.ros_node_utils import (
     AutostartLifecycleNode, TransitionCallbackReturn, declare, run_node, stable_label_color,
 )
+from semantic_mapping.ros_platform_mask import PlatformMaskSource, PlatformUnavailable, declare_platform_mask_parameters
 from semantic_mapping.types import CameraIntrinsics, Detection2D, ObjectStatus, Observation, StampedPose
 from semantic_mapping.vln.clients import build_vlm_client
 from semantic_mapping.vln.grounding import Grounder, GroundingRequest, GroundingResult
@@ -286,6 +288,8 @@ class _PendingFrame:
     annotate: bool = False
     camera_info: CameraInfo | None = None
     """Rectified calibration of this frame, kept only for the dense annotation export."""
+    platform_mask: np.ndarray | None = None
+    """Pixels showing the robot itself (platform_mask.enabled), for the annotated image."""
 
 
 @dataclass
@@ -457,6 +461,8 @@ class SemanticMappingNode(AutostartLifecycleNode):
         d("vlm.stale_after_sec", 30.0, "Occluded instances unseen longer than this are marked stale.",
           read_only=False)
 
+        declare_platform_mask_parameters(self)
+
         d("map_load_path", "", "Map directory restored on configure and by ~/load_map with an empty path.")
         d("map_save_path", "", "Map directory for ~/save_map with an empty path and for autosave.")
         d("map_autosave_sec", 0.0, "> 0: save to map_save_path every N seconds.")
@@ -587,6 +593,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self._jump_handle = None
         self._detection_ready = None
         self._detector_thread = self._grounding_thread = None
+        self._platform = None
 
         self.world_frame = self._param_str("world_frame", "map")
         self.camera_frame = self._param_str("camera_frame", "camera_color_optical_frame")
@@ -609,6 +616,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # The robot's own body in the image (hood, blade, sensor mounts) is
+        # neither an object nor a view of what lies behind it.
+        self._platform = PlatformMaskSource(self)
+        self._platform_max_overlap = self._platform.max_overlap
 
         self._scan_history = _ScanRing(int(self._param("pointcloud_accumulate_scans")))
         self._splat_radius_m = float(self._param("pointcloud_splat_radius_m"))
@@ -628,7 +639,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
 
         # The worker returns independent results so a late answer cannot
         # mutate an observation that has already been committed.
-        self._detection_jobs: queue.Queue[Observation] = queue.Queue(maxsize=1)
+        self._detection_jobs: queue.Queue[tuple[Observation, np.ndarray | None]] = queue.Queue(maxsize=1)
         self._detection_results: queue.Queue[tuple[int, list[Detection2D], float, bool]] = queue.Queue()
 
         # Language grounding (Sec. IV-D): requests snapshot and serialize the
@@ -647,7 +658,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self._stats = self._empty_stats()
         self._stats_since = time.monotonic()
         self._counters = {"out_of_order": 0, "invalid_input": 0, "tf_failures": 0, "detector_timeouts": 0,
-                          "time_jumps": 0, "failures": 0}
+                          "time_jumps": 0, "failures": 0, "platform_unavailable": 0, "platform_detections": 0}
         self._failures_by_stage: dict[str, int] = {}
 
         self.map_save_path = self._param_str("map_save_path")
@@ -747,6 +758,9 @@ class SemanticMappingNode(AutostartLifecycleNode):
         if getattr(self, "tf_listener", None) is not None:
             self.tf_listener.unregister()
             self.tf_listener = None
+        if self._platform is not None:
+            self._platform.destroy()
+            self._platform = None
         self.detector = None
 
     # ------------------------------------------------------------------ setup
@@ -940,7 +954,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self._last_diagnosed = counters
         if new["failures"]:
             stat.summary(DiagnosticStatus.ERROR, f"{new['failures']} processing failures since last report")
-        elif new["tf_failures"] or new["invalid_input"] or new["detector_timeouts"]:
+        elif new["tf_failures"] or new["invalid_input"] or new["detector_timeouts"] or new["platform_unavailable"]:
             stat.summary(DiagnosticStatus.WARN, "frames dropped since last report")
         elif not self._active:
             stat.summary(DiagnosticStatus.WARN, "inactive")
@@ -1391,16 +1405,23 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 T_world_from_cam = self._lookup_se3(self.world_frame, self.camera_frame, waiting.rgb.header.stamp)
                 T_world_from_cloud = None if self.depth_from_image else self._lookup_se3(
                     self.world_frame, waiting.depth.header.frame_id, waiting.depth.header.stamp)
-            except tf2_ros.TransformException as exc:
+                platform = self._platform.poses(self.tf_buffer, self.camera_frame, waiting.rgb.header.stamp) \
+                    if self._platform.enabled else None
+            except (tf2_ros.TransformException, PlatformUnavailable) as exc:
                 if (time.monotonic() - waiting.arrived < self._tf_wait_sec
                         and len(self._tf_waiting) <= self._max_pending_frames):
                     return
                 self._tf_waiting.popleft()
-                self._count("tf_failures")
-                self.get_logger().warning(f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
+                if isinstance(exc, PlatformUnavailable):
+                    self._count("platform_unavailable")
+                    self.get_logger().warning(f"platform mask unavailable, skipping frame: {exc}",
+                                              throttle_duration_sec=5.0)
+                else:
+                    self._count("tf_failures")
+                    self.get_logger().warning(f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
                 continue
             self._tf_waiting.popleft()
-            self._admit_frame(waiting, T_world_from_cam, T_world_from_cloud)
+            self._admit_frame(waiting, T_world_from_cam, T_world_from_cloud, platform)
 
     def _camera_intrinsics(self, info_msg: CameraInfo) -> tuple[CameraIntrinsics, CameraInfo]:
         """Intrinsics for projecting into the received image (C29).
@@ -1423,7 +1444,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
         return camera_info_to_intrinsics(info_msg, allow_distortion=False), info_msg
 
     def _admit_frame(self, waiting: _WaitingFrame, T_world_from_cam: np.ndarray,
-                     T_world_from_cloud: np.ndarray | None) -> None:
+                     T_world_from_cloud: np.ndarray | None, platform=None) -> None:
         rgb_msg, info_msg, depth_msg, stamp = waiting.rgb, waiting.info, waiting.depth, waiting.stamp
         detection_due = (self._detector_in_flight is None
                          and _rate_due(self._last_detector_stamp, stamp, self._detector_period_sec))
@@ -1443,6 +1464,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
             self._count("invalid_input")
             self.get_logger().error(f"invalid camera input: {exc}", throttle_duration_sec=5.0)
             return
+        platform_mask = None if platform is None else self._platform.render(*platform, intrinsics, self.camera_frame)
 
         if self.depth_from_image:
             # Depth already aligned to the RGB camera (e.g. an RGB-D driver's aligned stream).
@@ -1473,6 +1495,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 splat_radius_m=self._splat_radius_m, splat_max_px=self._splat_max_px,
                 occlusion_gap_m=self._occlusion_gap_m,
                 occlusion_grid_px=self._occlusion_grid_px or occlusion_grid_for(intrinsics.width, intrinsics.height))
+        if platform_mask is not None:
+            # The camera sees the robot there, not the returns behind it:
+            # unknown depth, neither lifted into masks nor evidence of absence.
+            depth = np.where(platform_mask, 0.0, depth)
 
         observation = Observation(
             stamp=stamp,
@@ -1487,21 +1513,22 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self._next_frame_id += 1
         self._last_input_stamp = stamp
         pending = _PendingFrame(observation, Header(stamp=rgb_msg.header.stamp, frame_id=rgb_msg.header.frame_id),
-                                camera_info=calibration if self.dense_annotations_pub is not None else None)
+                                camera_info=calibration if self.dense_annotations_pub is not None else None,
+                                platform_mask=platform_mask)
         self._pending_frames.append(pending)
         self._pending_by_id[observation.frame_id] = pending
 
         if detection_due:
             pending.detector_started_at = time.monotonic()
             self._detector_in_flight = observation.frame_id
-            self._detection_jobs.put(observation)
+            self._detection_jobs.put((observation, platform_mask))
             self._last_detector_stamp = _advance_schedule(
                 self._last_detector_stamp, stamp, self._detector_period_sec)
 
     def _detector_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                observation = self._detection_jobs.get(timeout=0.5)
+                observation, platform_mask = self._detection_jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
             evaluated = True
@@ -1514,6 +1541,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 )
                 for detection in detections:
                     detection.validate_mask((observation.intrinsics.height, observation.intrinsics.width))
+                if platform_mask is not None:
+                    detections, dropped = exclude_platform(detections, platform_mask, self._platform_max_overlap)
+                    with self._stats_lock:
+                        self._counters["platform_detections"] += dropped
             except Exception as exc:  # noqa: BLE001 - a detector failure must not kill the mapping loop
                 if self._stop_event.is_set():
                     return
@@ -1589,7 +1620,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 continue
             if pending.annotate:
                 try:
-                    self._publish_annotated_image(pending.observation, result, pending.header)
+                    self._publish_annotated_image(pending.observation, result, pending.header, pending.platform_mask)
                 except Exception as exc:  # noqa: BLE001
                     self._count_failure("annotated image", exc)
 
@@ -1656,7 +1687,8 @@ class SemanticMappingNode(AutostartLifecycleNode):
             return
         self.dense_annotations_pub.publish(msg)
 
-    def _publish_annotated_image(self, observation: Observation, result: FrameResult, header: Header) -> None:
+    def _publish_annotated_image(self, observation: Observation, result: FrameResult, header: Header,
+                                 platform_mask: np.ndarray | None = None) -> None:
         if observation.rgb is None or self.annotated_image_pub.get_subscription_count() == 0:
             return
         try:
@@ -1666,6 +1698,8 @@ class SemanticMappingNode(AutostartLifecycleNode):
             return
 
         image = np.ascontiguousarray(observation.rgb.copy())
+        if platform_mask is not None:
+            image[platform_mask] //= 3  # the robot itself: masked out of detections and depth
         for detection, instance_id in zip(observation.detections, result.detection_instance_ids):
             r, g, b = (int(c * 255) for c in _label_color(detection.label))
             x1, y1, x2, y2 = (int(round(v)) for v in detection.bbox)
