@@ -7,6 +7,12 @@ sensor reading. The resulting per-point evidence is fused recursively via a
 log-odds occupancy filter (Eq. 8), which is what lets SuperMap prune stale
 map content (occlusions, relocations, removals) without discarding points
 that are merely temporarily out of view.
+
+The paper's Gaussian sensor noise, p(Δd) ~ N(0, σ²), enters through the
+threshold τ_ε of Eq. 9: a residual within τ_ε (a few σ) is consistent with
+noise. The inverse sensor model P(o_k | Q_t) is then a constant per state
+(:func:`inverse_sensor_model`), not a function of Δd; the paper gives no
+other form (doc/paper-review-2026-09-25.md, D7).
 """
 from __future__ import annotations
 
@@ -49,12 +55,6 @@ def logit(p: float | np.ndarray) -> float | np.ndarray:
 
 def log_odds_to_prob(log_odds: float | np.ndarray) -> float | np.ndarray:
     return 1.0 / (1.0 + np.exp(-log_odds))
-
-
-def gaussian_likelihood(delta_d: np.ndarray, sigma: float) -> np.ndarray:
-    """p(delta_d) ~ N(0, sigma^2), the Gaussian sensor-noise model motivating tau_eps."""
-    sigma = max(sigma, 1e-6)
-    return np.exp(-0.5 * (delta_d / sigma) ** 2) / (sigma * np.sqrt(2.0 * np.pi))
 
 
 def project_and_classify(

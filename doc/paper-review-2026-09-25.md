@@ -145,4 +145,37 @@ tests for each item are in `test/test_paper_review_2026_09_25.py`.
     - Without geometric consistency, Eq. 7–9 are skipped. Points are never judged or pruned, and objects are never retired by geometry.
   - On the synthetic scene only the geometric-consistency switch changes the final map. Its labels never flicker, and its motion is gentle enough for 3D association alone: without the tracker, all 191 matches go through 3D re-activation with the same IDs. The Table V comparison therefore needs a real capture.
   - The Sec. V-E metric is still computed on the final frame only.
-- **Open:** D5–D20, D22–D26 and D28.
+- **D7 fixed.** The unused `gaussian_likelihood` is removed. The module now states that the paper's σ enters through τ_ε (a residual within τ_ε is consistent with sensor noise), and that P(o_k\|Q_t) is a constant for each state of Eq. 9, since the paper gives no other form.
+- **D12 fixed.**
+  - `on` keeps the paper's test (z_min(A) ≈ z_max(B) and IoU_xy > γ).
+  - It also holds when at least `scene_graph_on_min_footprint_fraction` (0.5) of A's footprint lies over B, so a mug on a 4 m table (IoU 0.0025) is on it. The IoU term alone rejected the paper's own motivating case of objects on tables, which left review item C15 open. 0 restores the literal test.
+  - The yaml comment now says the candidate radius is a box gap, not a centroid distance.
+- **D13 fixed.** An instance that moved more than once gets a timestamped path line in the prompt, e.g. `path: t=2.00s [..] -> t=5.00s [..] -> ...`. The path lists positions more than 0.5 m apart and is thinned to 8 points, first and last kept. Queries like Fig. 4's "where was the bag between T1 and T2" can now be answered. Temporal edges are still stored as per-node trajectories, an equivalent representation of E_t for a node whose ID is stable.
+- **D14 partly fixed.**
+  - A disappeared instance is marked `(disappeared)` on its own node line; before, only the separate temporal cue said so. The schema now describes the annotations the code actually writes.
+  - ROS goals remain approach poses: Nav2 needs a reachable pose, not the inside of an object. The offline `Grounder` returns centroids, as in the paper.
+- **D16 fixed for offline runs.**
+  - `run_sequence(..., detector_rate_hz=...)` and `evaluate.py --detector_rate_hz 1` detect at the paper's 1 Hz using the live node's scheduler (now `runtime.rate_due` / `advance_schedule`). The other frames are mapped from geometry alone.
+  - The default still detects on every frame, because the synthetic scene packs its changes into 6 s.
+  - The node keeps mapping at sensor rate: more frames give more evidence, and the paper's 3 Hz is a measured throughput, not a design parameter.
+- **D23–D26 documented.** The config comment above these options says how each departs from Eq. 8–9 when enabled. They stay off by default.
+
+**Kept as deliberate, with reasons:**
+
+| ID | Decision |
+|---|---|
+| D5 | YOLOE stays the default: it is the real-time detector the robots run. Reproduce Sec. V-B with `detector: groundingdino` and `groundingdino.sam2_checkpoint`. |
+| D6 | The projected box envelope, clipped to the image, matches detector boxes of partly visible objects better than the projected centroid; Eq. 5 remains the fallback. Overwriting the position reads "uses this projection as the prior" literally. |
+| D8 | LiDAR has to be rasterized to give a D(u). Splatting stops an offset LiDAR from making points look Disappeared through gaps between foreground returns. |
+| D9 | The paper does not say how per-point states become an object status. |
+| D10 | Eq. 10 is not gated on observability: sparse LiDAR frames often have no observable points, and relabelling (D1) needs the update to run. Per-point removal uses the 2D mask membership, a per-point reading of "remove object points whose posterior belief is too small". |
+| D11 | An open vocabulary has no calibrated confusion matrix; the two-level model is the stand-in. |
+| D15 | The defaults work with no API key: the keyword client, and the whole graph. Set `vlm.client` for a real model, and `vlm.local_radius_m` / `vlm.max_objects` for a local subgraph. |
+| D17 | The paper does not specify its label-transfer protocol. With D1 fixed, AP now ranks by a meaningful label confidence. |
+| D18 | Only visible frames count, since the camera cannot detect what it does not see. OCCLUDED instances count as detections because the map still holds the object. |
+| D19 | Ground exclusion stops LiDAR ground rings from taking an object's label. Set `ground_exclusion: false` for RGB-D, where object bottoms are clean. |
+| D20 | ByteTrack's split between spawning and extending tracks. Set `high_score_threshold` to the detector's own threshold to let every detection spawn. |
+| D22 | The platform mask is an opt-in extension. |
+| D28 | The paper's R⁸ variant is optional ("or R⁸"); it is not implemented. |
+
+Metrics on the synthetic scene are unchanged by this round.

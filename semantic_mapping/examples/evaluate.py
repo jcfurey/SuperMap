@@ -57,7 +57,8 @@ def run_temporal(dataset, detector, prompts, params: dict, temporal_gt, args):
             stale_after_sec=args.stale_after,
         )
     result = None
-    for frame, _detections, result in run_sequence(dataset, pipeline, detector, prompts):
+    for frame, _detections, result in run_sequence(dataset, pipeline, detector, prompts,
+                                                   detector_rate_hz=args.detector_rate_hz):
         if evaluator is not None:
             evaluator.observe(frame.frame_id, frame.T_world_from_cam, result.objects, depth_image=frame.depth,
                               stamp=frame.stamp)
@@ -74,6 +75,10 @@ def main() -> None:
     parser.add_argument("--eval_config", default="config/segmentation_eval.yaml",
                         help="Background classes, label aliases, and instance classes for the Sec. V-B metrics.")
     parser.add_argument("--frame_skip", type=int, default=1, help="Use every N-th frame (ScanNet is 30 Hz).")
+    parser.add_argument("--detector_rate_hz", type=float, default=0.0,
+                        help="Detect only at this rate by frame stamps (paper, Sec. V-H: 1 Hz); every other frame "
+                             "is mapped from geometry alone. 0 (default) detects on every frame, which the "
+                             "synthetic scene needs: it packs its changes into 6 s.")
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--iou", type=float, default=evaluation.DEFAULT_IOU_THRESHOLD,
                         help="3D IoU threshold for a Sec. V-D true positive (paper: 0.1).")

@@ -6,10 +6,12 @@ import numpy as np
 
 from semantic_mapping import association
 from semantic_mapping import evaluation as ev
+from semantic_mapping import scene_graph as sg
 from semantic_mapping.geometry_utils import bbox3d_gap, overlap_3d
 from semantic_mapping.pipeline import PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.types import ObjectStatus
 from test.helpers import make_object
+from semantic_mapping.vln import serialize_prompt as vp
 from test.test_review_2026_09_24 import INTRINSICS, _det, _obs
 
 
@@ -151,3 +153,63 @@ def test_d27_without_the_2d_tracker_association_runs_in_3d(monkeypatch):
     pipeline, result = _run(PipelineConfig(use_2d_tracker=False), [("chair", 2.0)] * 4)
     assert not calls and len(pipeline.object_map.objects) == 1
     assert result.detection_instance_ids == [next(iter(pipeline.object_map.objects))]
+
+
+# ------------------------------------------------------------------ D12
+def test_d12_a_mug_on_a_long_table_is_on_it():
+    table = make_object(1, "table", [0.0, 0.0, 0.0, 4.0, 1.0, 0.75])
+    mug = make_object(2, "mug", [3.8, 0.4, 0.75, 3.9, 0.5, 0.85])  # IoU_xy 0.0025
+    assert sg.SpatialEdge(2, "on", 1) in sg.build_spatial_edges([table, mug])
+    assert sg.build_spatial_edges([table, mug], on_min_footprint_fraction=0.0) == []  # the paper's IoU test alone
+    hanging = make_object(3, "mug", [3.95, 0.4, 0.75, 4.15, 0.5, 0.85])  # mostly past the table's end
+    assert not any(e.predicate == "on" for e in sg.build_spatial_edges([table, hanging]))
+
+
+# ------------------------------------------------------------------ D13, D14
+def test_d14_a_disappeared_node_is_marked_on_its_line():
+    plant = make_object(1, "plant", [0.0, 0.0, 0.0, 0.2, 0.2, 0.5], status=ObjectStatus.DISAPPEARED)
+    text = vp.serialize_subgraph_to_text([plant], sg.SceneGraph(node_ids=[1]), include_temporal_cues=False)
+    assert "Instance 1 (plant) at [0.10, 0.10, 0.25] (disappeared)" in text
+
+
+def test_d13_a_moving_object_gets_a_timestamped_path():
+    bag = make_object(4, "bag", [0.0, 0.0, 0.0, 0.3, 0.3, 0.3])
+    bag.first_seen_stamp = 0.0
+    bag.trajectory = [(t, np.array([x, 0.0, 0.15]), "active")
+                      for t, x in ((2.0, 0.0), (3.0, 0.1), (5.0, 2.0), (9.0, 4.0), (12.0, 4.05))]
+    text = vp.serialize_subgraph_to_text([bag], sg.SceneGraph(node_ids=[4]))
+    assert "moved from [0.00, 0.00, 0.15] at t=2.00s" in text
+    assert ("Instance 4 (bag) path: t=2.00s [0.00, 0.00, 0.15] -> t=5.00s [2.00, 0.00, 0.15] -> "
+            "t=9.00s [4.00, 0.00, 0.15]") in text
+    bag.trajectory = [(float(t), np.array([float(t), 0.0, 0.15]), "active") for t in range(2, 40)]
+    path = next(line for line in vp.serialize_subgraph_to_text([bag], sg.SceneGraph(node_ids=[4])).splitlines()
+                if "path:" in line)
+    assert path.count("t=") == vp.MAX_PATH_POINTS and "t=2.00s" in path and "t=39.00s" in path
+
+
+# ------------------------------------------------------------------ D16
+def test_d16_offline_runs_can_detect_at_the_paper_rate():
+    from semantic_mapping.datasets import run_sequence
+
+    class Frames:
+        def __iter__(self):
+            for i in range(25):  # 10 Hz for 2.4 s
+                yield type("Frame", (), {"frame_id": i, "stamp": i * 0.1, "rgb": None})()
+
+        def observation(self, frame, detections):
+            return _obs(frame.stamp, detections)
+
+    class Detector:
+        calls = []
+
+        def detect(self, rgb, prompts=None, frame_id=None):
+            self.calls.append(frame_id)
+            return [_det()]
+
+    detector = Detector()
+    evaluated = [bool(r.detection_instance_ids) for _f, _d, r in
+                 run_sequence(Frames(), SemanticMappingPipeline(), detector, None, detector_rate_hz=1.0)]
+    assert detector.calls == [0, 10, 20] and sum(evaluated) == 3
+    detector.calls.clear()
+    list(run_sequence(Frames(), SemanticMappingPipeline(), detector, None))
+    assert len(detector.calls) == 25

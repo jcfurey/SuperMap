@@ -222,6 +222,10 @@ class PipelineConfig:
     scene_graph_z_tolerance: float = 0.1
     scene_graph_xy_iou_threshold: float = 0.05
     scene_graph_beside_max_distance: float = 1.0
+    scene_graph_on_min_footprint_fraction: float = 0.5
+    """``on`` also holds when this fraction of the upper object's footprint lies
+    over the support, so a small object on a large table qualifies despite a tiny
+    IoU_xy (scene_graph._on_predicate). 0 keeps the paper's IoU test alone."""
     scene_graph_support_classes: list[str] = field(default_factory=lambda: list(sg.DEFAULT_SUPPORT_CLASSES))
     max_points_per_detection: int = 4000
     size_prior_weight: float = 0.0
@@ -908,6 +912,7 @@ class SemanticMappingPipeline:
             beside_max_distance=self.config.scene_graph_beside_max_distance,
             support_classes=self.config.scene_graph_support_classes,
             cache=self._edge_cache,
+            on_min_footprint_fraction=self.config.scene_graph_on_min_footprint_fraction,
         )
 
         t_graph = time.perf_counter()

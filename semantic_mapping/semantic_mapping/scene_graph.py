@@ -62,13 +62,30 @@ def _neighbor_pairs(objects: list[ObjectInstance], radius: float) -> list[tuple[
     return sorted(pairs)
 
 
-def _on_predicate(a: ObjectInstance, b: ObjectInstance, z_tolerance: float, xy_iou_threshold: float) -> bool:
-    """On(A, B) <=> (z_A_min ~= z_B_max) AND (IoU_xy(B_A, B_B) > gamma)."""
+def footprint_fraction(a: np.ndarray, b: np.ndarray) -> float:
+    """Fraction of box ``a``'s XY footprint that lies over box ``b``'s."""
+    overlap = np.clip(np.minimum(a[3:5], b[3:5]) - np.maximum(a[0:2], b[0:2]), 0.0, None)
+    area = float(np.prod(np.clip(a[3:5] - a[0:2], 0.0, None)))
+    return float(np.prod(overlap)) / area if area > 0 else 0.0
+
+
+def _on_predicate(a: ObjectInstance, b: ObjectInstance, z_tolerance: float, xy_iou_threshold: float,
+                  min_footprint_fraction: float = 0.0) -> bool:
+    """On(A, B) <=> (z_A_min ~= z_B_max) AND (IoU_xy(B_A, B_B) > gamma).
+
+    The IoU term alone rejects a small object on a large support -- a mug on
+    a 4 x 1 m table has IoU 0.0025 -- although the paper's own examples are
+    objects on tables. With ``min_footprint_fraction > 0`` the XY condition
+    also holds when at least that fraction of A's footprint lies over B
+    (doc/paper-review-2026-09-25.md, D12); 0 keeps the IoU test alone.
+    """
     z_a_min = a.bbox3d[2]
     z_b_max = b.bbox3d[5]
-    z_close = abs(z_a_min - z_b_max) <= z_tolerance
-    overlaps_xy = iou_xy(a.bbox3d, b.bbox3d) > xy_iou_threshold
-    return z_close and overlaps_xy
+    if abs(z_a_min - z_b_max) > z_tolerance:
+        return False
+    if iou_xy(a.bbox3d, b.bbox3d) > xy_iou_threshold:
+        return True
+    return min_footprint_fraction > 0 and footprint_fraction(a.bbox3d, b.bbox3d) >= min_footprint_fraction
 
 
 def _beside_predicate(a: ObjectInstance, b: ObjectInstance, z_tolerance: float,
@@ -122,11 +139,12 @@ class SpatialEdgeCache:
         self._edges = {k: v for k, v in self._edges.items() if k in keys}
 
 
-def _pair_edges(a, b, z_tolerance, xy_iou_threshold, beside_max_distance, supports) -> list[SpatialEdge]:
+def _pair_edges(a, b, z_tolerance, xy_iou_threshold, beside_max_distance, supports,
+                on_min_footprint_fraction=0.0) -> list[SpatialEdge]:
     edges: list[SpatialEdge] = []
     for subject, support in ((a, b), (b, a)):
         can_support = supports is None or support.label in supports
-        if can_support and _on_predicate(subject, support, z_tolerance, xy_iou_threshold):
+        if can_support and _on_predicate(subject, support, z_tolerance, xy_iou_threshold, on_min_footprint_fraction):
             edges.append(SpatialEdge(subject.instance_id, "on", support.instance_id))
             edges.append(SpatialEdge(support.instance_id, "under", subject.instance_id))
     if not edges and _beside_predicate(a, b, z_tolerance, xy_iou_threshold, beside_max_distance):
@@ -143,6 +161,7 @@ def build_spatial_edges(
     beside_max_distance: float = 1.0,
     support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
     cache: SpatialEdgeCache | None = None,
+    on_min_footprint_fraction: float = 0.5,
 ) -> list[SpatialEdge]:
     """Evaluate predicates for every pair within ``cluster_radius`` of each other.
 
@@ -156,14 +175,15 @@ def build_spatial_edges(
     pairs = _neighbor_pairs(objects, cluster_radius)
     supports = set(support_classes) if support_classes else None
     keys: set[tuple] = set()
-    parameters = (z_tolerance, xy_iou_threshold, beside_max_distance,
+    parameters = (z_tolerance, xy_iou_threshold, beside_max_distance, on_min_footprint_fraction,
                   tuple(sorted(supports)) if supports is not None else None)
 
     for i, j in pairs:
         key = (parameters, SpatialEdgeCache.signature(objects, (i, j))) if cache is not None else None
         pair_edges = cache.get(key) if cache is not None else None
         if pair_edges is None:
-            pair_edges = _pair_edges(objects[i], objects[j], z_tolerance, xy_iou_threshold, beside_max_distance, supports)
+            pair_edges = _pair_edges(objects[i], objects[j], z_tolerance, xy_iou_threshold, beside_max_distance,
+                                     supports, on_min_footprint_fraction)
             if cache is not None:
                 cache.put(key, pair_edges)
         if cache is not None:
@@ -208,6 +228,7 @@ def build_scene_graph(
     edge_statuses: tuple[ObjectStatus, ...] = (ObjectStatus.ACTIVE, ObjectStatus.OCCLUDED),
     support_classes: tuple[str, ...] | list[str] | None = DEFAULT_SUPPORT_CLASSES,
     cache: SpatialEdgeCache | None = None,
+    on_min_footprint_fraction: float = 0.5,
 ) -> SceneGraph:
     """Build G = (V, E_s, E_t) from the current map state.
 
@@ -227,6 +248,6 @@ def build_scene_graph(
     edge_eligible = [obj for obj in nodes if obj.status in edge_statuses]
     spatial_edges = build_spatial_edges(
         edge_eligible, cluster_radius, z_tolerance, xy_iou_threshold, beside_max_distance, support_classes,
-        cache=cache,
+        cache=cache, on_min_footprint_fraction=on_min_footprint_fraction,
     )
     return SceneGraph(node_ids=[obj.instance_id for obj in nodes], spatial_edges=spatial_edges)

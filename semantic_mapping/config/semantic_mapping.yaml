@@ -152,6 +152,11 @@
     ground_clearance_m: 0.15             # returns lower than this above the fitted ground are dropped
     ground_context_px: 20                # margin around the mask box whose returns inform the ground fit
     ground_max_slope: 0.25               # steeper fitted ground (rise/run) falls back to a level ground
+    # Off by default because, when enabled, these depart from the paper's Eq. (8)-(9)
+    # (doc/paper-review-2026-09-25.md, D23-D26): mask/ground-contact completion adds points
+    # no sensor measured; bbox_support_miss counts pixels without a depth reading as looked
+    # at; existence_hit_gain retires instances on detector misses whatever their geometry;
+    # dynamic_geometry replaces a class's points instead of updating them recursively.
     # mask_completion_labels: []           # complete the mask silhouette at the median range of its kept returns
     #                                      # (geometry only; never used as depth evidence or for layer selection)
     mask_completion_min_returns: 3       # kept real returns needed for completion (fewer: ground contact, if enabled)
@@ -226,10 +231,12 @@
     reconcile_max_distance_m: 10.0
     reconcile_max_gap_sec: 120.0            # ... and this soon after it was last seen; 0 disables either bound
 
-    scene_graph_cluster_radius: 2.0        # meters, maximum centroid distance for candidate relation pairs
+    scene_graph_cluster_radius: 2.0        # meters, maximum gap between two boxes for candidate relation pairs
     scene_graph_z_tolerance: 0.1           # meters, "On" predicate z_min ~= z_max tolerance
     scene_graph_xy_iou_threshold: 0.05     # gamma in Eq. On(A,B) predicate
     scene_graph_beside_max_distance: 1.0   # meters
+    scene_graph_on_min_footprint_fraction: 0.5  # "on" also when this much of the upper footprint lies over the
+                                           # support (a mug on a long table); 0 = the paper's IoU test alone
     # Class-dependent "on" (Sec. IV-C): only these classes can support another
     # object; an empty list makes the predicate purely geometric.
     scene_graph_support_classes: [table, desk, shelf, counter, countertop, cabinet, dresser, nightstand,

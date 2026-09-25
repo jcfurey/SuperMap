@@ -74,6 +74,7 @@ from semantic_mapping.detectors import build_detector
 from semantic_mapping.geometry_utils import invert_se3, occlusion_grid_for, rasterize_depth, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.platform_mask import exclude_platform
+from semantic_mapping.runtime import advance_schedule as _advance_schedule, rate_due as _rate_due
 from semantic_mapping.ros_msgs import (
     camera_info_has_distortion, camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy, numpy_to_image,
     pointcloud_to_xyz, rectified_camera_info, transform_to_se3,
@@ -126,20 +127,6 @@ def _packed_rgb_float(label: str) -> np.float32:
 
 def _stamp_to_seconds(stamp) -> float:
     return stamp.sec + stamp.nanosec * 1e-9
-
-
-def _advance_schedule(previous: float, stamp: float, period: float) -> float:
-    """Retain the rate's phase across input jitter; skip missed slots without bursts."""
-    if not np.isfinite(previous):
-        return stamp
-    return min(stamp, previous + max(1, int((stamp - previous) / period)) * period)
-
-
-def _rate_due(previous: float, stamp: float, period: float) -> bool:
-    # Camera timestamps jitter around their nominal period. Allow at most
-    # 1 ms (and at most 1% of a period) early, instead of dropping a whole
-    # camera frame for a sub-millisecond difference at the requested rate.
-    return stamp - previous >= period - min(0.001, 0.01 * period)
 
 
 def _yaw_quaternion(yaw: float) -> tuple[float, float, float, float]:

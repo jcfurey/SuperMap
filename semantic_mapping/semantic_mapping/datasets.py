@@ -114,11 +114,28 @@ def run_sequence(
     pipeline: SemanticMappingPipeline,
     detector: Detector,
     prompts: list[str] | None,
+    detector_rate_hz: float = 0.0,
 ) -> Iterator[tuple[SequenceFrame, list[Detection2D], FrameResult]]:
-    """Drive the pipeline over a sequence, yielding each frame's inputs and result."""
+    """Drive the pipeline over a sequence, yielding each frame's inputs and result.
+
+    Every frame is mapped. ``detector_rate_hz > 0`` runs the detector only on
+    frames due at that rate by their stamps, with the live node's scheduler,
+    so an offline run keeps the paper's detection-to-mapping ratio (Sec. V-H:
+    1 Hz segmentation); the other frames are geometry-only
+    (``detections_evaluated=False``). 0 detects on every frame.
+    """
+    from semantic_mapping.runtime import advance_schedule, rate_due
+
+    period = 1.0 / detector_rate_hz if detector_rate_hz > 0 else 0.0
+    last_detection = -float("inf")
     for frame in dataset:
-        detections = detector.detect(frame.rgb, prompts=prompts, frame_id=frame.frame_id)
-        result = pipeline.process_frame(dataset.observation(frame, detections))
+        due = not period or rate_due(last_detection, frame.stamp, period)
+        detections = detector.detect(frame.rgb, prompts=prompts, frame_id=frame.frame_id) if due else []
+        if due and period:
+            last_detection = advance_schedule(last_detection, frame.stamp, period)
+        observation = dataset.observation(frame, detections)
+        observation.detections_evaluated = due
+        result = pipeline.process_frame(observation)
         yield frame, detections, result
 
 
