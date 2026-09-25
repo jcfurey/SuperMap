@@ -136,9 +136,41 @@ def clip_bbox_to_image(bbox: Array, width: int, height: int) -> Array | None:
     return np.array([x1, y1, x2, y2], dtype=np.float64)
 
 
+VOXEL_KEY_BITS = 21
+"""Voxel coordinates are packed three-per-int64 with 21 bits each, i.e. any
+map within +-2^20 voxels of the origin (+-52 km at 5 cm) takes the fast path."""
+
+
+def pack_voxel_keys(cells: Array) -> Array | None:
+    """One int64 per integer ``(x, y, z)`` cell, ordered like the rows themselves
+    (lexicographically), or None when a coordinate lies outside +-2^20.
+
+    Sorting, de-duplicating and searching the keys is a 1-D operation on
+    integers; row-wise ``np.unique(axis=0)`` and structured-view searches over
+    the same cells are several times slower (doc/audit-2026-09.md, P2)."""
+    offset = 1 << (VOXEL_KEY_BITS - 1)
+    shifted = np.asarray(cells, dtype=np.int64).reshape(-1, 3) + offset
+    if shifted.size and (shifted.min() < 0 or shifted.max() >= 1 << VOXEL_KEY_BITS):
+        return None
+    return (shifted[:, 0] << (2 * VOXEL_KEY_BITS)) | (shifted[:, 1] << VOXEL_KEY_BITS) | shifted[:, 2]
+
+
+def mask_bounds(mask: Array) -> tuple[int, int, int, int] | None:
+    """Rows ``[y1, y2)`` and columns ``[x1, x2)`` holding a boolean mask's pixels,
+    or None for an empty mask. Two row/column reductions, far cheaper than
+    listing every pixel of a full-image mask."""
+    rows = np.flatnonzero(mask.any(axis=1))
+    if not rows.size:
+        return None
+    y1, y2 = int(rows[0]), int(rows[-1]) + 1
+    cols = np.flatnonzero(mask[y1:y2].any(axis=0))
+    return y1, y2, int(cols[0]), int(cols[-1]) + 1
+
+
 def back_project_depth(
     K: Array, depth: Array, mask: Array | None = None, *,
     max_points: int | None = None, depth_mad_factor: float = 0.0, depth_min_tolerance: float = 0.05,
+    pixel_origin: tuple[int, int] = (0, 0),
 ) -> Array:
     """Back-project a depth image (or masked subset) into the camera frame.
 
@@ -150,6 +182,8 @@ def back_project_depth(
     max_points : optional deterministic sample limit, applied before projection.
     depth_mad_factor : optional median-absolute-deviation gate; 0 disables it.
     depth_min_tolerance : minimum depth tolerance in meters when the gate is enabled.
+    pixel_origin : (column, row) of ``depth[0, 0]`` in the image ``K`` describes,
+        so a crop back-projects exactly as the same pixels of the full image.
 
     Returns
     -------
@@ -163,6 +197,7 @@ def back_project_depth(
     if us.size == 0:
         return np.zeros((0, 3), dtype=np.float64)
     z = depth[vs, us].astype(np.float64)
+    us, vs = us + pixel_origin[0], vs + pixel_origin[1]
     if depth_mad_factor > 0:
         keep = depth_consistency_mask(z, mad_factor=depth_mad_factor, min_tolerance=depth_min_tolerance)
         vs, us, z = vs[keep], us[keep], z[keep]
@@ -318,16 +353,21 @@ def fill_sparse_depth(depth: Array, radius_px: int) -> Array:
     depth = np.asarray(depth, dtype=np.float64)
     if radius_px <= 0:
         return depth
-    from scipy.ndimage import minimum_filter
+    import cv2
 
-    valid = np.isfinite(depth) & (depth > 0)
+    valid = np.isfinite(depth)
+    valid &= depth > 0
     if valid.all() or not valid.any():
         return np.where(valid, depth, 0.0)
-    candidates = np.where(valid, depth, np.inf)
-    filled = minimum_filter(candidates, size=2 * int(radius_px) + 1, mode="nearest")
-    out = np.where(valid, depth, filled)
-    out[~np.isfinite(out)] = 0.0
-    return out
+    # A square minimum filter is a grayscale erosion; OpenCV's is several times
+    # faster than scipy.ndimage.minimum_filter and gives the same values
+    # (replicated border = mode "nearest"). Few full-image passes: this runs on
+    # every frame of a sparse depth source.
+    size = 2 * int(radius_px) + 1
+    filled = cv2.erode(np.where(valid, depth, np.inf), np.ones((size, size), np.uint8), borderType=cv2.BORDER_REPLICATE)
+    np.copyto(filled, depth, where=valid)
+    filled[np.isinf(filled)] = 0.0  # no valid neighbour
+    return filled
 
 
 def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance: float = 0.05) -> Array:

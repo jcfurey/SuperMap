@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
+from semantic_mapping.geometry_utils import mask_bounds
 from semantic_mapping.types import CameraIntrinsics, Detection2D
 
 GEOMETRY_KINDS = ("visual", "collision")
@@ -260,8 +261,8 @@ def _clip_near(triangle: np.ndarray, near: float) -> np.ndarray:
 
 
 def _mask_bbox(mask: np.ndarray) -> np.ndarray:
-    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
-    return np.array([cols[0], rows[0], cols[-1] + 1, rows[-1] + 1], dtype=np.float64)
+    y1, y2, x1, x2 = mask_bounds(mask)
+    return np.array([x1, y1, x2, y2], dtype=np.float64)
 
 
 @dataclass
@@ -436,13 +437,22 @@ def exclude_platform(detections: Sequence[Detection2D], platform: np.ndarray,
     height, width = platform.shape
     for detection in detections:
         if detection.mask is not None:
-            area = int(np.count_nonzero(detection.mask))
-            on = int(np.count_nonzero(detection.mask & platform))
-            if not area or on > max_overlap * area:
+            # Only the mask's bounding crop can overlap: no whole-image passes per detection.
+            bounds = mask_bounds(detection.mask)
+            if bounds is None:
+                dropped += 1
+                continue
+            y1, y2, x1, x2 = bounds
+            crop = detection.mask[y1:y2, x1:x2]
+            on_platform = crop & platform[y1:y2, x1:x2]
+            area, on = int(np.count_nonzero(crop)), int(np.count_nonzero(on_platform))
+            # A mask entirely on the platform is dropped even with max_overlap 1.
+            if on > max_overlap * area or on == area:
                 dropped += 1
                 continue
             if on:
-                mask = detection.mask & ~platform
+                mask = detection.mask.copy()
+                mask[y1:y2, x1:x2] = crop & ~on_platform
                 detection = dataclasses.replace(detection, mask=mask, bbox=_mask_bbox(mask))
         else:
             x1, y1, x2, y2 = np.round(np.asarray(detection.bbox, dtype=np.float64)).astype(np.int64)

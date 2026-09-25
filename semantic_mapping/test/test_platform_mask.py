@@ -183,3 +183,33 @@ def test_detections_on_the_platform_are_dropped_or_trimmed():
     assert detections[1].mask.sum() == 50 * 10  # the input is untouched
     assert kept[1] is detections[3]
     assert exclude_platform(detections, platform, max_overlap=1.0)[1] == 0
+
+
+def test_a_mask_entirely_on_the_platform_is_dropped_even_at_full_overlap():
+    platform = np.zeros((20, 20), bool)
+    platform[:10] = True
+    mask = np.zeros_like(platform)
+    mask[2:5, 2:5] = True  # used to leave an empty mask whose box raised IndexError
+    empty = np.zeros_like(platform)
+    detections = [Detection2D(np.array([2., 2., 5., 5.]), "hood", 0.9, mask=mask),
+                  Detection2D(np.array([0., 0., 1., 1.]), "nothing", 0.9, mask=empty)]
+    assert exclude_platform(detections, platform, max_overlap=1.0) == ([], 2)
+
+
+def test_platform_exclusion_on_mask_crops_matches_whole_image_masks():
+    rng = np.random.default_rng(11)
+    platform = rng.random((60, 90)) > .6
+    for overlap in (0.2, 0.5, 0.9):
+        for _ in range(20):
+            mask = np.zeros_like(platform)
+            y, x = rng.integers(0, 60), rng.integers(0, 90)
+            mask[y:y + rng.integers(1, 30), x:x + rng.integers(1, 40)] = rng.random() > .1
+            area, on = mask.sum(), (mask & platform).sum()
+            kept, dropped = exclude_platform([Detection2D(np.array([0., 0., 1., 1.]), "x", .9, mask=mask)], platform, overlap)
+            if not area or on > overlap * area:
+                assert (kept, dropped) == ([], 1)
+            else:
+                np.testing.assert_array_equal(kept[0].mask, mask & ~platform)
+                if on:
+                    ys, xs = np.nonzero(mask & ~platform)
+                    np.testing.assert_array_equal(kept[0].bbox, [xs.min(), ys.min(), xs.max() + 1, ys.max() + 1])

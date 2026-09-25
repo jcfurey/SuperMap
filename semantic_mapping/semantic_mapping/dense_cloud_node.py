@@ -66,6 +66,8 @@ _CONFIG_DOCS: dict[str, tuple[str, tuple[float, float] | None]] = {
     "min_region_voxels": ("Smaller surface components stay unsegmented", (1, 1_000_000)),
     "max_map_voxels": ("Capacity; beyond it a cloud is rejected, never cropped", (1, 100_000_000)),
     "chunk_size": ("KD-tree query batch size", (1, 1_000_000)),
+    "kdtree_workers": ("Threads for KD-tree neighbour queries; -1 = all cores (results do not depend on it)",
+                       (-1, 1024)),
     "camera_depth_tolerance": ("Z-buffer / measured-depth agreement (m)", (1e-4, 10.0)),
     "max_camera_time_delta": ("Max |image stamp - cloud stamp| for labels (s)", (0.0, 60.0)),
     "min_camera_score": ("Ignore masks scored below this", (0.0, 1.0)),

@@ -14,7 +14,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
-from semantic_mapping.geometry_utils import GROUND_SURFACE_LABELS, fit_ground_plane, splat_depth_buffer
+from semantic_mapping.geometry_utils import GROUND_SURFACE_LABELS, fit_ground_plane, pack_voxel_keys, splat_depth_buffer
 from semantic_mapping.types import CameraIntrinsics, Detection2D
 
 UNKNOWN, DIRECT, PROPAGATED = 0, 1, 2
@@ -32,6 +32,10 @@ class DenseCloudConfig:
     min_region_voxels: int = 4
     max_map_voxels: int = 500_000
     chunk_size: int = 4096
+    # Threads for KD-tree neighbour queries, the bulk of segmentation time;
+    # -1 uses every core. Results do not depend on it. Lower it to leave
+    # cores for other processes on the robot.
+    kdtree_workers: int = -1
     camera_depth_tolerance: float = 0.05
     max_camera_time_delta: float = 0.20
     min_camera_score: float = 0.5
@@ -91,6 +95,9 @@ class DenseCloudConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.kdtree_workers, int) or isinstance(self.kdtree_workers, bool) \
+                or not (self.kdtree_workers == -1 or self.kdtree_workers >= 1):
+            raise ValueError("kdtree_workers must be -1 (all cores) or a positive integer")
         if not isinstance(self.ground_context_px, int) or isinstance(self.ground_context_px, bool) \
                 or self.ground_context_px < 0:
             raise ValueError("ground_context_px must be a nonnegative integer")
@@ -174,11 +181,37 @@ def _cell_keys(cells):
         np.dtype([("x", "<i8"), ("y", "<i8"), ("z", "<i8")])).reshape(-1)
 
 
+def _unique_cells(cells, return_index=False, return_inverse=False):
+    """``np.unique(cells, axis=0, ...)`` for (N, 3) integer cells: the same sorted
+    rows, first-occurrence indices and inverse, through one packed int64 key
+    per cell when the cells fit (several times faster on a large cloud)."""
+    keys = pack_voxel_keys(cells)
+    if keys is None:
+        return np.unique(cells, axis=0, return_index=return_index, return_inverse=return_inverse)
+    _, index, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    unique = np.asarray(cells, dtype=np.int64).reshape(-1, 3)[index]
+    extra = ((index,) if return_index else ()) + ((inverse.reshape(-1),) if return_inverse else ())
+    return (unique, *extra) if extra else unique
+
+
+def _unique_pairs(first, second, return_counts=False):
+    """``np.unique(np.column_stack([first, second]), axis=0)`` for non-negative
+    integer columns (voxel/component/region/label indices), as one 1-D unique of
+    ``first * (max(second) + 1) + second`` keys: same rows, order and counts."""
+    first, second = np.asarray(first, dtype=np.int64), np.asarray(second, dtype=np.int64)
+    base = int(second.max()) + 1 if second.size else 1
+    keys = np.unique(first * base + second, return_counts=return_counts)
+    pairs = np.column_stack(np.divmod(keys[0] if return_counts else keys, base))
+    return (pairs, keys[1]) if return_counts else pairs
+
+
 def _cell_match(old, new):
     """Indices of identical cells in two lexicographically sorted unique arrays."""
     if not len(old) or not len(new):
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
-    old_keys, new_keys = _cell_keys(old), _cell_keys(new)
+    old_keys, new_keys = pack_voxel_keys(old), pack_voxel_keys(new)
+    if old_keys is None or new_keys is None:
+        old_keys, new_keys = _cell_keys(old), _cell_keys(new)
     index = np.searchsorted(old_keys, new_keys)
     current = np.flatnonzero(index < len(old_keys))
     current = current[old_keys[index[current]] == new_keys[current]]
@@ -194,7 +227,7 @@ def _surface_normals(points, tree, index, config):
     for start in range(0, len(index), config.chunk_size):
         stop = min(start+config.chunk_size, len(index))
         distances, indices = tree.query(points[index[start:stop]], k=list(range(1, k+1)),
-                                        distance_upper_bound=config.normal_radius, workers=1)
+                                        distance_upper_bound=config.normal_radius, workers=config.kdtree_workers)
         good = np.isfinite(distances)
         count = good.sum(axis=1)
         neighbors = points[np.minimum(indices, n-1)]
@@ -218,7 +251,7 @@ def _surface_edges(points, tree, normals, reliable, index, config):
         stop = min(start+config.chunk_size, len(index))
         chunk = index[start:stop]
         distance, neighbor = tree.query(points[chunk], k=list(range(1, k+1)),
-                                        distance_upper_bound=config.neighbor_radius, workers=1)
+                                        distance_upper_bound=config.neighbor_radius, workers=config.kdtree_workers)
         row = np.broadcast_to(chunk[:, None], neighbor.shape)
         valid = np.isfinite(distance) & (neighbor != row)
         a, b = row[valid], neighbor[valid]
@@ -268,11 +301,11 @@ def build_surface_graph(points: np.ndarray, config: DenseCloudConfig) -> Surface
     return SurfaceGraph(points, normals, reliable, rows, cols)
 
 
-def _within(points, seeds, radius):
+def _within(points, seeds, radius, workers=1):
     """Mask of ``points`` within ``radius`` of any seed position."""
     if not len(seeds) or not len(points):
         return np.zeros(len(points), bool)
-    distance, _ = cKDTree(seeds).query(points, k=1, distance_upper_bound=radius, workers=1)
+    distance, _ = cKDTree(seeds).query(points, k=1, distance_upper_bound=radius, workers=workers)
     return np.isfinite(distance)
 
 
@@ -300,9 +333,9 @@ def update_surface_graph(previous: SurfaceGraph, old_index: np.ndarray, new_inde
     old_to_new[kept_old] = kept_new
     vanished = old_to_new < 0  # removed voxels plus the old position of moved ones
     seeds = np.concatenate([points[changed], previous.points[vanished]])
-    normal_dirty = changed | _within(points, seeds, config.normal_radius)
+    normal_dirty = changed | _within(points, seeds, config.normal_radius, config.kdtree_workers)
     edge_dirty = normal_dirty | _within(points, np.concatenate([seeds, points[normal_dirty]]),
-                                        config.neighbor_radius)
+                                        config.neighbor_radius, config.kdtree_workers)
     if edge_dirty.mean() > max_dirty_fraction:
         graph = build_surface_graph(points, config)
         return graph, {"incremental": False, "dirty_voxels": n}
@@ -410,8 +443,7 @@ class DenseCloudPipeline:
     def _stable_regions(self, components, old_region):
         result = np.full(len(components), -1, dtype=np.int32)
         pairs_valid = (components >= 0) & (old_region >= 0)
-        pairs, counts = np.unique(np.column_stack([components[pairs_valid], old_region[pairs_valid]]),
-                                  axis=0, return_counts=True)
+        pairs, counts = _unique_pairs(components[pairs_valid], old_region[pairs_valid], return_counts=True)
         assigned, used = {}, set()
         for index in np.argsort(-counts, kind="stable"):
             component, previous = map(int, pairs[index])
@@ -447,11 +479,10 @@ class DenseCloudPipeline:
         scaled = np.floor(points[finite]/self.config.voxel_size)
         if scaled.size and np.max(np.abs(scaled)) >= 2**62:
             raise ValueError("cloud coordinates exceed voxel index range")
-        cells, representative, inverse = np.unique(scaled.astype(np.int64), axis=0,
-                                                    return_index=True, return_inverse=True)
+        cells, representative, inverse = _unique_cells(scaled.astype(np.int64), return_index=True, return_inverse=True)
         current_points = points[finite][representative]
         if self.config.input_mode == "scan":
-            all_cells = np.unique(np.concatenate([self.cells, cells]), axis=0)
+            all_cells = _unique_cells(np.concatenate([self.cells, cells]))
         else:
             all_cells = cells
         if len(all_cells) > self.config.max_map_voxels:
@@ -565,8 +596,7 @@ class DenseCloudPipeline:
         selected = point_label > 0
         map_index = self._input_map[valid[selected]]
         # A voxel containing conflicting labels remains unresolved this frame.
-        pairs = np.column_stack([map_index, point_label[selected]])
-        unique = np.unique(pairs, axis=0)
+        unique = _unique_pairs(map_index, point_label[selected])
         voxel, count = np.unique(unique[:, 0], return_counts=True)
         ambiguous = voxel[count > 1]
         accepted = ~np.isin(map_index, ambiguous)
@@ -593,7 +623,8 @@ class DenseCloudPipeline:
             seeds = np.flatnonzero((semantic > 0) & (self.regions >= 0))
             target = np.flatnonzero((semantic == 0) & (self.regions >= 0))
             if len(seeds) and len(target):
-                distance, nearest = cKDTree(self.points[seeds]).query(self.points[target], workers=1)
+                distance, nearest = cKDTree(self.points[seeds]).query(self.points[target],
+                                                                      workers=self.config.kdtree_workers)
                 seed = seeds[nearest]
                 keep = (distance <= radius) & (self.regions[seed] == self.regions[target])
                 target, seed, distance = target[keep], seed[keep], distance[keep]
