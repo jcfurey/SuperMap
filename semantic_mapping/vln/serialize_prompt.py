@@ -59,7 +59,7 @@ def serialize_subgraph_to_text(
 ) -> str:
     """Render nodes, spatial edges, and temporal cues as structured text.
 
-    Occluded instances carry their age since the last observation (relative
+    Occluded instances carry their age since the last 3D observation (relative
     to ``now``, defaulting to the freshest observation in the map); past
     ``stale_after_sec`` they are also marked as possibly gone, so the model
     does not send the robot to something the map merely remembers.
@@ -74,9 +74,12 @@ def serialize_subgraph_to_text(
             continue
         line = f"  Instance {obj.instance_id} ({obj.label}) at {_format_center(obj.center)}"
         if obj.status == ObjectStatus.OCCLUDED:
-            age = max(reference - obj.latest_stamp, 0.0)
+            measured = obj.geometry_stamp if obj.geometry_stamp is not None else obj.latest_stamp
+            age = max(reference - measured, 0.0)
             stale = stale_after_sec is not None and age > stale_after_sec
-            line += f" (not seen for {age:.1f} s" + (", may no longer be there)" if stale else ")")
+            age_text = (f"location last measured {age:.1f} s ago" if obj.geometry_stamp is not None
+                        else f"not seen for {age:.1f} s")
+            line += f" ({age_text}" + (", may no longer be there)" if stale else ")")
         lines.append(line)
 
     if scene_graph.spatial_edges:

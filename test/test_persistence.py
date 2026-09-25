@@ -23,6 +23,7 @@ def _populated_map() -> ObjectMap:
     chair.hits, chair.frames_since_seen, chair.points_contradicted = 7, 2, 4
     chair.missed_detection_frames = 1
     chair.first_seen_stamp, chair.latest_stamp = 1.5, 9.25
+    chair.geometry_stamp = 8.75
     chair.trajectory = [(1.5, np.array([0.5, 0.5, 0.5]), "tentative"), (2.0, np.array([0.6, 0.5, 0.5]), "active")]
     plant = make_object(5, "plant", [2, 2, 0, 3, 3, 1], status=ObjectStatus.DISAPPEARED)  # no points at all
     object_map.objects = {3: chair, 5: plant}
@@ -50,6 +51,7 @@ def test_roundtrip_restores_every_field(tmp_path):
         assert (r.first_seen_stamp, r.latest_stamp) == (s.first_seen_stamp, s.latest_stamp)
         assert (r.frames_since_seen, r.hits, r.points_contradicted) == (s.frames_since_seen, s.hits, s.points_contradicted)
         assert r.missed_detection_frames == s.missed_detection_frames
+        assert r.geometry_stamp == s.geometry_stamp
         assert len(r.trajectory) == len(s.trajectory)
         for (rs, rc, rst), (ss, sc, sst) in zip(r.trajectory, s.trajectory):
             assert rs == ss and rst == sst and np.allclose(rc, sc)
@@ -72,6 +74,19 @@ def test_resume_resets_tracklet_and_demotes_active_to_occluded(tmp_path):
     assert np.allclose(current_velocity(chair.track), 0.0)
     np.testing.assert_allclose(current_bbox(chair.track), current_bbox(saved.objects[3].track))
     assert restored.objects[5].status == ObjectStatus.DISAPPEARED  # untouched
+
+
+def test_old_maps_without_geometry_time_use_the_last_observation(tmp_path):
+    persistence.save_map(_populated_map(), tmp_path/'map')
+    path = tmp_path/'map'/persistence.MAP_JSON
+    header = json.loads(path.read_text())
+    for record in header['instances']:
+        record.pop('geometry_stamp')
+    path.write_text(json.dumps(header))
+    restored = ObjectMap()
+    persistence.load_map(tmp_path/'map', restored, resume=False)
+    assert restored.objects[3].geometry_stamp == 9.25
+    assert restored.objects[5].geometry_stamp is None
 
 
 def test_next_id_never_reuses_a_saved_id(tmp_path):

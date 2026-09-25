@@ -45,10 +45,16 @@ class PipelineConfig:
     """Separate masked sensor depths into layers; 0 disables foreground selection."""
     foreground_depth_min_points: int = 5
     foreground_depth_min_fraction: float = 0.1
+    foreground_depth_min_image_span: float = 0.0
+    """Minimum fraction of the visible mask span covered by real returns in each image axis."""
+    foreground_depth_max_extent_m: float = 0.0
+    """Optional compact-object bound per camera axis; reject implausible layers, never clip them."""
     foreground_depth_labels: list[str] = field(default_factory=lambda: ["person"])
     dynamic_geometry_enabled: bool = False
     dynamic_geometry_labels: list[str] = field(default_factory=lambda: ["person"])
     """Use the latest supported geometry for these moving classes; keep identity/history."""
+    dynamic_geometry_min_extent_fraction: float = 0.0
+    """Retire a contradicted compact body as a whole when a supported axis collapses; 0 disables."""
     tau_eps: float = 0.15
     max_points_per_object: int = 5000
     prune_log_odds: float = -1.5
@@ -128,6 +134,11 @@ class PipelineConfig:
             raise ValueError("foreground_depth_min_points must be a positive integer")
         if not 0 <= self.foreground_depth_min_fraction <= 1:
             raise ValueError("foreground_depth_min_fraction must be in [0, 1]")
+        for name in ('foreground_depth_min_image_span', 'dynamic_geometry_min_extent_fraction'):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not np.isfinite(self.foreground_depth_max_extent_m) or self.foreground_depth_max_extent_m < 0:
+            raise ValueError("foreground_depth_max_extent_m must be finite and nonnegative")
 
     @classmethod
     def from_dict(cls, params: dict) -> "PipelineConfig":
@@ -178,6 +189,7 @@ class SemanticMappingPipeline:
             cull_out_of_view=self.config.cull_out_of_view,
             bbox_trim_percentile=self.config.bbox_trim_percentile,
             dynamic_geometry_labels=self.config.dynamic_geometry_labels if self.config.dynamic_geometry_enabled else (),
+            dynamic_geometry_min_extent_fraction=self.config.dynamic_geometry_min_extent_fraction,
         )
         self._frame_index = 0
         self._last_stamp: float | None = None
@@ -238,9 +250,16 @@ class SemanticMappingPipeline:
         cfg = self.config
         if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
             # Count real returns, not pixels synthesized by sparse filling.
+            pixels = min_span = None
+            if cfg.foreground_depth_min_image_span > 0:
+                ys, xs = np.nonzero(mask)
+                pixels = np.column_stack((xs, ys))
+                if len(pixels):
+                    min_span = (np.ptp(pixels, axis=0) + 1) * cfg.foreground_depth_min_image_span
             selected = foreground_depth_mask(
                 depth[mask], cfg.foreground_depth_gap_m,
                 cfg.foreground_depth_min_points, cfg.foreground_depth_min_fraction,
+                pixels=pixels, min_span=min_span,
             )
             filtered = np.zeros_like(depth)
             filtered[mask] = np.where(selected, depth[mask], 0.0)
@@ -252,6 +271,11 @@ class SemanticMappingPipeline:
             depth_mad_factor=self.config.mask_depth_mad_factor if has_instance_mask else 3.0,
             depth_min_tolerance=self.config.mask_depth_min_tolerance_m if has_instance_mask else 0.05,
         )
+        if (cfg.foreground_depth_max_extent_m > 0 and detection.label in cfg.foreground_depth_labels
+                and len(points_cam)):
+            bounds = bbox3d_from_points(points_cam, cfg.bbox_trim_percentile)
+            if np.any(bounds[3:] - bounds[:3] > cfg.foreground_depth_max_extent_m):
+                return np.zeros((0, 3))
         return transform_points(T_world_from_cam, points_cam)
 
     def process_frame(self, observation: Observation) -> FrameResult:
@@ -322,7 +346,8 @@ class SemanticMappingPipeline:
                 continue
             dt = max(observation.stamp - obj.latest_stamp, 1e-3)
             predicted = tracking.predict(
-                obj.track, dt, K=K, T_world_from_cam=T_world_from_cam, object_centroid_world=obj.center,
+                obj.track, dt, K=K, T_world_from_cam=T_world_from_cam,
+                object_centroid_world=obj.center if len(obj.points_world) else None,
                 object_bbox3d_world=obj.bbox3d if obj.points_world.shape[0] > 0 else None,
                 image_size=image_size, size_prior_weight=cfg.size_prior_weight,
             )

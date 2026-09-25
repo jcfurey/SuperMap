@@ -241,3 +241,15 @@ def test_live_display_removes_retired_geometry_but_keeps_memory(node_factory):
         ('obj_boxes', 1, Marker.DELETE), ('obj_labels', 1, Marker.DELETE)}
     assert result.objects == [obj] and len(obj.points_world) == 1
     assert result.scene_graph.node_ids == [1]
+
+
+def test_marker_ages_location_independently_of_2d_detections(node_factory):
+    node = node_factory()
+    published = []
+    node.obj_boxes_pub.publish = published.append
+    obj = make_object(1, 'person', [0, 0, 0, 1, 1, 2], status=ObjectStatus.OCCLUDED)
+    obj.latest_stamp, obj.geometry_stamp = 49.0, 10.0
+    result = FrameResult(objects=[obj], stamp=50.0, scene_graph=SceneGraph(node_ids=[1]))
+    node._publish_object_boxes(result, Header(stamp=stamp_msg(50.0), frame_id='map'))
+    labels = [m.text for m in published[-1].markers if m.ns == 'obj_labels']
+    assert labels == ['1:person (occluded 40s)']

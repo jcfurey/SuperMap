@@ -78,6 +78,9 @@ def test_depth_limits_reject_saturated_geometry_without_false_removal_evidence()
     {'foreground_depth_gap_m': -1}, {'foreground_depth_gap_m': float('nan')},
     {'foreground_depth_min_points': 0}, {'foreground_depth_min_points': 1.5},
     {'foreground_depth_min_fraction': -0.1}, {'foreground_depth_min_fraction': float('nan')},
+    {'foreground_depth_min_image_span': 1.1}, {'foreground_depth_min_image_span': float('nan')},
+    {'foreground_depth_max_extent_m': -1.}, {'foreground_depth_max_extent_m': float('inf')},
+    {'dynamic_geometry_min_extent_fraction': -0.1},
 ])
 def test_invalid_geometry_limits_are_rejected(params):
     with pytest.raises(ValueError):
@@ -128,6 +131,71 @@ def test_foreground_depth_does_not_invent_geometry_from_unsupported_returns():
     pipeline = SemanticMappingPipeline(PipelineConfig(foreground_depth_gap_m=.75, depth_fill_radius_px=3))
     obj = pipeline.process_frame(obs).objects[0]
     assert obj.points_world.shape == (0, 3)
+
+
+def _person_observation(stamp, distance=3.):
+    obs = _observation(stamp, distance, True)
+    obs.detections[0].label = 'person'
+    obs.detections[0].mask = np.zeros(obs.depth.shape, dtype=bool)
+    obs.detections[0].mask[40:80,60:100] = True
+    return obs
+
+
+def test_partial_person_depth_preserves_last_body_and_geometry_time():
+    p = SemanticMappingPipeline(PipelineConfig(dynamic_geometry_enabled=True, foreground_depth_gap_m=.75,
+                                               foreground_depth_min_image_span=.5, depth_fill_radius_px=2))
+    p.process_frame(_person_observation(0))
+    obj = p.process_frame(_person_observation(.1)).objects[0]
+    old_points, old_evidence = obj.points_world.copy(), obj.point_log_odds.copy()
+    for i in range(2, 8):
+        obs = _person_observation(i*.1)
+        obs.depth[:] = 0
+        obs.depth[75:80,60:100] = 2.5  # many real points, but only at the feet
+        p.process_frame(obs)
+        assert obj.status == ObjectStatus.OCCLUDED
+        assert obj.geometry_stamp == .1 and obj.latest_stamp == i*.1
+        np.testing.assert_array_equal(obj.points_world, old_points)
+        np.testing.assert_array_equal(obj.point_log_odds, old_evidence)
+    p.process_frame(_person_observation(.8, 2.5))
+    assert obj.status == ObjectStatus.ACTIVE and obj.geometry_stamp == .8 and obj.instance_id == 1
+
+
+def test_person_extent_guard_rejects_background_without_clipping_or_affecting_other_classes():
+    p = SemanticMappingPipeline(PipelineConfig(foreground_depth_gap_m=.75, foreground_depth_min_image_span=.5,
+                                               foreground_depth_max_extent_m=3.))
+    obs = _person_observation(0, 30.)
+    d = obs.detections[0]
+    assert len(p._detection_points_world(d, obs.depth, K, np.eye(4))) == 0
+    d.label = 'pipe'
+    points = p._detection_points_world(d, obs.depth, K, np.eye(4))
+    assert len(points) and np.ptp(points[:,1]) > 10.
+
+
+def test_depthless_person_keeps_one_2d_track_without_inventing_a_mapped_location():
+    p = SemanticMappingPipeline(PipelineConfig(dynamic_geometry_enabled=True, foreground_depth_gap_m=.75))
+    for i in range(3):
+        obs = _person_observation(i*.1, 0.)
+        obs.pose.T_world_from_frame[:3,3] = [5, 0, -5]
+        result = p.process_frame(obs)
+        assert len(result.objects) == 1
+        obj = result.objects[0]
+        assert obj.status == ObjectStatus.TENTATIVE and obj.instance_id == 1 and not len(obj.points_world)
+        assert not result.scene_graph.node_ids
+    obs = _person_observation(.3)
+    obs.pose.T_world_from_frame[:3,3] = [5, 0, -5]
+    obj = p.process_frame(obs).objects[0]
+    assert obj.instance_id == 1 and obj.status == ObjectStatus.ACTIVE and obj.geometry_stamp == .3
+
+
+def test_expired_depthless_tracks_do_not_become_spatial_memories_at_the_origin():
+    p = SemanticMappingPipeline(PipelineConfig(dynamic_geometry_enabled=True, tentative_max_age=2))
+    p.process_frame(_person_observation(0., 0.))
+    for i in range(1, 5):
+        obs = _person_observation(i*.1, 0.)
+        obs.detections = []
+        result = p.process_frame(obs)
+    assert result.objects[0].status == ObjectStatus.DISAPPEARED
+    assert result.scene_graph.node_ids == []
 
 
 @pytest.mark.parametrize('label, dynamic, replaces', [('person', True, True), ('chair', True, False), ('person', False, False)])

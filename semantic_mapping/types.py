@@ -158,6 +158,8 @@ class ObjectInstance:
     embedding_count: int = 0
     missed_detection_frames: int = 0
     """Completed detector observations that did not match this object; geometry-only frames do not count."""
+    geometry_stamp: float | None = None
+    """Last accepted 3D measurement; a 2D-only match must not refresh geometry age."""
 
     @property
     def label(self) -> str:

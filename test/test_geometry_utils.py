@@ -149,6 +149,17 @@ def test_foreground_layer_preserves_input_order_and_single_surface():
     np.testing.assert_array_equal(depths[foreground_depth_mask(depths, .75)], depths)
 
 
+def test_foreground_layer_requires_spatial_support_not_just_many_foot_returns():
+    feet = np.column_stack((np.linspace(0, 30, 30), np.full(30, 39)))
+    x, y = np.meshgrid(np.arange(0, 31, 5), np.arange(0, 40, 5))
+    body = np.column_stack((x.ravel(), y.ravel()))
+    pixels = np.vstack((feet, body))
+    depths = np.concatenate((np.full(len(feet), 2.), np.full(len(body), 3.)))
+    keep = foreground_depth_mask(depths, .75, pixels=pixels, min_span=np.array([15, 20]))
+    assert not keep[:len(feet)].any() and keep[len(feet):].all()
+    assert not foreground_depth_mask(depths[:len(feet)], .75, pixels=feet, min_span=np.array([15, 20])).any()
+
+
 def test_fill_sparse_depth_fills_only_empty_pixels_with_neighbourhood_minimum():
     from semantic_mapping.geometry_utils import fill_sparse_depth
 

@@ -82,3 +82,12 @@ def test_occluded_nodes_carry_their_age_and_a_stale_warning():
     text = vp.serialize_subgraph_to_text(objects, graph, now=130.0, stale_after_sec=30.0)
     assert "(not seen for 42.0 s, may no longer be there)" in text
     assert "not seen for" in vp.build_prompt(objects, graph, "go", now=130.0) and "annotated" in vp.SCHEMA_PREAMBLE
+
+
+def test_fresh_2d_detection_does_not_make_old_location_current():
+    from semantic_mapping.types import ObjectStatus
+
+    obj = make_object(1, "person", [0, 0, 0, 1, 1, 2], status=ObjectStatus.OCCLUDED)
+    obj.latest_stamp, obj.geometry_stamp = 49.0, 10.0
+    text = vp.serialize_subgraph_to_text([obj], sg.SceneGraph(node_ids=[1]), now=50.0, stale_after_sec=30.0)
+    assert "location last measured 40.0 s ago, may no longer be there" in text

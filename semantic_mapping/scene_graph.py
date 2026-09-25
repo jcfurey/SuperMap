@@ -199,7 +199,10 @@ def build_scene_graph(
     incrementally by :func:`record_trajectory_sample`), which the
     serialization layer reads directly.
     """
-    nodes = [obj for obj in objects if obj.status in node_statuses]
+    # A track that never acquired depth has no spatial location, including
+    # after it expires. Retired mapped objects retain their last known box.
+    nodes = [obj for obj in objects if obj.status in node_statuses
+             and np.any(obj.bbox3d[3:] > obj.bbox3d[:3])]
     edge_eligible = [obj for obj in nodes if obj.status in edge_statuses]
     spatial_edges = build_spatial_edges(
         edge_eligible, cluster_radius, z_tolerance, xy_iou_threshold, beside_max_distance, support_classes,

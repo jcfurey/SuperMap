@@ -15,10 +15,11 @@ def test_serialize_frame_matches_documented_schema():
     assert len(records) == 2
     mug_record = next(r for r in records if r["id"] == 2)
     assert set(mug_record) == {"id", "label", "bbox3d", "center", "spatial_relations", "status", "latest_stamp",
-                               "seconds_since_seen"}
+                               "seconds_since_seen", "geometry_stamp", "seconds_since_geometry"}
     assert mug_record["label"] == "mug"
     assert mug_record["status"] == "active"
     assert mug_record["latest_stamp"] == 12.5
+    assert mug_record["geometry_stamp"] is None and mug_record["seconds_since_geometry"] is None
     assert {"predicate": "on", "target_id": 1} in mug_record["spatial_relations"]
 
 
@@ -53,3 +54,11 @@ def test_seconds_since_seen_is_relative_to_now_or_the_freshest_instance():
     assert by_id[1]["seconds_since_seen"] == 0.0 and by_id[2]["seconds_since_seen"] == 30.0
     by_id = {r["id"]: r for r in serialize_frame([fresh, old], graph, now=65.0)}
     assert by_id[1]["seconds_since_seen"] == 15.0 and by_id[2]["seconds_since_seen"] == 45.0
+
+
+def test_new_2d_observation_does_not_refresh_geometry_age():
+    obj = make_object(1, "person", [0, 0, 0, 1, 1, 2], status=ObjectStatus.OCCLUDED)
+    obj.latest_stamp, obj.geometry_stamp = 49.0, 10.0
+    record = serialization.serialize_instance(obj, sg.SceneGraph(node_ids=[1]), now=50.0)
+    assert record["seconds_since_seen"] == 1.0
+    assert record["geometry_stamp"] == 10.0 and record["seconds_since_geometry"] == 40.0

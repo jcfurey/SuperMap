@@ -780,7 +780,8 @@ class SemanticMappingNode(Node):
             label_marker.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
             status = obj.status.value
             if obj.status == ObjectStatus.OCCLUDED:
-                status = f"occluded {max(now - obj.latest_stamp, 0.0):.0f}s"
+                measured = obj.geometry_stamp if obj.geometry_stamp is not None else obj.latest_stamp
+                status = f"occluded {max(now - measured, 0.0):.0f}s"
             label_marker.text = f"{instance_id}:{obj.label} ({status})"
             marker_array.markers.append(label_marker)
 

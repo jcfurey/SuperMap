@@ -209,6 +209,51 @@ def test_disappearance_counts_contradicted_points_even_after_pruning():
     assert obj.status == ObjectStatus.DISAPPEARED
 
 
+def _compact_body():
+    from semantic_mapping.geometry_utils import back_project_depth
+    m = ObjectMap(dynamic_geometry_labels=['person'], dynamic_geometry_min_extent_fraction=.35)
+    K, T, depth = _identity_camera_looking_at_z()
+    mask = np.zeros_like(depth, dtype=bool)
+    mask[10:61:5,49:52] = True  # sparse torso returns
+    mask[52:61,40:61] = True    # dense foot/floor returns dominate the count
+    points = back_project_depth(K, depth, mask)
+    obj = m.spawn(np.array([40., 10., 61., 61.]), points, 'person', .9, 0.)
+    obj.status = ObjectStatus.ACTIVE
+    return m, obj, K, T, depth
+
+
+def test_compact_body_retires_when_only_a_dense_floor_fragment_is_supported():
+    m, obj, K, T, depth = _compact_body()
+    old_box = obj.bbox3d.copy()
+    depth[:52] = 8.  # torso is observed empty, feet still coincide with the floor
+    m.update_unmatched(obj, K, T, depth)
+    assert obj.status == ObjectStatus.DISAPPEARED
+    np.testing.assert_array_equal(obj.bbox3d, old_box)  # history keeps the last body, not a shrinking fragment
+
+
+def test_compact_body_keeps_unknown_occluded_and_out_of_view_geometry():
+    for reading, in_view in [(0., True), (1., True), (8., False)]:
+        m, obj, K, T, depth = _compact_body()
+        points = obj.points_world.copy()
+        depth[:] = reading
+        for _ in range(35):
+            m.update_unmatched(obj, K, T, depth, in_view=in_view)
+        assert obj.status == ObjectStatus.OCCLUDED
+        np.testing.assert_array_equal(obj.points_world, points)
+
+
+def test_dynamic_merge_chooses_latest_geometry_not_latest_2d_detection():
+    m = ObjectMap(dynamic_geometry_labels=['person'])
+    box = np.array([0.,0.,10.,10.])
+    old = m.spawn(box, np.array([[0.,0.,2.],[.1,.1,2.]]), 'person', .9, 1.)
+    fresh = m.spawn(box, np.array([[0.,0.,2.1],[.1,.1,2.1]]), 'person', .9, 2.)
+    old.latest_stamp = 3.  # a newer image had no usable depth
+    expected = fresh.points_world.copy()
+    m.merge_duplicates(distance_threshold=.25)
+    assert old.latest_stamp == 3. and old.geometry_stamp == 2.
+    np.testing.assert_array_equal(old.points_world, expected)
+
+
 def test_bbox_is_padded_by_half_voxel_so_single_face_views_have_volume():
     m = ObjectMap(voxel_size=0.1)
     obj = m.spawn(np.array([0.0, 0.0, 10.0, 10.0]), np.array([[0.0, 0.0, 1.0], [0.0, 0.5, 1.5]]), "chair", 0.9, 0.0)

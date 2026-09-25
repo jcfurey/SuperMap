@@ -260,6 +260,7 @@ def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance
 
 def foreground_depth_mask(
     depths: Array, gap_m: float, min_points: int = 5, min_fraction: float = 0.1,
+    *, pixels: Array | None = None, min_span: Array | None = None,
 ) -> Array:
     """Keep the nearest supported depth layer, even when background dominates.
 
@@ -269,6 +270,8 @@ def foreground_depth_mask(
     layer means unknown geometry. Call before filling sparse depth: invented
     neighbours must not count as independent support. This is intended for
     compact foreground objects, not structures extending through many depths.
+    Optional image coordinates and minimum spans require each candidate to
+    cover the silhouette in both image axes, rather than just its feet.
     """
     keep = np.zeros(depths.shape, dtype=bool)
     valid_indices = np.flatnonzero(np.isfinite(depths) & (depths > 0))
@@ -279,9 +282,16 @@ def foreground_depth_mask(
     boundaries = np.concatenate(([0], splits, [order.size]))
     required = max(min_points, int(np.ceil(min_fraction * order.size)))
     supported = np.flatnonzero(np.diff(boundaries) >= required)
-    if supported.size:
-        i = supported[0]
-        keep[order[boundaries[i]:boundaries[i + 1]]] = True
+    for i in supported:
+        indices = order[boundaries[i]:boundaries[i + 1]]
+        if min_span is not None:
+            if pixels is None:
+                raise ValueError("pixels are required with min_span")
+            span = np.diff(np.percentile(pixels[indices], [5, 95], axis=0), axis=0)[0] + 1
+            if np.any(span < min_span):
+                continue
+        keep[indices] = True
+        break
     return keep
 
 
