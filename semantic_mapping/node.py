@@ -516,11 +516,11 @@ class SemanticMappingNode(Node):
                 f"TF lookup failed, skipping frame: {exc}", throttle_duration_sec=5.0)
             return
 
-        intrinsics = camera_info_to_intrinsics(info_msg)
         try:
+            intrinsics = camera_info_to_intrinsics(info_msg)
             rgb = self._decode_rgb(rgb_msg, intrinsics)
         except ValueError as exc:
-            self.get_logger().error(f"cannot decode RGB image: {exc}", throttle_duration_sec=5.0)
+            self.get_logger().error(f"invalid camera input: {exc}", throttle_duration_sec=5.0)
             return
 
         if self.depth_from_image:
@@ -665,14 +665,14 @@ class SemanticMappingNode(Node):
         return transform_to_se3(self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time.from_msg(stamp)))
 
     def _decode_rgb(self, rgb_msg, intrinsics: CameraIntrinsics) -> np.ndarray:
-        """RGB (H, W, 3) at the CameraInfo resolution from an Image or CompressedImage."""
+        """Decode at the ROI/binning-adjusted CameraInfo size without stretching pixels."""
         rgb = image_to_numpy(rgb_msg)
         if rgb.ndim == 2:
             rgb = np.repeat(rgb[:, :, None], 3, axis=2)
         if rgb.shape[:2] != (intrinsics.height, intrinsics.width):
-            import cv2
-
-            rgb = cv2.resize(rgb, (intrinsics.width, intrinsics.height), interpolation=cv2.INTER_AREA)
+            raise ValueError(
+                f"image {rgb.shape[1]}x{rgb.shape[0]} does not match CameraInfo after ROI/binning "
+                f"({intrinsics.width}x{intrinsics.height}); supply matching image calibration")
         return np.ascontiguousarray(rgb)
 
     # ---------------------------------------------------------------- publish

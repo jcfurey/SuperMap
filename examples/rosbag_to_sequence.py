@@ -252,9 +252,8 @@ def main() -> None:
                 print(f"skipping frame at t={rgb_stamp:.3f}: {exc}")
             return
         if rgb.shape[:2] != (intrinsics.height, intrinsics.width):
-            import cv2
-
-            rgb = cv2.resize(rgb, (intrinsics.width, intrinsics.height), interpolation=cv2.INTER_AREA)
+            skipped["rgb_size_mismatch"] += 1
+            return
         if depth.shape != (intrinsics.height, intrinsics.width):
             skipped["depth_size_mismatch"] += 1
             return

@@ -67,3 +67,54 @@ def test_pointcloud_to_xyz_drops_nans():
     cloud = pc2.create_cloud_xyz32(Header(frame_id="x"), [[1.0, 2.0, 3.0], [float("nan"), 0.0, 0.0], [4.0, 5.0, 6.0]])
     xyz = ros_msgs.pointcloud_to_xyz(cloud)
     assert xyz.shape == (2, 3) and np.allclose(xyz, [[1, 2, 3], [4, 5, 6]])
+
+
+@pytest.mark.parametrize('binning', [(0, 0), (2, 3)])
+def test_cropped_camera_info_preserves_full_sensor_rays(binning):
+    import copy
+    from semantic_mapping.geometry_utils import back_project_depth
+
+    info = sensor_msgs.CameraInfo(width=256, height=128,
+                                 k=[128., 0., 127.5, 0., 96., 63.5, 0., 0., 1.],
+                                 binning_x=binning[0], binning_y=binning[1])
+    info.roi = sensor_msgs.RegionOfInterest(x_offset=32, y_offset=8, width=192, height=96)
+    original = copy.deepcopy(info)
+    intr = ros_msgs.camera_info_to_intrinsics(info)
+    bx, by = max(1, binning[0]), max(1, binning[1])
+    assert (intr.width, intr.height) == (192 // bx, 96 // by)
+    depth = np.zeros((intr.height, intr.width))
+    depth[7, 11] = 4.
+    points = back_project_depth(intr.K, depth)
+    # The cropped pixel must back-project along its original full-sensor ray.
+    expected = [[(32 + 11 * bx - 127.5) / 128 * 4, (8 + 7 * by - 63.5) / 96 * 4, 4.]]
+    np.testing.assert_allclose(points, expected)
+    assert info == original
+
+
+def test_full_camera_info_roi_and_default_roi_are_equivalent():
+    info = sensor_msgs.CameraInfo(width=256, height=128, binning_x=2, binning_y=2,
+                                 k=[128., 0., 127.5, 0., 96., 63.5, 0., 0., 1.])
+    default = ros_msgs.camera_info_to_intrinsics(info)
+    info.roi = sensor_msgs.RegionOfInterest(width=256, height=128)
+    explicit = ros_msgs.camera_info_to_intrinsics(info)
+    assert default == explicit
+    assert (explicit.width, explicit.height, explicit.cx, explicit.cy) == (128, 64, 63.75, 31.75)
+
+
+@pytest.mark.parametrize('invalid', ['uncalibrated', 'nonfinite', 'empty', 'partial_roi', 'outside_roi', 'binning'])
+def test_invalid_camera_info_is_rejected(invalid):
+    info = sensor_msgs.CameraInfo(width=256, height=128, k=[128., 0., 127.5, 0., 96., 63.5, 0., 0., 1.])
+    if invalid == 'uncalibrated':
+        info.k[0] = 0.
+    elif invalid == 'nonfinite':
+        info.k[2] = np.nan
+    elif invalid == 'empty':
+        info.width = 0
+    elif invalid == 'partial_roi':
+        info.roi.x_offset = 32
+    elif invalid == 'outside_roi':
+        info.roi = sensor_msgs.RegionOfInterest(x_offset=250, width=20, height=30)
+    else:
+        info.binning_y = 256
+    with pytest.raises(ValueError, match='CameraInfo'):
+        ros_msgs.camera_info_to_intrinsics(info)
