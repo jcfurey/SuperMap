@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # SuperMap container: ROS 2 Jazzy on Ubuntu 24.04. The repository root holds
-# two colcon packages -- semantic_mapping (ament_python) and supermap_msgs
-# (interfaces) -- which are built together in /workspace.
+# three colcon packages -- semantic_mapping (ament_python), supermap_msgs
+# (interfaces) and supermap_kernels (C++ kernels) -- which are built together
+# in /workspace.
 #
 # The heavy open-vocabulary detector stack (torch, ultralytics/YOLOE) is
 # behind the INSTALL_DETECTORS build arg since it is multi-gigabyte and only
@@ -50,6 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-yaml \
         python3-opencv \
         python3-pytest \
+        pybind11-dev \
         ros-${ROS_DISTRO}-tf2-ros \
         ros-${ROS_DISTRO}-message-filters \
         ros-${ROS_DISTRO}-sensor-msgs-py \
@@ -88,7 +90,7 @@ COPY . .
 
 WORKDIR /workspace
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
-    && colcon build --symlink-install --packages-select supermap_msgs semantic_mapping
+    && colcon build --symlink-install --packages-select supermap_msgs supermap_kernels semantic_mapping
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

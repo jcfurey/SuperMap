@@ -1,0 +1,18 @@
+# pip build of the same extension colcon builds from CMakeLists.txt:
+#   python -m pip install ./supermap_kernels
+[build-system]
+requires = ["scikit-build-core>=0.8", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "supermap-kernels"
+version = "0.1.0"
+description = "Compiled kernels for SuperMap's semantic_mapping package (optional; NumPy/SciPy is the reference)."
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+cmake.version = ">=3.18"
+cmake.build-type = "Release"
+wheel.packages = ["supermap_kernels"]

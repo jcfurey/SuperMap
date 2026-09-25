@@ -26,6 +26,9 @@
   <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>supermap_msgs</exec_depend>
+  <!-- Compiled kernels for the dense-cloud surface graph and depth splatting;
+       the NumPy/SciPy fallback runs without them. -->
+  <exec_depend>supermap_kernels</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>sensor_msgs_py</exec_depend>
   <exec_depend>std_msgs</exec_depend>

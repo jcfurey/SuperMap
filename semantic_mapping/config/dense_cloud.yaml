@@ -61,7 +61,8 @@
     min_region_voxels: 4
     max_map_voxels: 500000  # explicit error at capacity, never a silent crop
     chunk_size: 4096
-    kdtree_workers: -1  # KD-tree query threads (-1 = all cores); lower it to leave cores for SLAM
+    workers: -1  # neighbour-search / surface-graph threads (-1 = all cores); lower it to leave cores for SLAM
+    native_kernels: true  # use the compiled supermap_kernels package when installed (NumPy/SciPy otherwise)
     incremental_segmentation: true  # re-segment only near changed voxels
     camera_depth_tolerance: 0.05
     max_camera_time_delta: 0.20  # image capture time, not annotation arrival time

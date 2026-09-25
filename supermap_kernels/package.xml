@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>supermap_kernels</name>
+  <version>0.1.0</version>
+  <description>
+    Compiled (C++/pybind11) kernels for semantic_mapping: dense-cloud surface
+    normals, surface-graph edges and components, and depth-buffer splatting.
+    The NumPy/SciPy implementations in semantic_mapping remain the reference
+    and the fallback when this module is not installed.
+  </description>
+  <maintainer email="jcameronfurey@gmail.com">jcfurey</maintainer>
+  <license>MIT</license>
+  <url type="repository">https://github.com/jcfurey/SuperMap</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <build_depend>pybind11-dev</build_depend>
+  <build_depend>python3-dev</build_depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
