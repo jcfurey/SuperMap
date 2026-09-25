@@ -34,6 +34,13 @@ class YOLOEDetector(Detector):
         self.text_encoder_path = text_encoder_path
         # FP16 inference only on CUDA; CPU half precision is slow or unsupported.
         self.half = bool(half) and str(device).startswith("cuda")
+        # Ultralytics 8.4 replaced half=True with quantize=16 and warns on every
+        # predict() that still passes half; older releases only know half.
+        try:
+            from ultralytics.cfg import DEFAULT_CFG_DICT
+            self._fp16_kwargs = {"quantize": 16} if "quantize" in DEFAULT_CFG_DICT else {"half": True}
+        except ImportError:
+            self._fp16_kwargs = {"half": True}
         self.mask_threshold = float(mask_threshold)
         self._current_prompts: list[str] | None = None
 
@@ -57,7 +64,7 @@ class YOLOEDetector(Detector):
 
         predict_kwargs = dict(device=self.device, conf=self.confidence_threshold, verbose=False, retina_masks=True)
         if self.half:
-            predict_kwargs["half"] = True
+            predict_kwargs.update(self._fp16_kwargs)
         results = self.model.predict(
             np.ascontiguousarray(rgb_image[:, :, ::-1]),  # Ultralytics numpy inputs are BGR.
             **predict_kwargs,
