@@ -1,6 +1,8 @@
 """Ultralytics YOLOE backend: real-time open-vocabulary detection via text prompts."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from semantic_mapping.detectors.base import Detector
@@ -13,7 +15,10 @@ class YOLOEDetector(Detector):
         checkpoint: str = "yoloe-v8l-seg.pt",
         device: str = "cuda",
         confidence_threshold: float = 0.25,
+        text_encoder_path: str | None = None,
     ) -> None:
+        if text_encoder_path is not None and not Path(text_encoder_path).is_file():
+            raise ValueError("text_encoder_path must name an existing local TorchScript encoder")
         try:
             from ultralytics import YOLOE
         except ImportError as exc:
@@ -24,12 +29,20 @@ class YOLOEDetector(Detector):
         self.model = YOLOE(checkpoint)
         self.device = device
         self.confidence_threshold = confidence_threshold
+        self.text_encoder_path = text_encoder_path
         self._current_prompts: list[str] | None = None
 
     def _set_vocabulary(self, prompts: list[str]) -> None:
         if prompts == self._current_prompts:
             return
-        text_embeddings = self.model.get_text_pe(prompts)
+        if self.text_encoder_path is None:
+            text_embeddings = self.model.get_text_pe(prompts)
+        else:
+            # Explicit local encoder: do not fetch an implicit model by name.
+            from ultralytics.nn.text_model import MobileCLIPTS
+            device = next(self.model.model.parameters()).device
+            self.model.model.clip_model = MobileCLIPTS(device=device, weight=self.text_encoder_path)
+            text_embeddings = self.model.model.get_text_pe(prompts, cache_clip_model=True)
         self.model.set_classes(prompts, text_embeddings)
         self._current_prompts = list(prompts)
 

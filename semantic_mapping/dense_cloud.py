@@ -36,8 +36,11 @@ class DenseCloudConfig:
     min_camera_score: float = 0.5
     label_propagation_radius: float = 0.0
     label_ttl_sec: float = 0.0
+    allow_yoloe_labels: bool = False
 
     def __post_init__(self):
+        if type(self.allow_yoloe_labels) is not bool:
+            raise ValueError("allow_yoloe_labels must be a boolean")
         if self.input_mode not in {"snapshot", "scan"}:
             raise ValueError("input_mode must be snapshot or scan")
         for name in ("voxel_size", "neighbor_radius", "normal_radius", "plane_tolerance",
@@ -78,10 +81,9 @@ class CameraLabels:
     depth: np.ndarray | None = None
     source: str = "manual"
 
-    def validate(self):
-        # No model-backed annotation provider has yet passed the US-only audit.
-        if self.source != "manual":
-            raise ValueError("only manual camera annotations are enabled; no model provider is approved")
+    def validate(self, *, allow_yoloe=False):
+        if self.source != "manual" and not (allow_yoloe and self.source == "yoloe"):
+            raise ValueError("only manual camera annotations are enabled unless YOLOE is explicitly allowed")
         if not math.isfinite(self.stamp):
             raise ValueError("camera stamp must be finite")
         rigid_transform(self.T_world_from_camera)
@@ -213,6 +215,7 @@ class DenseCloudPipeline:
         self._input_map = np.empty(0, np.int64)
         self._visible = np.empty(0, bool)
         self._last_camera = None
+        self._annotation_sources = set()
 
     def _stable_regions(self, components, old_region):
         result = np.full(len(components), -1, dtype=np.int32)
@@ -293,7 +296,7 @@ class DenseCloudPipeline:
         return self.result()
 
     def annotate(self, camera: CameraLabels) -> CloudResult:
-        camera.validate()
+        camera.validate(allow_yoloe=self.config.allow_yoloe_labels)
         if not math.isfinite(self.stamp):
             raise ValueError("a cloud must arrive before camera labels")
         if abs(camera.stamp-self.stamp) > self.config.max_camera_time_delta:
@@ -360,6 +363,7 @@ class DenseCloudPipeline:
         np.maximum.at(self.confidence, map_index, scores)
         self.label_stamp[map_index] = camera.stamp
         self.labels, self._visible, self._last_camera = new_labels, visible_points, float(camera.stamp)
+        self._annotation_sources.add(camera.source)
         return self.result()
 
     def result(self) -> CloudResult:
@@ -395,7 +399,8 @@ class DenseCloudPipeline:
                  "camera_stamp": self._last_camera,
                  "direct_labeled_voxels": int((self.semantic > 0).sum()),
                  "propagated_voxels": int((source == PROPAGATED).sum()),
-                 "pretrained_models": [], "geometry_is_semantic_instances": False}
+                 "pretrained_models": [], "annotation_sources": sorted(self._annotation_sources),
+                 "geometry_is_semantic_instances": False}
         return CloudResult(self.stamp, self._input.copy(), valid.copy(), regions_out,
                            semantics_out, confidence_out, source_out, self._visible.copy(),
                            dict(self.labels), self.points.copy(), self.regions.copy(), semantic,

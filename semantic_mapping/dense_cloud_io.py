@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+from dataclasses import asdict
 import json
 from pathlib import Path
 
@@ -9,19 +11,49 @@ import numpy as np
 
 from semantic_mapping.dense_cloud import CameraLabels, CloudResult
 from semantic_mapping.types import CameraIntrinsics, Detection2D
+from semantic_mapping.ros_msgs import stamp_to_seconds
 
 ANNOTATION_FIELDS = ("region_id", "semantic_id", "semantic_confidence", "label_source", "camera_visible", "valid_geometry")
 
 
-def camera_labels_from_dict(payload: dict, *, intrinsics=None, T_world_from_camera=None) -> CameraLabels:
-    """Decode manual masks on a calibrated, rectified pinhole image grid.
+def mask_runs(mask):
+    """Encode foreground spans in row-major order, including empty/full masks."""
+    flat = np.asarray(mask, dtype=bool).reshape(-1)
+    edges = np.flatnonzero(np.diff(np.r_[False, flat, False].astype(np.int8)))
+    return np.column_stack([edges[::2], edges[1::2]-edges[::2]]).tolist()
+
+
+def annotations_payload(header, intrinsics, detections, model):
+    items = []
+    for detection in detections:
+        if detection.mask is None:
+            raise ValueError("YOLOE must return segmentation masks; boxes alone are not labels")
+        detection.validate_mask((intrinsics.height, intrinsics.width))
+        items.append({"label": detection.label, "score": float(detection.score),
+                      "mask_runs": mask_runs(detection.mask)})
+    return {"source": "yoloe", "rectified": True, "stamp": stamp_to_seconds(header.stamp),
+            "frame_id": header.frame_id, "intrinsics": asdict(intrinsics),
+            "detections": items, "model": model}
+
+
+def sha256_file(path):
+    with path.open("rb") as stream:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024*1024), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+
+def camera_labels_from_dict(payload: dict, *, intrinsics=None, T_world_from_camera=None,
+                            allow_yoloe=False) -> CameraLabels:
+    """Decode allowed masks on a calibrated, rectified pinhole image grid.
 
     Each detection supplies flattened row-major ``mask_indices`` or pairs of
     ``[start, length]`` in ``mask_runs``. Runs are foreground spans, not COCO RLE.
     Callers may provide TF-derived pose and CameraInfo-derived intrinsics.
     """
-    if payload.get("source") != "manual":
-        raise ValueError("source must be manual; learned annotation sources are not approved")
+    if payload.get("source") != "manual" and not (allow_yoloe and payload.get("source") == "yoloe"):
+        raise ValueError("source must be manual unless YOLOE is explicitly allowed")
     if payload.get("rectified") is not True:
         raise ValueError("annotations must declare rectified=true and use matching pinhole calibration")
     if intrinsics is None:
@@ -30,7 +62,7 @@ def camera_labels_from_dict(payload: dict, *, intrinsics=None, T_world_from_came
         T_world_from_camera = np.asarray(payload["T_world_from_camera"], dtype=np.float64)
     camera = CameraLabels(float(payload["stamp"]), intrinsics, T_world_from_camera,
                           source=payload["source"])
-    camera.validate()
+    camera.validate(allow_yoloe=allow_yoloe)
     size = intrinsics.width*intrinsics.height
     if size > 100_000_000:
         raise ValueError("camera image exceeds 100 million pixels")
@@ -62,7 +94,7 @@ def camera_labels_from_dict(payload: dict, *, intrinsics=None, T_world_from_came
     camera.detections = detections
     if "depth" in payload:
         camera.depth = np.asarray(payload["depth"], dtype=np.float64)
-    camera.validate()
+    camera.validate(allow_yoloe=allow_yoloe)
     return camera
 
 

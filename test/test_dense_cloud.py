@@ -10,6 +10,22 @@ def make_pipeline(**kwargs):
     return DenseCloudPipeline(DenseCloudConfig(min_region_voxels=1, **kwargs))
 
 
+def test_yoloe_exception_is_explicit_and_does_not_label_unseen_geometry():
+    points = np.array([[0., 0., 2.], [10., 0., 2.]])
+    strict = make_pipeline()
+    strict.update(points, 1.)
+    with pytest.raises(ValueError, match="explicitly allowed"):
+        strict.annotate(camera(source="yoloe"))
+    allowed = make_pipeline(allow_yoloe_labels=True)
+    allowed.update(points, 1.)
+    result = allowed.annotate(camera(source="yoloe"))
+    assert result.semantic_ids.tolist() == [1, 0]
+    assert result.stats["annotation_sources"] == ["yoloe"]
+    np.testing.assert_array_equal(result.points_world, points)
+    with pytest.raises(ValueError, match="explicitly allowed"):
+        allowed.annotate(camera(source="another_model"))
+
+
 def camera(stamp=1., mask=None, label="chair", **kwargs):
     intr = CameraIntrinsics(10., 10., 5., 5., 10, 10)
     if mask is None:

@@ -13,6 +13,10 @@ semantic_mapping_node:
     obj_points_topic: /obj_points
     obj_boxes_topic: /obj_boxes
     annotated_image_topic: /semantic_mapping/annotated_image
+    # Share the existing YOLOE inference with full-cloud fusion, preserving tracking/boxes.
+    publish_dense_camera_annotations: false
+    dense_camera_images_rectified: false
+    dense_camera_annotations_topic: /supermap/camera_annotations
 
     world_frame: map
     camera_frame: camera_color_optical_frame
@@ -59,6 +63,7 @@ semantic_mapping_node:
       checkpoint: yoloe-v8l-seg.pt
       device: cuda
       confidence_threshold: 0.25
+      text_encoder_path: ""  # local MobileCLIP TorchScript asset; required for dense mask export
       sam2_checkpoint: ""       # optional; "-seg" checkpoints already produce masks
       sam2_model_cfg: ""
 

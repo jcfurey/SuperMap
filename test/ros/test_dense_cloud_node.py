@@ -1,5 +1,6 @@
 """Real ROS messages through the independent full-cloud node; no live sensors."""
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -15,7 +16,7 @@ from test.ros.helpers import stamp_msg
 @pytest.fixture
 def dense_node():
     rclpy.init(args=["--ros-args", "-p", "cloud_topic:=/test/dense_cloud", "-p", "input_mode:=scan",
-                    "-p", "world_frame:=map", "-p", "min_region_voxels:=1"])
+                    "-p", "world_frame:=map", "-p", "min_region_voxels:=1", "-p", "camera_annotation_queue_size:=8"])
     node = DenseCloudMappingNode()
     node.published_clouds, node.published_maps, node.published_metadata = [], [], []
     node.cloud_pub.publish = node.published_clouds.append
@@ -98,3 +99,49 @@ def test_zero_stamp_never_requests_latest_dynamic_tf(dense_node):
     node = dense_node
     node._on_cloud(cloud([[0., 0., 2.]], stamp=0., frame="sensor"))
     assert node._rejected_clouds == 1 and not node.published_clouds
+
+
+def test_annotations_arriving_before_their_cloud_are_queued_and_applied(dense_node):
+    node = dense_node
+    node._on_annotations(manual_labels(stamp=2.))
+    assert len(node._pending_annotations) == 1 and not node.published_clouds
+    node._on_cloud(cloud([[0., 0., 2.], [10., 0., 2.]], stamp=1.))
+    assert node.pipeline.result().semantic_ids.tolist() == [0, 0]
+    node._on_cloud(cloud([[0., 0., 2.], [10., 0., 2.]], stamp=2.))
+    assert node.pipeline.result().semantic_ids.tolist() == [1, 0]
+    assert not node._pending_annotations and node._applied_annotations == 1
+
+
+def test_queued_annotations_are_bounded_and_expire_without_labeling_newer_cloud(dense_node):
+    node = dense_node
+    for stamp in range(1, 21):
+        node._on_annotations(manual_labels(stamp=float(stamp)))
+    assert len(node._pending_annotations) == 8
+    node._on_cloud(cloud([[0., 0., 2.]], stamp=30.))
+    assert node.pipeline.result().semantic_ids.tolist() == [0]
+    assert not node._pending_annotations and node._expired_annotations == 20
+
+
+def test_mask_reception_continues_while_cloud_segmentation_is_busy(dense_node, monkeypatch):
+    node = dense_node
+    started, release = threading.Event(), threading.Event()
+    original = node.pipeline.update
+
+    def slow_update(*args):
+        started.set()
+        assert release.wait(5.0)
+        return original(*args)
+
+    monkeypatch.setattr(node.pipeline, "update", slow_update)
+    worker = threading.Thread(target=node._on_cloud, args=(cloud([[0., 0., 2.], [10., 0., 2.]]),))
+    worker.start()
+    try:
+        assert started.wait(5.0)
+        node._on_annotations(manual_labels())
+        assert len(node._pending_annotations) == 1 and node._applied_annotations == 0
+    finally:
+        release.set()
+        worker.join(5.0)
+    assert not worker.is_alive()
+    assert node.pipeline.result().semantic_ids.tolist() == [1, 0]
+    assert node._applied_annotations == 1

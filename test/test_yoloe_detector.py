@@ -68,3 +68,28 @@ def test_yoloe_rejects_a_backend_that_returns_inference_sized_masks(monkeypatch)
     monkeypatch.setitem(sys.modules, 'ultralytics', SimpleNamespace(YOLOE=lambda path: model))
     with pytest.raises(ValueError, match='boolean mask of shape'):
         YOLOEDetector(device='cpu').detect(np.zeros((720, 1280, 3), dtype=np.uint8))
+
+
+def test_explicit_local_text_encoder_is_used_once_for_fixed_vocabulary(monkeypatch, tmp_path):
+    calls = []
+    encoder = tmp_path/'encoder.ts'
+    encoder.write_bytes(b'fake')
+    inner = SimpleNamespace(parameters=lambda: iter([SimpleNamespace(device='cpu')]),
+                            get_text_pe=lambda prompts, **kwargs: calls.append(('embeddings', kwargs)))
+    model = SimpleNamespace(model=inner, set_classes=lambda prompts, pe: calls.append(('classes', prompts)))
+    monkeypatch.setitem(sys.modules, 'ultralytics', SimpleNamespace(YOLOE=lambda path: model))
+    monkeypatch.setitem(sys.modules, 'ultralytics.nn.text_model', SimpleNamespace(
+        MobileCLIPTS=lambda **kwargs: calls.append(('encoder', kwargs))))
+    detector = YOLOEDetector(device='cpu', text_encoder_path=str(encoder))
+    detector._set_vocabulary(['pipe'])
+    detector._set_vocabulary(['pipe'])
+    assert calls == [('encoder', {'device': 'cpu', 'weight': str(encoder)}),
+                     ('embeddings', {'cache_clip_model': True}), ('classes', ['pipe'])]
+
+
+def test_missing_explicit_encoder_fails_before_model_construction(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setitem(sys.modules, 'ultralytics', SimpleNamespace(YOLOE=lambda path: calls.append(path)))
+    with pytest.raises(ValueError, match='existing local'):
+        YOLOEDetector(text_encoder_path=str(tmp_path/'missing.ts'))
+    assert not calls

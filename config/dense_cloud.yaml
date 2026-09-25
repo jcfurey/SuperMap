@@ -12,7 +12,10 @@ dense_cloud_mapping:
 
     # Optional camera annotations. No camera or RGB message is needed for geometry.
     # The tunnel bag is Ouster + Lucid. D435i is a separate indoor depth source.
-    # Messages describe manual masks; this node loads no learned models.
+    # Messages describe manual masks or explicitly allowed YOLOE masks.
+    # The cloud node itself loads no learned models.
+    allow_yoloe_labels: false
+    camera_annotation_queue_size: 512  # compressed masks, retained for delayed map snapshots
     camera_annotations_topic: /supermap/camera_annotations
     camera_info_topic: ""  # optional when annotations include calibrated intrinsics
 

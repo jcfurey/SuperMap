@@ -27,6 +27,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path as FilePath
 
 import numpy as np
 import rclpy
@@ -112,6 +113,7 @@ class SemanticMappingNode(Node):
         self.world_frame = self._param_str("world_frame", "map")
         self.camera_frame = self._param_str("camera_frame", "camera_color_optical_frame")
         self.prompts = self._load_prompts(self._param_str("prompts_file", "config/prompts.yaml"))
+        self._dense_annotation_model = self._configure_dense_annotations()
 
         self.pipeline = SemanticMappingPipeline(self._build_pipeline_config())
         self.detector = build_detector(self._param_str("detector", "offline"), **self._detector_kwargs())
@@ -214,6 +216,9 @@ class SemanticMappingNode(Node):
             "obj_points_topic": "/obj_points",
             "obj_boxes_topic": "/obj_boxes",
             "annotated_image_topic": "/semantic_mapping/annotated_image",
+            "publish_dense_camera_annotations": False,
+            "dense_camera_images_rectified": False,
+            "dense_camera_annotations_topic": "/supermap/camera_annotations",
             "world_frame": "map",
             "camera_frame": "camera_color_optical_frame",
             "sync_slop_sec": 0.05,
@@ -257,6 +262,7 @@ class SemanticMappingNode(Node):
         self.declare_parameter("yoloe.checkpoint", "yoloe-v8l-seg.pt")
         self.declare_parameter("yoloe.device", "cuda")
         self.declare_parameter("yoloe.confidence_threshold", 0.25)
+        self.declare_parameter("yoloe.text_encoder_path", "")
         self.declare_parameter("yoloe.sam2_checkpoint", "")
         self.declare_parameter("yoloe.sam2_model_cfg", "")
         self.declare_parameter("groundingdino.config_path", "")
@@ -294,6 +300,7 @@ class SemanticMappingNode(Node):
                 "checkpoint": self._param_str("yoloe.checkpoint", "yoloe-v8l-seg.pt"),
                 "device": self._param_str("yoloe.device", "cuda"),
                 "confidence_threshold": float(self.get_parameter("yoloe.confidence_threshold").value),
+                "text_encoder_path": self._param_str("yoloe.text_encoder_path", "") or None,
                 "sam2_checkpoint": self._param_str("yoloe.sam2_checkpoint", "") or None,
                 "sam2_model_cfg": self._param_str("yoloe.sam2_model_cfg", "") or None,
             }
@@ -308,6 +315,24 @@ class SemanticMappingNode(Node):
                 "text_threshold": float(self.get_parameter("groundingdino.text_threshold").value),
             }
         return {"detections_dir": self._param_str("offline.detections_dir", "")}
+
+    def _configure_dense_annotations(self):
+        if not self.get_parameter("publish_dense_camera_annotations").value:
+            return None
+        if (self._param_str("detector", "offline") != "yoloe"
+                or self._param_str("yoloe.sam2_checkpoint", "")):
+            raise ValueError("dense camera export supports only the explicit YOLOE exception, without extra models")
+        if not self.get_parameter("dense_camera_images_rectified").value:
+            raise ValueError("dense camera export requires dense_camera_images_rectified=true")
+        paths = [FilePath(self._param_str(key, "")).expanduser() for key in
+                 ("yoloe.checkpoint", "yoloe.text_encoder_path")]
+        if not all(path.is_file() for path in paths):
+            raise ValueError("dense camera export requires existing local YOLOE checkpoint and text encoder")
+        from semantic_mapping.dense_cloud_io import sha256_file
+        digests = [sha256_file(path) for path in paths]
+        return {"name": "YOLOE", "exception": "explicitly_allowed_non_US_origin",
+                "checkpoint": paths[0].name, "checkpoint_sha256": digests[0],
+                "text_encoder": paths[1].name, "text_encoder_sha256": digests[1]}
 
     def _vlm_kwargs(self) -> dict:
         """Only pass what was configured, so each backend keeps its own defaults."""
@@ -358,6 +383,9 @@ class SemanticMappingNode(Node):
             MarkerArray, self._param_str("obj_boxes_topic", "/obj_boxes"), 10)
         self.annotated_image_pub = self.create_publisher(
             Image, self._param_str("annotated_image_topic", "/semantic_mapping/annotated_image"), 10)
+        self.dense_annotations_pub = (self.create_publisher(
+            String, self._param_str("dense_camera_annotations_topic", "/supermap/camera_annotations"), 8)
+            if self._dense_annotation_model is not None else None)
 
         self.query_sub = self.create_subscription(
             String, self._param_str("query_topic", "/semantic_mapping/query"), self._on_query, 10)
@@ -519,6 +547,12 @@ class SemanticMappingNode(Node):
         try:
             intrinsics = camera_info_to_intrinsics(info_msg)
             rgb = self._decode_rgb(rgb_msg, intrinsics)
+            if self.dense_annotations_pub is not None:
+                rotation = np.asarray(info_msg.r).reshape(3, 3)
+                if (rgb_msg.header.frame_id != self.camera_frame or info_msg.header.frame_id != self.camera_frame
+                        or not np.isfinite(info_msg.d).all() or any(abs(x) > 1e-12 for x in info_msg.d)
+                        or (rotation.any() and not np.allclose(rotation, np.eye(3)))):
+                    raise ValueError("dense annotation export needs matching rectified optical calibration")
         except ValueError as exc:
             self.get_logger().error(f"invalid camera input: {exc}", throttle_duration_sec=5.0)
             return
@@ -637,6 +671,8 @@ class SemanticMappingNode(Node):
                     throttle_duration_sec=5.0)
             self._pending_frames.popleft()
             self._pending_by_id.pop(pending.observation.frame_id)
+            if pending.annotate and pending.observation.detections_evaluated:
+                self._publish_dense_camera_annotations(pending.observation, pending.header)
             result = self._process_and_publish(pending.observation, pending.header)
             if pending.annotate:
                 self._publish_annotated_image(pending.observation, result, pending.header)
@@ -676,6 +712,18 @@ class SemanticMappingNode(Node):
         return np.ascontiguousarray(rgb)
 
     # ---------------------------------------------------------------- publish
+    def _publish_dense_camera_annotations(self, observation, header):
+        if self.dense_annotations_pub is None:
+            return
+        from semantic_mapping.dense_cloud_io import annotations_payload
+        try:
+            payload = annotations_payload(header, observation.intrinsics,
+                                          observation.detections, self._dense_annotation_model)
+            self.dense_annotations_pub.publish(String(data=json.dumps(payload)))
+        except ValueError as exc:
+            self.get_logger().warning(f"Dense camera masks skipped; object tracking continues: {exc}",
+                                      throttle_duration_sec=5.0)
+
     def _publish_annotated_image(self, observation: Observation, result: FrameResult, header: Header) -> None:
         if observation.rgb is None or self.annotated_image_pub.get_subscription_count() == 0:
             return

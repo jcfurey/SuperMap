@@ -1,6 +1,6 @@
 # Full dense clouds with partial camera coverage
 
-`DenseCloudPipeline` segments geometry over the complete incoming cloud and optionally adds camera labels to visible surfaces. Camera coverage never determines which points exist in the map. Both accumulated clouds and individual registered scans are supported. This implementation runs on CPU, loads no pretrained models, and makes no network requests. Camera annotations currently accept **manual masks only** because no learned annotation provider has passed the required US creation and hosting audit.
+`DenseCloudPipeline` segments geometry over the complete incoming cloud and optionally adds camera labels to visible surfaces. Camera coverage never determines which points exist in the map. Both accumulated clouds and individual registered scans are supported. The geometry core runs on CPU, loads no pretrained models, and makes no network requests. Camera annotations accept manual masks by default. An explicitly enabled **YOLOE exception** adds automatic camera labels through a separate node; it does not qualify YOLOE as a US-created model.
 
 The tunnel capture is **Ouster LiDAR plus a Lucid camera**. Tunnel geometry comes from the Ouster cloud; Lucid supplies optional camera observations. The RealSense D435i data used for the indoor checks are a separate capture. A depth camera can supply its full XYZ cloud through the same interface.
 
@@ -79,7 +79,54 @@ Alternatively, configure `camera_info_topic` and omit `intrinsics`. CameraInfo m
 
 Projection uses the full latest dense cloud to build a nearest-surface depth buffer. Only points inside the image, in front of the camera, and within `camera_depth_tolerance` of the nearest measured surface can receive labels. When depth is supplied, it must agree as well. Conflicting classes at one pixel or voxel are left unresolved for that observation. Existing positive evidence is not negated by an empty annotation or camera absence. Multiple camera observations can contribute positive labels to different visible portions of a cloud.
 
-`max_camera_time_delta` bounds the difference between image capture and the latest cloud timestamp. A delayed result for an older cloud is rejected once it falls outside that window. This first implementation does not replay a historical cloud buffer for late inference. A non-world-frame observation with stamp 0 is rejected instead of requesting the latest dynamic TF. TF failure, invalid calibration, unapproved annotation source, and stale masks do not remove geometry.
+`max_camera_time_delta` bounds the difference between image capture and the latest cloud timestamp. A delayed result for an older cloud is rejected once it falls outside that window. Results that arrive before their matching cloud are held in a bounded `camera_annotation_queue_size` queue, then applied only to a matching cloud. Queue overflow and expired results increment `expired_annotations`; malformed or unusable matching results increment `rejected_annotations`. The queue holds compressed masks and resolves historical TF when a matching cloud is processed. At most the closest YOLOE observation per optical frame is applied to each cloud; manual observations can contribute separately. Historical clouds are not replayed for late inference. A non-world-frame observation with stamp 0 is rejected instead of requesting the latest dynamic TF. TF failure, invalid calibration, unapproved annotation source, and stale masks do not remove geometry.
+
+## Explicit YOLOE labeling exception
+
+[Ultralytics documents YOLOE](https://docs.ultralytics.com/models/yoloe/) as an image detection and segmentation model and credits its original Tsinghua authors. Enable this adapter only when that origin is an accepted exception. Other model providers remain rejected by the dense-cloud path.
+
+Set `allow_yoloe_labels: true` in the cloud node configuration.
+
+To preserve the existing tracker, object identities, 3D boxes and camera overlay, use the existing `semantic_mapping_node` with:
+
+```yaml
+publish_dense_camera_annotations: true
+dense_camera_images_rectified: true
+dense_camera_annotations_topic: /supermap/camera_annotations
+detector: yoloe
+yoloe:
+  checkpoint: /absolute/path/to/yoloe-v8l-seg.pt
+  text_encoder_path: /absolute/path/to/mobileclip_blt.ts
+```
+
+This shares the already running detector's masks with dense fusion; it does not start a second model. Keep its pointcloud input on the live deskewed Ouster topic and its RGB/CameraInfo inputs on the rectified Lucid stream. The tracker retains its normal `/obj_points`, `/obj_boxes` and annotated-image outputs, including existing foreground filtering and dynamic object handling. Dense geometry runs separately and does not pace the tracker. Model export requires local assets, the YOLOE backend without an extra refinement model, and explicit rectified-image configuration. Masks carry the original image timestamp.
+
+For an independent camera-only label producer when object tracking is not needed, copy `config/dense_yoloe.yaml` to a deployment configuration and set:
+
+- `allow_yoloe: true` and `images_rectified: true`.
+- Absolute paths to an existing YOLOE segmentation `checkpoint` and matching local MobileCLIP TorchScript `text_encoder_path` (the tunnel deployment uses YOLOE-v8l and `mobileclip_blt.ts`). Missing files fail before model construction; no download is requested by this adapter.
+- Rectified `rgb_topic` and matching `camera_info_topic`. Camera inference needs no cloud or accumulated-map subscription.
+- The desired `prompts`. Keep `confidence_threshold` and the cloud node's `min_camera_score` consistent.
+
+Run the adapter in an environment that already contains Ultralytics, Torch, OpenCV, the CLIP tokenizer and ROS:
+
+```bash
+ros2 run semantic_mapping dense_yoloe_labels_node --ros-args \
+  --params-file /path/to/deployment-dense-yoloe.yaml
+# Or, from this repository with ROS sourced and its Python dependencies available:
+python3 -m semantic_mapping.dense_yoloe_node --ros-args \
+  --params-file /path/to/deployment-dense-yoloe.yaml
+```
+
+The independent camera adapter runs directly on synchronized RGB/CameraInfo pairs, up to `max_rate_hz` (20 Hz by default). Neither live clouds nor accumulated maps gate image inference or the annotated camera display. The image capture timestamp and optical frame accompany every mask. CameraInfo must describe the actual rectified image dimensions with zero distortion and identity rectification rotation.
+
+For live Ouster processing, feed the dense node the complete deskewed scan, e.g. `/deliriom/odom_node/pointcloud/deskewed`, in `odom`. Use `input_mode: snapshot` for independent complete live scans, or `scan` to retain a world-voxel union (whose segmentation cost grows with the union). To keep the live path responsive while also labeling an accumulated map, run a second dense node with the map as its snapshot input and distinct output topics. Both consume the same live camera annotations. Delayed map snapshots choose matching historical masks from a bounded queue (512 by default), with 30 seconds of TF history. They never hold up the camera or live-cloud process. Size the queue for the observed map delay and inference rate.
+
+The tunnel replay uses `/supermap/dense_cloud` for the live Ouster output, `/supermap/live_regions` for its label vocabulary, and `/supermap/dense_map` plus `/supermap/regions` for the separate accumulated-map output. Its upstream mapper publishes a resident submap window and archives complete observations on disk; this should not be confused with publishing the entire trajectory's raw returns in each message.
+
+Output `/supermap/camera_annotations` contains `source: "yoloe"`, mask spans, class names, confidence, and checkpoint/text-encoder SHA-256 hashes. `/supermap/annotated_image` displays the camera masks and names. The cloud node appends semantic IDs to **every original cloud point**, preserves unseen geometry, and reports the class vocabulary, `annotation_sources`, applied/rejected annotation counts and model metadata on `/supermap/regions`. Its `pretrained_models` list stays empty because model inference runs in the separate adapter. In RViz choose `semantic_id` for the dense cloud's intensity channel, and display the annotated image for class names.
+
+This is camera-derived labeling of visible cloud surfaces, not learned point-cloud recognition. Unseen geometry remains unknown unless it retains previous direct evidence or bounded propagation is explicitly enabled. Camera labels do not turn geometric region IDs into tracked object instances. Sparse geometry can miss camera occluders, and accumulated maps can retain moving-object trails; the new dense path does not inherit the separate object tracker's dynamic-object filtering.
 
 ## Offline use
 
@@ -101,12 +148,12 @@ NPZ files contain `xyz` (Nx3 or HxWx3) and optional scalar `stamp` and rigid `T_
 
 ## Practical limits and verification
 
-This is geometric segmentation and optional manual semantic fusion. It does not automatically recognize chairs, pipes or people, does not train or run a learned segmenter, and does not claim semantic object-instance accuracy. The existing image-driven object tracker and scene-graph path remain separate; surface regions are not silently inserted as recognized object instances.
+The core performs geometric segmentation and optional semantic fusion. Automatic class names require the explicitly enabled YOLOE camera adapter; the core itself runs no learned segmenter and makes no semantic object-instance accuracy claim. The existing image-driven object tracker and scene-graph path can run alongside dense fusion and share inference; surface regions are not silently inserted as recognized object instances.
 
 Normal and distance thresholds depend on sensor noise, density and scene scale. A surface can fragment, and touching objects can merge. Point labels inherit voxel-level evidence, so boundaries are limited by voxel resolution. Cloud-derived visibility cannot account for an occluder missing from the cloud; independent synchronized depth improves that check.
 
 Scan mode is a static accumulation path, with no free-space carving, moving-object removal, or correction of historical poses after loop closure. Use authoritative map snapshots for an upstream SLAM map that revises geometry. Changed world frames or clock rewinds require a new pipeline. Label evidence persists by exact world-voxel overlap; `label_ttl_sec` optionally expires labels without deleting geometry. Reused spatial locations can otherwise retain old labels until new evidence or a snapshot removes them.
 
-Memory scales with the dense incoming cloud and the voxel graph. Neighbor searches use a bounded count and chunks, not an NxN distance matrix. `max_map_voxels` raises an explicit error and preserves the last map at capacity; it never truncates the input to fit. Dense snapshots are computationally heavier than scans, and this version processes callbacks serially. At an unsustainable input rate, ROS subscription queues may drop messages; deployment rate must be measured for the target cloud size. No real-time guarantee is made.
+Memory scales with the dense incoming cloud and the voxel graph. Neighbor searches use a bounded count and chunks, not an NxN distance matrix. `max_map_voxels` raises an explicit error and preserves the last map at capacity; it never truncates the input to fit. Dense snapshots are computationally heavier than scans, and geometry processing is serialized, while a separate callback group receives compressed masks concurrently so a heavy cloud cannot block camera-annotation reception. At an unsustainable input rate, ROS subscription queues may drop messages; deployment rate must be measured for the target cloud size. No real-time guarantee is made.
 
 Validation includes complete point/field preservation, endian and row-padding handling, partial FOV and occlusion, depth evidence, stale observations, mask conflicts, scan/snapshot behavior, persistent region IDs, explicit capacity failures, and actual ROS messages. A saved-data check preserved all 1,863,653 points in an overlapping stationary D435i snapshot and all 65,536 rows of each of five raw Ouster scans from the Lucid/Ouster tunnel bag. Ouster scans were evaluated individually because those fixtures do not store registration poses. These checks establish data handling and geometry execution, not semantic accuracy or performance on a complete moving room scan.

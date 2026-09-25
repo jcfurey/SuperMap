@@ -29,6 +29,7 @@ setup(
         "console_scripts": [
             "semantic_mapping_node = semantic_mapping.node:main",
             "dense_cloud_mapping_node = semantic_mapping.dense_cloud_node:main",
+            "dense_yoloe_labels_node = semantic_mapping.dense_yoloe_node:main",
         ],
     },
 )
