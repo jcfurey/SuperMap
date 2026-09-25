@@ -20,6 +20,24 @@ import numpy as np
 
 from semantic_mapping.types import ObjectInstance
 
+
+def advance_schedule(previous: float, stamp: float, period: float) -> float:
+    """Retain the rate's phase across input jitter; skip missed slots without bursts."""
+    if not np.isfinite(previous):
+        return stamp
+    return min(stamp, previous + max(1, int((stamp - previous) / period)) * period)
+
+
+def rate_due(previous: float, stamp: float, period: float) -> bool:
+    """Whether a rate-limited stage (detector, publisher) runs on the input at ``stamp``.
+
+    Camera timestamps jitter around their nominal period. Allow at most 1 ms
+    (and at most 1% of a period) early, instead of dropping a whole camera
+    frame for a sub-millisecond difference at the requested rate.
+    """
+    return stamp - previous >= period - min(0.001, 0.01 * period)
+
+
 BYTES_PER_MAP_POINT = 3 * 8 + 8 + 8
 """float64 xyz + geometric log-odds + membership log-odds per stored point."""
 

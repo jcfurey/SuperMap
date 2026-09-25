@@ -544,6 +544,26 @@ def iou_3d_matrix(boxes_a: Array, boxes_b: Array) -> Array:
     return np.where(union > 1e-12, inter / np.where(union > 1e-12, union, 1.0), 0.0)
 
 
+def bbox3d_gap(bbox3d_a: Array, bbox3d_b: Array) -> float:
+    """Euclidean distance between two axis-aligned 3D boxes; 0 when they touch or overlap."""
+    a, b = np.asarray(bbox3d_a, dtype=np.float64), np.asarray(bbox3d_b, dtype=np.float64)
+    return float(np.linalg.norm(np.clip(np.maximum(a[:3] - b[3:], b[:3] - a[3:]), 0.0, None)))
+
+
+def overlap_3d(bbox3d_a: Array, bbox3d_b: Array, pad: float = 0.0) -> float:
+    """Intersection volume over the smaller box's volume, with every side grown by ``pad``.
+
+    1 when one box contains the other, whatever their sizes -- unlike IoU, a
+    partial view of an object inside the object's full box scores 1. The pad
+    keeps a flat box (one voxel thick) from having zero volume.
+    """
+    a = np.asarray(bbox3d_a, dtype=np.float64) + np.array([-pad] * 3 + [pad] * 3)
+    b = np.asarray(bbox3d_b, dtype=np.float64) + np.array([-pad] * 3 + [pad] * 3)
+    inter = float(np.prod(np.clip(np.minimum(a[3:], b[3:]) - np.maximum(a[:3], b[:3]), 0.0, None)))
+    smaller = min(float(np.prod(np.clip(a[3:] - a[:3], 0.0, None))), float(np.prod(np.clip(b[3:] - b[:3], 0.0, None))))
+    return inter / smaller if smaller > 1e-12 else 0.0
+
+
 def centroid(bbox3d: Array) -> Array:
     """Center of an axis-aligned 3D box [xmin, ymin, zmin, xmax, ymax, zmax]."""
     return np.array([

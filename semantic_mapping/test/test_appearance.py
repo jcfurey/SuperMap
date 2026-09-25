@@ -20,7 +20,7 @@ def test_color_histogram_embeddings_are_unit_norm_and_discriminate_colours():
             Detection2D(bbox=np.array([5.0, 25.0, 20.0, 38.0]), label="box", score=0.9)]
     embedder = appearance.ColorHistogramEmbedder(bins=8)
     red_a, red_dark, blue = embedder.embed(rgb, dets)
-    assert red_a.shape == (64,) and red_a.dtype == np.float32
+    assert red_a.shape == (64 + 3,) and red_a.dtype == np.float32  # chroma bins + neutral intensity bins
     assert np.isclose(np.linalg.norm(red_a), 1.0, atol=1e-5)
     assert appearance.cosine_similarity(red_a, red_dark) > 0.99   # shading-invariant
     assert appearance.cosine_similarity(red_a, blue) < 0.3
@@ -28,6 +28,25 @@ def test_color_histogram_embeddings_are_unit_norm_and_discriminate_colours():
     raw = appearance.ColorHistogramEmbedder(bins=8, space="rgb")
     raw_a, raw_dark, _ = raw.embed(rgb, dets)
     assert raw_a.shape == (512,) and appearance.cosine_similarity(raw_a, raw_dark) < 0.5  # brightness-sensitive
+
+
+def test_black_grey_and_white_objects_no_longer_share_a_descriptor():
+    # Chromaticity alone maps every neutral pixel to one bin (paper review 2026-09-25, D21).
+    rng = np.random.default_rng(0)
+    patches = {"black": (35, 35, 38), "grey": (128, 128, 130), "white": (225, 225, 228),
+               "grey_dim": (85, 85, 87), "beige": (200, 180, 150), "beige_half": (100, 90, 75)}
+    rgb = np.zeros((40, 40 * len(patches), 3), dtype=np.uint8)
+    dets = []
+    for i, colour in enumerate(patches.values()):
+        rgb[:, 40 * i:40 * (i + 1)] = np.clip(np.array(colour) + rng.normal(0, 6, (40, 40, 3)), 0, 255)
+        dets.append(Detection2D(bbox=np.array([40.0 * i, 0.0, 40.0 * (i + 1), 40.0]), label="chair", score=0.9))
+    e = dict(zip(patches, appearance.ColorHistogramEmbedder().embed(rgb, dets)))
+    sim = appearance.cosine_similarity
+    assert sim(e["black"], e["white"]) < 0.3 and sim(e["black"], e["grey"]) < 0.6
+    assert sim(e["grey"], e["grey_dim"]) > 0.85            # two-thirds of the light: still the same object
+    assert sim(e["beige"], e["beige_half"]) > 0.9          # coloured pixels stay shading-invariant
+    legacy = dict(zip(patches, appearance.ColorHistogramEmbedder(achromatic_bins=0).embed(rgb, dets)))
+    assert sim(legacy["grey"], legacy["white"]) > 0.99
 
 
 def test_mask_pixels_take_precedence_over_the_box_and_tiny_regions_give_none():
@@ -57,7 +76,8 @@ def test_running_embedding_stays_unit_norm_and_tracks_the_mean():
 def test_build_embedder_names():
     assert appearance.build_embedder("none") is None
     assert isinstance(appearance.build_embedder("color_histogram", bins=4), appearance.ColorHistogramEmbedder)
-    assert appearance.build_embedder("color_histogram", bins=4).dim == 16
+    assert appearance.build_embedder("color_histogram", bins=4).dim == 16 + 3
+    assert appearance.build_embedder("color_histogram", bins=4, achromatic_bins=0).dim == 16
     assert appearance.build_embedder("color_histogram", bins=4, space="rgb").dim == 64
     with pytest.raises(ValueError):
         appearance.ColorHistogramEmbedder(space="lab")

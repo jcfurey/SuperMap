@@ -24,10 +24,14 @@ You are given a 4D scene graph of a robot's environment.
 - Spatial edges describe the current layout, e.g. "Instance 3 on Instance 5".
 - Temporal cues describe how an instance's state changed over time, e.g.
   "Instance 7 (plant) was last seen at [x, y, z] at t=12.4s and has since disappeared".
+  An instance that moved more than once also has a timestamped path,
+  "Instance 4 (bag) path: t=3.10s [x, y, z] -> t=8.40s [x, y, z] -> ...", giving where it was when.
 - Instance IDs are stable identities: the same ID always refers to the same physical object,
   even across occlusions, relocations, or long gaps in observation.
-- An instance that is not currently observed is annotated "(not seen for N s)"; one that has
-  not been seen for a long time may no longer be there, and is marked as such.
+- An instance that is not currently observed is annotated "(location last measured N s ago)", or
+  "(not seen for N s)" when it never had a 3D location; one unseen for a long time is also marked
+  "may no longer be there". An instance confirmed gone is marked "(disappeared)"; its position is
+  where it was last seen.
 
 When answering, reason over the graph and put your final choice of target
 instance ID(s) inside <answer></answer> tags, e.g. <answer>3</answer> or
@@ -42,6 +46,9 @@ MAX_INSTRUCTION_CHARS = 2000
 
 MOVED_THRESHOLD_M = 0.5
 """Displacement before an instance is described as having moved."""
+
+MAX_PATH_POINTS = 8
+"""Timestamped positions listed per moved instance (first, last, and evenly spaced between)."""
 
 SETTLE_SECONDS = 1.0
 """Trajectory samples younger than this (after first sight) are ignored when
@@ -89,7 +96,9 @@ def serialize_subgraph_to_text(
         if obj is None:
             continue
         line = f"  Instance {obj.instance_id} ({prompt_label(obj.label)}) at {_format_center(obj.center)}"
-        if obj.status == ObjectStatus.OCCLUDED:
+        if obj.status == ObjectStatus.DISAPPEARED:
+            line += " (disappeared)"
+        elif obj.status == ObjectStatus.OCCLUDED:
             measured = obj.geometry_stamp if obj.geometry_stamp is not None else obj.latest_stamp
             age = max(reference - measured, 0.0)
             stale = stale_after_sec is not None and age > stale_after_sec
@@ -142,11 +151,29 @@ def serialize_subgraph_to_text(
                     f"{_format_center(ref_center)} at t={ref_stamp:.2f}s to "
                     f"{_format_center(last_center)} at t={last_stamp:.2f}s."
                 )
+            path = _path(settled)
+            if len(path) > 2:
+                steps = " -> ".join(f"t={stamp:.2f}s {_format_center(center)}" for stamp, center in path)
+                temporal_lines.append(f"  Instance {obj.instance_id} ({prompt_label(obj.label)}) path: {steps}")
         if temporal_lines:
             lines.append("Temporal cues:")
             lines.extend(temporal_lines)
 
     return "\n".join(lines)
+
+
+def _path(samples) -> list[tuple[float, np.ndarray]]:
+    """Positions where a settled trajectory moved on by more than ``MOVED_THRESHOLD_M``,
+    thinned to ``MAX_PATH_POINTS`` (first and last kept), so "where was it at t" can be answered."""
+    kept: list[tuple[float, np.ndarray]] = []
+    for stamp, center, status in samples:
+        if status == ObjectStatus.DISAPPEARED.value:
+            continue
+        if not kept or float(np.linalg.norm(center - kept[-1][1])) > MOVED_THRESHOLD_M:
+            kept.append((stamp, center))
+    if len(kept) > MAX_PATH_POINTS:
+        kept = [kept[i] for i in np.unique(np.linspace(0, len(kept) - 1, MAX_PATH_POINTS).round().astype(int))]
+    return kept
 
 
 def build_prompt(

@@ -98,7 +98,10 @@ def test_c2_person_in_front_of_chair_is_not_fused_into_it():
     for i in range(3):
         pipeline.process_frame(_obs(i * 0.1, [_det()]))
     chair_id = next(iter(pipeline.object_map.objects))
-    result = pipeline.process_frame(_obs(0.3, [_det("person")]))
+    # The person stands 1 m in front of the chair. (A person detection lifting
+    # onto the chair's own geometry is a relabelling for Eq. 10 to weigh;
+    # see test_paper_review_2026_09_25.py, D1.)
+    result = pipeline.process_frame(_obs(0.3, [_det("person")], depth=1.0))
     assert result.detection_instance_ids[0] != chair_id
     assert "person" not in pipeline.object_map.objects[chair_id].label_belief
     assert chair_id in pipeline.object_map.objects  # and no merge folded them together
@@ -396,7 +399,8 @@ def test_p8_matched_instances_reuse_the_batched_frustum_test(monkeypatch):
 
 # ----------------------------------------------------------------------- P1
 def _reidentify_reference(boxes, labels, embeddings, retired, min_similarity=0.85, iou_threshold=0.05,
-                          margin=0.25, max_age_sec=0.0, now=0.0, candidates=None, min_mass=0.1):
+                          margin=0.25, max_age_sec=0.0, now=0.0, candidates=None, min_mass=0.1,
+                          relocation_max_distance=0.0, relocation_max_gap_sec=0.0):
     """The per-pair loop reidentify replaced, kept as the equivalence oracle."""
     def inside(point, box):
         return bool(np.all(point >= box[:3] - margin) and np.all(point <= box[3:] + margin))
@@ -417,11 +421,16 @@ def _reidentify_reference(boxes, labels, embeddings, retired, min_similarity=0.8
             same_place = has_box and (iou_3d(boxes[j], obj.bbox3d) > iou_threshold
                                       or inside(det_center, obj.bbox3d) or inside(obj.center, boxes[j]))
             similarity = None
-            if embeddings[j] is not None and obj.embedding is not None:
+            if embeddings[j] is not None and obj.embedding is not None \
+                    and np.asarray(embeddings[j]).size == np.asarray(obj.embedding).size:
                 similarity = cosine_similarity(embeddings[j], obj.embedding)
                 if similarity < min_similarity:
                     continue
             if not same_place and similarity is None:
+                continue
+            if not same_place and (
+                    (relocation_max_distance > 0 and np.linalg.norm(det_center - obj.center) > relocation_max_distance)
+                    or (relocation_max_gap_sec > 0 and now - obj.latest_stamp > relocation_max_gap_sec)):
                 continue
             appearance_cost = (1.0 - similarity) if similarity is not None else 0.5
             cost[r, c] = appearance_cost - (0.5 if same_place else 0.0) + 0.01 * float(
@@ -464,7 +473,9 @@ def test_p1_vectorized_reidentify_matches_the_pairwise_reference(seed):
     det_embeddings = [embedding() for _ in range(n_det)]
     candidates = sorted(rng.choice(n_det, size=int(rng.integers(0, n_det + 1)), replace=False).tolist()) \
         if n_det and rng.random() < 0.5 else None
-    kwargs = dict(min_similarity=0.8, max_age_sec=float(rng.choice([0.0, 50.0])), now=100.0)
+    kwargs = dict(min_similarity=0.8, max_age_sec=float(rng.choice([0.0, 50.0])), now=100.0,
+                  relocation_max_distance=float(rng.choice([0.0, 3.0])),
+                  relocation_max_gap_sec=float(rng.choice([0.0, 60.0])))
 
     got, got_place = association.reidentify(det_boxes, det_labels, det_embeddings, retired,
                                             candidate_detections=candidates, **kwargs)

@@ -27,13 +27,15 @@ True-positive criterion (paper, Sec. V-D): 3D IoU > 0.1, centroid distance
 * ``detection_recall`` -- fraction of frames in the *appearance interval*
   (present and visible) in which the map contains a matching, not-disappeared
   instance.
-* ``change_recall`` -- over the appearance interval plus the *disappearance
-  interval* (frames after removal in which the object's former location is
-  in view), the fraction of frames that are correct: detected while present,
-  and no instance still asserting presence (active/tentative) once removed.
-  Absence intervals are only scored for objects that were present first, so
-  an object the system simply never mapped doesn't get "credit" for its
-  absence (the artifact the paper points out in DualMap's numbers).
+* ``change_recall`` -- over the appearance interval plus the object's
+  *absence intervals* (frames before it appears or after it is removed in
+  which its location is in view), the fraction of frames that are correct:
+  detected while present, and no instance asserting presence
+  (active/tentative) there while absent. Both absence intervals count, as in
+  Table IV, where an appeared object's change recall differs from its
+  detection recall. Absence is credited even for an object the system never
+  mapped; that is the artifact the paper points out in DualMap's numbers, and
+  comparing ``change_recall`` with ``detection_recall`` exposes it.
 * ``fragments`` -- number of distinct instance IDs that ever matched the
   object; 1 means a single stable identity for the whole sequence.
 
@@ -217,17 +219,27 @@ class SequenceEvaluator:
                     stats.matched_ids.update(o.instance_id for o in matched)
                     for instance_id in {o.instance_id for o in matched}:
                         stats.matched_id_frames[instance_id] = stats.matched_id_frames.get(instance_id, 0) + 1
-            elif frame_id >= gt.disappear_frame and not self._back_in_place(gt, frame_id) and location_in_view(
-                gt, self.intrinsics, T_world_from_cam, depth_image,
-            ):
+            elif (frame_id >= gt.disappear_frame or not self._earlier_phase_here(gt)) \
+                    and not self._back_in_place(gt, frame_id) and location_in_view(
+                        gt, self.intrinsics, T_world_from_cam, depth_image):
                 stats.absence_frames += 1
                 if not self._matches(objects, gt, ASSERTING_STATUSES):
                     stats.absence_hits += 1
 
+    def _earlier_phase_here(self, gt: GroundTruthObject) -> bool:
+        """Whether an earlier phase of the same identity stood at this entry's
+        place: the frames before this phase are that phase's absence interval
+        (after its removal) and are scored there, not twice."""
+        return any(
+            other is not gt and other.identity == gt.identity and other.disappear_frame <= gt.appear_frame
+            and float(np.linalg.norm(other.center - gt.center)) < self.centroid_threshold
+            for other in self.ground_truth
+        )
+
     def _back_in_place(self, gt: GroundTruthObject, frame_id: int) -> bool:
-        """Whether the same physical object is present again at this entry's
-        place (a later phase of the same identity), in which case asserting
-        presence there is correct, not a missed disappearance."""
+        """Whether the same physical object is present at this entry's place in
+        another phase of the same identity (before this phase or after it), in
+        which case asserting presence there is correct, not a missed change."""
         return any(
             other is not gt and other.identity == gt.identity and other.present_at(frame_id)
             and float(np.linalg.norm(other.center - gt.center)) < self.centroid_threshold
