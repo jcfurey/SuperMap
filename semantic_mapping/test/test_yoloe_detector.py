@@ -123,6 +123,7 @@ def test_yoloe_transfers_once_thresholds_on_device_and_uses_half_on_cuda(monkeyp
                                 masks=SimpleNamespace(data=_Tensor(masks)))]
 
     monkeypatch.setitem(sys.modules, 'ultralytics', SimpleNamespace(YOLOE=lambda path: SimpleNamespace(predict=predict)))
+    monkeypatch.delitem(sys.modules, 'ultralytics.cfg', raising=False)  # pre-8.4 API: half only
     _Tensor.transfers.clear()
     detections = YOLOEDetector(device='cuda:0').detect(np.zeros((240, 320, 3), np.uint8))
     assert captured['half'] is True
@@ -133,3 +134,19 @@ def test_yoloe_transfers_once_thresholds_on_device_and_uses_half_on_cuda(monkeyp
     captured.clear()
     YOLOEDetector(device='cpu').detect(np.zeros((240, 320, 3), np.uint8))
     assert 'half' not in captured
+
+
+def test_yoloe_uses_quantize_instead_of_deprecated_half_when_supported(monkeypatch):
+    captured = {}
+
+    def predict(image, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setitem(sys.modules, 'ultralytics', SimpleNamespace(YOLOE=lambda path: SimpleNamespace(predict=predict)))
+    monkeypatch.setitem(sys.modules, 'ultralytics.cfg', SimpleNamespace(DEFAULT_CFG_DICT={'quantize': None}))
+    YOLOEDetector(device='cuda:0').detect(np.zeros((240, 320, 3), np.uint8))
+    assert captured['quantize'] == 16 and 'half' not in captured
+    captured.clear()
+    YOLOEDetector(device='cpu').detect(np.zeros((240, 320, 3), np.uint8))
+    assert 'quantize' not in captured and 'half' not in captured
