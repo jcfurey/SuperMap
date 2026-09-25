@@ -12,11 +12,22 @@ from semantic_mapping.dense_yoloe_node import DenseYOLOELabelsNode
 PACKAGE = Path(__file__).resolve().parents[2]
 
 
+def flatten(params: dict, prefix: str = "") -> dict:
+    """ROS parameter names of a ros__parameters block: nested keys joined with dots."""
+    flat = {}
+    for key, value in params.items():
+        if isinstance(value, dict):
+            flat.update(flatten(value, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = value
+    return flat
+
+
 @pytest.mark.parametrize("config, factory", [("dense_cloud.yaml", DenseCloudMappingNode),
                                              ("dense_yoloe.yaml", DenseYOLOELabelsNode)])
 def test_yaml_matches_declared_parameters_under_a_namespace(config, factory):
     path = PACKAGE / "config" / config
-    params = yaml.safe_load(path.read_text())["/**"]["ros__parameters"]
+    params = flatten(yaml.safe_load(path.read_text())["/**"]["ros__parameters"])
     rclpy.init(args=["--ros-args", "--params-file", str(path), "-p", "autostart:=false", "-r", "__ns:=/robot1"])
     try:
         node = factory()
@@ -24,6 +35,8 @@ def test_yaml_matches_declared_parameters_under_a_namespace(config, factory):
         for name, value in params.items():
             assert node.has_parameter(name), f"{config}: {name} is not declared"
             actual = node.get_parameter(name).value
+            if value == [] and actual is None:
+                continue  # an empty YAML list arrives untyped and reads back as None
             assert (list(actual) if isinstance(actual, (list, tuple)) else actual) == value, name
         for name, value in params.items():
             if name.endswith("_topic") and value:
