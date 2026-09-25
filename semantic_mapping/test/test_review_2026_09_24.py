@@ -98,7 +98,10 @@ def test_c2_person_in_front_of_chair_is_not_fused_into_it():
     for i in range(3):
         pipeline.process_frame(_obs(i * 0.1, [_det()]))
     chair_id = next(iter(pipeline.object_map.objects))
-    result = pipeline.process_frame(_obs(0.3, [_det("person")]))
+    # The person stands 1 m in front of the chair. (A person detection lifting
+    # onto the chair's own geometry is a relabelling for Eq. 10 to weigh;
+    # see test_paper_review_2026_09_25.py, D1.)
+    result = pipeline.process_frame(_obs(0.3, [_det("person")], depth=1.0))
     assert result.detection_instance_ids[0] != chair_id
     assert "person" not in pipeline.object_map.objects[chair_id].label_belief
     assert chair_id in pipeline.object_map.objects  # and no merge folded them together

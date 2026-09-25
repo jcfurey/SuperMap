@@ -73,12 +73,20 @@ def test_change_recall_penalizes_stale_active_instance_after_removal():
     assert stats.change_recall == 0.75  # (2 + 1) / (2 + 2)
 
 
-def test_never_present_object_gets_no_absence_credit():
-    gt = _gt(appear=5, disappear=10, visible=[])  # appears late, never observed
+def test_absence_before_an_object_appears_is_scored():
+    # Table IV scores appeared objects' change recall apart from their detection recall.
+    gt = _gt(appear=3, disappear=10, visible=[3, 4])
     evaluator = ev.SequenceEvaluator([gt], INTRINSICS)
-    for frame_id in range(5):
-        evaluator.observe(frame_id, CAMERA_AT_ORIGIN, [])
-    assert evaluator.stats[0].absence_frames == 0
+    box = (-0.5, -0.5, 1.5, 0.5, 0.5, 2.5)
+    evaluator.observe(0, CAMERA_AT_ORIGIN, [])
+    evaluator.observe(1, CAMERA_AT_ORIGIN, [_instance(1, "chair", box)])  # asserted before it arrived: FP
+    evaluator.observe(2, CAMERA_AT_ORIGIN, [])
+    evaluator.observe(3, CAMERA_AT_ORIGIN, [_instance(2, "chair", box)])
+    evaluator.observe(4, CAMERA_AT_ORIGIN, [])
+    stats = evaluator.stats[0]
+    assert (stats.absence_frames, stats.absence_hits) == (3, 2)
+    assert stats.detection_recall == 0.5
+    assert stats.change_recall == 0.6  # (1 + 2) / (2 + 3)
 
 
 def test_final_map_prf_counts_duplicates_as_false_positives():

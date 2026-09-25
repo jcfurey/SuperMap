@@ -17,7 +17,18 @@ The pipeline runs association in stages:
    and tentative ones. This is what keeps one identity when the 2D prediction
    is off after a long occlusion or an aggressive viewpoint change, instead of
    fragmenting the object into a chain of new IDs.
-4. Anything left spawns a new tentative object.
+4. **Relabelling** -- a high-confidence detection whose label the instance has
+   not (yet) taken may still be the same object: open-vocabulary labels
+   flicker. It joins a visible, unmatched track only when the 2D boxes overlap
+   *and* the 3D boxes largely coincide, and Eq. (10) then weighs the new label
+   (:func:`associate_relabel`).
+5. **Re-identification** -- still-unmatched detections are compared against
+   retired instances, in place or by appearance (:func:`reidentify`).
+6. Anything left spawns a new tentative object.
+
+Every 2D match (stages 1 and 2) is also validated in 3D (Fig. 2, "2D→3D
+Validation"; :func:`split_depth_inconsistent`): image overlap cannot tell a
+chair at 2 m from a different chair at 6 m behind it.
 """
 from __future__ import annotations
 
@@ -26,7 +37,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from semantic_mapping.geometry_utils import centroid, iou_3d, iou_3d_matrix, iou_xyxy
+from semantic_mapping.geometry_utils import bbox3d_gap, centroid, iou_3d, iou_3d_matrix, iou_xyxy, overlap_3d
 from semantic_mapping.tracking import TrackKalmanState, mahalanobis_gate
 from semantic_mapping.types import ObjectInstance
 
@@ -197,6 +208,77 @@ def associate_3d(
                 cost[r, c] = (1.0 - iou) + 0.01 * distance
 
     return _solve(cost, rows, cols, lambda i, j: True)
+
+
+def split_depth_inconsistent(
+    result: AssociationResult,
+    detection_bboxes3d: list[np.ndarray | None],
+    objects: list[ObjectInstance],
+    max_gap: float,
+) -> int:
+    """2D→3D validation (Fig. 2): unmatch 2D pairs whose detection lifts away from the instance.
+
+    A pair stays matched when the detection's back-projected box lies within
+    ``max_gap`` metres of the instance's box, or when either side has no 3D
+    extent to compare (too few depth readings, a 2D-only instance). Split
+    pairs return to the unmatched lists, so the detection can re-activate or
+    spawn another instance and the instance receives this frame's geometric
+    evidence as unmatched. Returns the number of pairs split; ``max_gap <= 0``
+    disables the check.
+    """
+    if max_gap <= 0:
+        return 0
+    kept, split = [], 0
+    for track_idx, det_idx in result.matches:
+        det_box, obj = detection_bboxes3d[det_idx], objects[track_idx]
+        if det_box is not None and obj.points_world.shape[0] and bbox3d_gap(det_box, obj.bbox3d) > max_gap:
+            result.unmatched_tracks.append(track_idx)
+            result.unmatched_detections.append(det_idx)
+            split += 1
+        else:
+            kept.append((track_idx, det_idx))
+    result.matches = kept
+    return split
+
+
+def associate_relabel(
+    tracks: list[TrackKalmanState],
+    predicted_bboxes: list[np.ndarray],
+    detection_bboxes: list[np.ndarray],
+    detection_bboxes3d: list[np.ndarray | None],
+    objects: list[ObjectInstance],
+    iou_threshold: float = 0.3,
+    min_overlap: float = 0.5,
+    pad: float = 0.025,
+    candidate_tracks: list[int] | None = None,
+    candidate_detections: list[int] | None = None,
+) -> AssociationResult:
+    """Match detections to instances regardless of label, when image and 3D geometry agree.
+
+    Label-gated stages keep a ``person`` in front of a chair out of the chair
+    (review 2026-09-24, C2), but they also kept a label the instance had never
+    taken from ever reaching Eq. (10), so a flickering detector label split one
+    object into co-located instances (paper review 2026-09-25, D1). Here a pair
+    is admissible when the 2D boxes overlap by at least ``iou_threshold``, the
+    motion gate accepts it, and at least ``min_overlap`` of the smaller 3D box
+    (each grown by ``pad``) lies inside the other: a person standing in front
+    of the chair lifts to a box in front of it and stays out. Both sides need
+    3D extent; ``min_overlap <= 0`` disables the stage.
+    """
+    rows = list(range(len(objects))) if candidate_tracks is None else list(candidate_tracks)
+    cols = list(range(len(detection_bboxes))) if candidate_detections is None else list(candidate_detections)
+    cost = np.full((len(rows), len(cols)), INVALID_COST, dtype=np.float64)
+    if min_overlap > 0:
+        for r, i in enumerate(rows):
+            if objects[i].points_world.shape[0] == 0:
+                continue
+            for c, j in enumerate(cols):
+                if detection_bboxes3d[j] is None:
+                    continue
+                iou = iou_xyxy(predicted_bboxes[i], detection_bboxes[j])
+                if iou >= iou_threshold and overlap_3d(detection_bboxes3d[j], objects[i].bbox3d, pad) >= min_overlap:
+                    cost[r, c] = 1.0 - iou
+    return _solve(cost, rows, cols, lambda i, j: mahalanobis_gate(tracks[i], detection_bboxes[j]))
 
 
 def reidentify(

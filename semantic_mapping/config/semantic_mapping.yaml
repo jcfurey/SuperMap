@@ -189,13 +189,18 @@
     min_hits_to_confirm: 2
     tentative_max_age: 10                  # missed detector observations; geometry-only frames do not count
     # Staged association (Sec. IV-B): 2D high-confidence -> 2D low-confidence
-    # (ByteTrack) -> 3D-aware re-activation -> spawn.
+    # (ByteTrack) -> 3D-aware re-activation -> relabelling -> re-identification -> spawn.
     association_iou_threshold: 0.3
     high_score_threshold: 0.5              # detections below this only match existing tracks, never spawn
     low_score_iou_threshold: 0.2
     reactivation_iou_threshold: 0.05       # 3D box IoU to re-attach a detection to an existing object
     reactivation_margin_m: 0.25            # or: one centroid inside the other's box expanded by this
     label_compatibility_min_mass: 0.1      # belief mass a label needs in an instance to fuse or merge into it
+    match_max_gap_m: 1.0                   # 2D->3D validation (Fig. 2): split a 2D match lifting farther from the
+                                           # instance's box than this (a different object behind it); 0 = off
+    relabel_min_overlap: 0.5               # a detection under a label the instance hasn't taken joins a visible track
+                                           # when 2D boxes overlap and this much of the smaller 3D box lies in the
+                                           # other; Eq. (10) then weighs the label; 0 = off
     min_points_for_3d_association: 5
     merge_iou_threshold: 0.3               # duplicate instances (same label) merged when their 3D boxes overlap this much
     merge_distance_m: 0.25                 #   ... or their centroids are this close; the older ID survives

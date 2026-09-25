@@ -160,8 +160,10 @@ class ObjectMap:
         self.existence_max_log_odds = existence_max_log_odds
         self.stats = {"size_rejected_observations": 0, "size_refused_associations": 0, "size_refused_merges": 0,
                       "mask_completions": 0, "ground_contact_completions": 0,
-                      "support_culled_points": 0, "existence_culled": 0}
-        """Cumulative counts of size-limit and mask-completion decisions (the pipeline counts all but merges)."""
+                      "support_culled_points": 0, "existence_culled": 0,
+                      "depth_split_matches": 0, "relabel_matches": 0}
+        """Cumulative counts of size-limit, mask-completion and association decisions (the pipeline counts all
+        but merges)."""
 
         self.objects: dict[int, ObjectInstance] = {}
         self._next_id = 1

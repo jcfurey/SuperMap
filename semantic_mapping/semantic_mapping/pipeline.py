@@ -168,9 +168,19 @@ class PipelineConfig:
     reactivation_iou_threshold: float = 0.05
     reactivation_margin_m: float = 0.25
     label_compatibility_min_mass: float = 0.1
-    """Belief mass the detection's label must hold in an instance for any
-    association stage to fuse it there, and that a shared label must hold in
-    both instances for them to merge or reconcile (association.labels_compatible)."""
+    """Belief mass the detection's label must hold in an instance for the
+    label-gated association stages to fuse it there, and that a shared label
+    must hold in both instances for them to merge or reconcile
+    (association.labels_compatible). The relabelling stage is not label-gated."""
+    match_max_gap_m: float = 1.0
+    """2D→3D validation (Fig. 2): a 2D match whose detection lifts farther than
+    this from the instance's box is split (association.split_depth_inconsistent).
+    0 disables."""
+    relabel_min_overlap: float = 0.5
+    """A high-confidence detection with a label the instance has not taken joins
+    a visible, unmatched track when the 2D boxes overlap and this fraction of the
+    smaller 3D box lies inside the other; Eq. (10) then weighs the new label
+    (association.associate_relabel). 0 disables."""
     min_points_for_3d_association: int = 5
     merge_iou_threshold: float = 0.3
     merge_distance_m: float = 0.25
@@ -280,8 +290,11 @@ class PipelineConfig:
         for name in ('voxel_size', 'tau_eps'):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        if not 0 <= self.label_compatibility_min_mass <= 1:
-            raise ValueError("label_compatibility_min_mass must be in [0, 1]")
+        for name in ('label_compatibility_min_mass', 'relabel_min_overlap'):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not np.isfinite(self.match_max_gap_m) or self.match_max_gap_m < 0:
+            raise ValueError("match_max_gap_m must be finite and nonnegative")
         for name in ('reconcile_max_distance_m', 'reconcile_max_gap_sec', 'reid_max_age_sec'):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -621,6 +634,12 @@ class SemanticMappingPipeline:
                 kept.append((track_idx, det_idx))
         result.matches = kept
 
+    def _split_depth_inconsistent(self, result: association.AssociationResult, objects: list[ObjectInstance],
+                                  det_boxes3d: list[np.ndarray | None]) -> None:
+        """2D→3D validation of a 2D association stage (association.split_depth_inconsistent)."""
+        self.object_map.stats["depth_split_matches"] += association.split_depth_inconsistent(
+            result, det_boxes3d, objects, self.config.match_max_gap_m)
+
     def process_frame(self, observation: Observation) -> FrameResult:
         """Run one full P(I_t, M_t, P_t | M_t-1, Q_t) update step (Eq. 2), given
         that pose P_t was already estimated upstream (Sec. IV-A) and is
@@ -736,6 +755,7 @@ class SemanticMappingPipeline:
             label_min_mass=cfg.label_compatibility_min_mass,
         )
         self._refuse_oversized(stage1, live_objects, detections, det_points)
+        self._split_depth_inconsistent(stage1, live_objects, det_boxes3d)
         # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no motion gate.
         stage2 = association.associate(
             predicted_tracks, predicted_bboxes, detection_bboxes,
@@ -745,6 +765,7 @@ class SemanticMappingPipeline:
             label_min_mass=cfg.label_compatibility_min_mass,
         )
         self._refuse_oversized(stage2, live_objects, detections, det_points)
+        self._split_depth_inconsistent(stage2, live_objects, det_boxes3d)
         # Stage 3: 3D-aware re-activation for high-confidence detections still unmatched.
         stage3 = association.associate_3d(
             det_boxes3d, detection_labels, live_objects,
@@ -753,11 +774,20 @@ class SemanticMappingPipeline:
             label_min_mass=cfg.label_compatibility_min_mass,
         )
         self._refuse_oversized(stage3, live_objects, detections, det_points)
+        # Stage 4, relabelling: the same object under a label it has not taken yet (Eq. 10 decides).
+        relabel = association.associate_relabel(
+            predicted_tracks, predicted_bboxes, detection_bboxes, det_boxes3d, live_objects,
+            iou_threshold=cfg.association_iou_threshold, min_overlap=cfg.relabel_min_overlap,
+            pad=cfg.voxel_size / 2, candidate_tracks=stage3.unmatched_tracks,
+            candidate_detections=stage3.unmatched_detections,
+        )
+        self._refuse_oversized(relabel, live_objects, detections, det_points)
+        self.object_map.stats["relabel_matches"] += len(relabel.matches)
 
         t_associate = time.perf_counter()
 
         detection_instance_ids = [-1] * len(detections)
-        for track_idx, det_idx in stage1.matches + stage2.matches:
+        for track_idx, det_idx in stage1.matches + stage2.matches + relabel.matches:
             detection = detections[det_idx]
             updated_track = tracking.update(predicted_tracks[track_idx], detection.bbox)
             # Matched instances are all in view: pass the batched verdict on
@@ -778,7 +808,7 @@ class SemanticMappingPipeline:
         # the prediction loop above). Without depth, update_unmatched applies
         # no evidence but still counts detector misses, so tentative tracks
         # expire; out-of-view instances are never charged a miss.
-        for track_idx in stage3.unmatched_tracks:
+        for track_idx in relabel.unmatched_tracks:
             self.object_map.update_unmatched(
                 live_objects[track_idx], K, T_world_from_cam, evidence_depth, in_view=bool(in_view[track_idx]),
                 detections_evaluated=observation.detections_evaluated)
@@ -787,9 +817,9 @@ class SemanticMappingPipeline:
                 live_objects[track_idx], K, T_world_from_cam, evidence_depth, in_view=False,
                 detections_evaluated=observation.detections_evaluated)
 
-        # Stage 4: re-identification against retired instances, so an object
+        # Stage 5: re-identification against retired instances, so an object
         # that was removed and comes back -- in place or elsewhere -- keeps its ID.
-        unmatched_detections = stage3.unmatched_detections
+        unmatched_detections = relabel.unmatched_detections
         if cfg.reid_enabled and unmatched_detections:
             retired = [o for o in self.object_map.objects.values() if o.status == ObjectStatus.DISAPPEARED]
             if retired:
