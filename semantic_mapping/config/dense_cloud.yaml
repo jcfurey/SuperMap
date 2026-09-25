@@ -58,3 +58,10 @@
     mask_depth_gap: 1.0              # m; split a mask's points into depth layers; 0 = off
     mask_depth_gap_ratio: 0.25       # plus this fraction of depth (receding surfaces stay one layer)
     mask_min_layer_points: 3         # nearest layer with this many points takes the label
+    # Keep labels off the ground a mask bled onto (world z up): with a LiDAR the ground rings in front of an
+    # object are nearer than it, took its label, and slid along with the vehicle.
+    ground_exclusion: true
+    ground_clearance: 0.15           # m above the local ground fitted around the mask
+    ground_max_slope: 0.25
+    ground_context_px: 20
+    ground_surface_labels: [floor, ground, road, sidewalk, pavement, grass, terrain, carpet, rug, mat]

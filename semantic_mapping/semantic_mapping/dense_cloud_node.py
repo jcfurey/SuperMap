@@ -80,12 +80,18 @@ _CONFIG_DOCS: dict[str, tuple[str, tuple[float, float] | None]] = {
     "mask_min_layer_points": ("Nearest layer with at least this many points takes the label", (1, 100_000)),
     "max_labels": ("Maximum distinct semantic labels in one map", (1, 1_000_000)),
     "incremental_segmentation": ("Re-segment only near changed geometry", None),
+    "ground_exclusion": ("Keep labels off the ground under an object whose mask bled onto it (world z up)", None),
+    "ground_clearance": ("Points less than this above the fitted local ground are ground (m)", (1e-3, 10.0)),
+    "ground_max_slope": ("Steepest local ground accepted (rise over run)", (1e-3, 10.0)),
+    "ground_context_px": ("Margin around a mask whose points also inform the ground fit (px)", (0, 10_000)),
+    "ground_surface_labels": ("Classes that are the ground itself; their masks keep ground points", None),
 }
 
 # Safe to change while running: read per annotation / per publish.
 _RUNTIME_CONFIG = {"min_camera_score", "camera_depth_tolerance", "max_camera_time_delta",
                    "label_propagation_radius", "label_ttl_sec", "camera_splat_occlusion_gap",
-                   "mask_depth_gap", "mask_depth_gap_ratio", "mask_min_layer_points"}
+                   "mask_depth_gap", "mask_depth_gap_ratio", "mask_min_layer_points",
+                   "ground_exclusion", "ground_clearance", "ground_max_slope", "ground_context_px"}
 _RUNTIME_NODE = {"publish_period_s", "publish_voxel_map"}
 _CONFIG_FIELDS = {item.name: item for item in fields(DenseCloudConfig)}
 
@@ -141,6 +147,7 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         self._applied_yoloe_frames: set[str] = set()
         self._last_cloud = None
         self._latest_result = None
+        self._latest_cloud = None
         self._dirty = False
         self._cloud_dirty = False
         self._last_publish = -math.inf
@@ -162,8 +169,10 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         defaults = DenseCloudConfig()
         for item in fields(defaults):
             description, value_range = _CONFIG_DOCS.get(item.name, ("", None))
-            declare(self, item.name, getattr(defaults, item.name), description,
-                    read_only=item.name not in _RUNTIME_CONFIG, range=value_range)
+            value = getattr(defaults, item.name)
+            # A YAML `[]` arrives untyped; dynamic typing accepts it (read back as None).
+            declare(self, item.name, value, description, read_only=item.name not in _RUNTIME_CONFIG,
+                    range=value_range, dynamic_typing=isinstance(value, list))
         declare(self, "cloud_topic", "points", "Input PointCloud2 (any frame with TF to world_frame)")
         declare(self, "world_frame", "map", "Fixed frame of the voxel map")
         declare(self, "camera_annotations_topic", "supermap/camera_annotations",
@@ -223,6 +232,8 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
             value = self._param(name)
             if item.type in ("float", float) and isinstance(value, int) and not isinstance(value, bool):
                 value = float(value)
+            if isinstance(getattr(DenseCloudConfig(), name), list):
+                value = list(value or [])
             values[name] = value
         return DenseCloudConfig(**values)
 
@@ -349,7 +360,7 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         with self._annotation_lock:
             self._pending_annotations.clear()
         with self._result_lock:
-            self._latest_result, self._dirty = None, False
+            self._latest_result, self._latest_cloud, self._dirty = None, None, False
 
     def destroy_node(self):
         self._teardown()
@@ -431,8 +442,8 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
             result = updated
         self._last_processing_seconds = time.perf_counter()-started
         self._stats.set("processing_seconds", self._last_processing_seconds)
-        self._publish_cloud(result)
-        self._mark_dirty(result)
+        self._publish_cloud(result, message)
+        self._mark_dirty(result, message)
         return "done"
 
     # ----------------------------------------------------------- annotations
@@ -575,7 +586,7 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
                     return
                 result = self._drain_annotations()
                 if result is not None:
-                    self._mark_dirty(result, cloud=True)
+                    self._mark_dirty(result, self._last_cloud, cloud=True)
             finally:
                 self._pipeline_lock.release()
 
@@ -616,14 +627,17 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         return result
 
     # ------------------------------------------------------------ publishing
-    def _publish_cloud(self, result):
-        if self._last_cloud is None or self.cloud_pub is None:
+    def _publish_cloud(self, result, message):
+        if message is None or self.cloud_pub is None:
             return
-        self.cloud_pub.publish(annotate_pointcloud_message(self._last_cloud, result))
+        self.cloud_pub.publish(annotate_pointcloud_message(message, result))
 
-    def _mark_dirty(self, result, cloud=False):
+    def _mark_dirty(self, result, message, cloud=False):
+        # The labels and the cloud they index are stored together: the publish
+        # timer runs concurrently with cloud processing, and an organized cloud
+        # (e.g. Ouster) accepts another scan's labels without a size error.
         with self._result_lock:
-            self._latest_result, self._dirty = result, True
+            self._latest_result, self._latest_cloud, self._dirty = result, message, True
             self._cloud_dirty = cloud or self._cloud_dirty
         if float(self._param("publish_period_s")) <= 0:
             self._publish_state()
@@ -637,15 +651,15 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
     def _publish_state(self):
         """Voxel map + regions (+ a label-updated cloud), at most once per publish_period_s."""
         with self._result_lock:
-            if not self._dirty or self._latest_result is None or self._last_cloud is None:
+            if not self._dirty or self._latest_result is None or self._latest_cloud is None:
                 return
             result, cloud_dirty = self._latest_result, self._cloud_dirty
             self._dirty = self._cloud_dirty = False
-            last_cloud = self._last_cloud
+            last_cloud = self._latest_cloud
         self._last_publish = time.monotonic()
         try:
             if cloud_dirty:
-                self._publish_cloud(result)
+                self._publish_cloud(result, last_cloud)
             header = Header(stamp=last_cloud.header.stamp, frame_id=self.world_frame)
             if bool(self._param("publish_voxel_map")) and self.map_pub is not None:
                 self.map_pub.publish(voxel_map_message(result, header))

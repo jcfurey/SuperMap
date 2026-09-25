@@ -293,6 +293,46 @@ A LiDAR scan rasterized into the camera covers a few percent of the pixels, and 
 | 5% sparse, no fill | 0.96 | 0.96 | 1 / 2 | 17 / 11 | 0.73 |
 | 5% sparse, `depth_fill_radius_px: 2` | 0.96 | 0.96 | 2 / 2 | 13 / 11 | 0.89 |
 
+Two defaults keep a mask's depth on the object when the depth comes from a LiDAR
+mounted apart from the camera ([analysis](doc/lidar-camera-range-2026-09-25.md)):
+
+- **Occlusion-aware rasterization** (`pointcloud_splat_radius_m: 0.05`). A
+  one-pixel z-buffer let the background show between sparse foreground returns,
+  and let the camera "see" surfaces only the offset LiDAR reaches. Each point now
+  hides the points more than `pointcloud_occlusion_gap_m` behind it within a disc
+  of that radius, as the dense labeller already did. Hidden points carry no reading,
+  so they are neither lifted into a mask nor taken as free space in front of a
+  mapped object. Densely sampled surfaces (a depth camera's cloud) are exempt,
+  since the one-pixel z-buffer is already exact there. `pointcloud_occlusion_grid_px` (0 = auto) bounds the cost at high
+  resolution: 15–22 ms added per frame from VGA to 5 MP in the analysis rig. A coarse LiDAR at long range may need a
+  larger radius; 0 restores the one-pixel z-buffer.
+- **Ground exclusion** (`ground_exclusion: true`). A mask bleeds a few pixels
+  onto the ground at an object's base, and a spinning LiDAR's ground rings there
+  are nearer than the object. Taken as its depth, the ring put the box on the
+  ground in front of the object, at the start of the gap between rings, and
+  since rings sit at fixed ranges from the sensor the box slid along with the
+  vehicle. Masked readings less than `ground_clearance_m` above the local ground
+  (fitted in world z around the mask) are now dropped when at least
+  `ground_exclusion_min_returns` readings stand above it. `ground_surface_labels`
+  (floor, road, rug, ...), objects lying flat on the ground, and masks with no
+  ground fitted below the camera (a world frame that is not z up) keep every
+  reading. It costs about 1 ms per masked detection on dense depth. Objects lose
+  their lowest `ground_clearance_m`: on the synthetic scene mIoU (without
+  background) is 0.987 instead of 1.000, while final-map F1 rises from 0.89 to 0.94.
+
+### Outdoor objects on sparse LiDAR
+
+With a LiDAR projected into a camera, instance masks of compact outdoor objects (barriers, bulk bags, containers) contain the ground strip in front of the object and background behind it, and most mask pixels never get a return, so the evidence-based pruning rarely removes either. Occlusion-aware rasterization and ground exclusion (above, on by default) remove most of both. Six opt-in settings (all off by default) keep such boxes object-sized:
+
+- `ground_removal_labels`: for these classes, the local ground is fitted as a plane in the world frame (z up; the lowest return per 0.5 m cell in and `ground_context_px` around the mask, anchored low and limited to `ground_max_slope`), and masked returns less than `ground_clearance_m` above it are dropped before layer selection, even when nothing is left (unlike `ground_exclusion`), so `ground_contact_depth_labels` can take over. An object standing on the ground loses only that thin band.
+- `foreground_depth_largest_labels`: of `foreground_depth_labels`, the classes that keep the supported depth layer with the most real returns rather than the nearest one (the nearest is often a ground ring). `person` tuning keeps the nearest layer.
+- `bbox_min_support` > 1: each mapped point counts the frames whose lifted detection points came within `bbox_support_radius_m` of it (shared voxels keep the better count on merges); once a static instance has that many hits, its reported box (published and used for association and merging) spans only points with that support, so an early outlier drops out of the box when later frames do not re-observe it. The points themselves are kept.
+- `bbox_support_miss` > 0 makes that support two-sided, so boxes trim as well as grow. A matched frame that looked at a mapped point (it projects inside the image, in front of the camera, with no nearer depth reading on its pixel) and did not re-hit it takes `bbox_support_miss` off its support; points that fall to `bbox_support_cull_at` are removed. Occluded points and points outside a truncated view keep their support. New regions join the box once re-hit `bbox_min_support` times, and `bbox_support_max` caps support so a long-established wrong region can still decay.
+- `existence_hit_gain` > 0 gives each instance an existence log-odds: each matched detection adds `existence_hit_gain` times its score, and each frame in which the detector could have seen the instance but did not subtracts `existence_miss_penalty`. Below `existence_cull_log_odds` the instance is culled (disappeared), even when confirmed; `existence_max_log_odds` caps it so long-lived instances stay cullable. The box label shows the resulting probability, and it is saved with the map.
+- `class_size_limits`: `'label:D'` bounds the 3D box diagonal, `'label:H,V'` the footprint diagonal and height. An observation whose lifted (trimmed) points exceed its class limit keeps its 2D association but contributes no geometry, and an association or duplicate merge that would grow an instance past its limit is refused (the detection starts its own instance). Counts are in `ObjectMap.stats` and on the node's "mapping state" diagnostic.
+- `mask_completion_labels`: where the LiDAR leaves gaps, the few real returns alone give a box around the first ring that hits the object. For these classes, once the kept layer (after ground removal and layer selection) has `mask_completion_min_returns` real returns, the mask pixels without a reading are back-projected at the median range of those returns (on a `mask_completion_stride_px` grid plus the silhouette's extreme pixels, within `max_points_per_detection`, and never below a fitted ground). Width and height then follow the mask, and depth extent follows the real returns. Completed points only add geometry to the detection: they are not used for layer selection, image-span checks, or the depth evidence, and size limits still apply to them. With `bbox_min_support`, a completion earns one frame of support like any other observation, so a one-off wrong range drops out of the box.
+- `ground_contact_depth_labels`: a mask with fewer kept returns than that is completed at the range where the ray through its bottom-centre pixel meets the fitted local ground (`ground_contact_completions` in the stats). There is no geometry if the ground fell back to level, the mask touches the image bottom, or the hit is behind the camera or beyond `max_depth_m`.
+
 ### Identities across relocation and return
 
 The paper's instance IDs are meant to be stable "even across relocations", which geometry alone cannot deliver. Every detection therefore carries an appearance descriptor (`appearance_embedder`: a shading-invariant chromaticity histogram by default, which needs no model, or CLIP via `open_clip_torch`), each instance keeps a running mean of the descriptors it was built from, and a disappeared instance stays in the map as a retired identity with its points released after `disappeared_prune_grace_frames`. A detection that no live instance claims is then matched against the retired pool (association stage 4): back in the old place with a compatible label it re-attaches by geometry, anywhere else it re-attaches when the appearance similarity clears `reid_min_similarity`, and a similarity below that vetoes even a same-place match so a different object put in the old spot gets a new ID. An object moved before its old spot is confirmed empty holds a provisional ID until the old instance retires, at which point the two records are reconciled under the original ID with the new geometry. The trajectory records the move, and the VLM prompt reports it ("disappeared at t=2.30s and reappeared at t=3.60s, moved from [...] to [...]"). `evaluate.py` scores this as identity consistency: the fraction of moved or returned objects served by a single instance ID across all their phases.

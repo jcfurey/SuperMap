@@ -13,6 +13,7 @@ Layout::
 
     <map_dir>/map.json                  header, ID counter, and every instance's scalar fields
     <map_dir>/map_arrays-<save>.npz     points_<id>, log_odds_<id>, membership_<id> per instance
+                                        (+ support_<id> when bbox support is tracked)
 
 Saves are atomic. The arrays go to a file unique to this save, written via
 a temporary file, fsync'ed, and renamed into place; ``map.json`` -- which
@@ -76,6 +77,7 @@ def instance_to_record(obj: ObjectInstance) -> dict:
         "geometry_stamp": obj.geometry_stamp,
         "hits": int(obj.hits),
         "points_contradicted": int(obj.points_contradicted),
+        "existence_log_odds": float(obj.existence_log_odds),
         "trajectory": [[float(stamp), _floats(center), str(status)] for stamp, center, status in obj.trajectory],
         "embedding": _floats(obj.embedding) if obj.embedding is not None else None,
         "embedding_count": int(obj.embedding_count),
@@ -107,6 +109,7 @@ def instance_from_record(
         geometry_stamp=record.get("geometry_stamp", float(record['latest_stamp']) if n else None),
         hits=int(record["hits"]),
         points_contradicted=int(record.get("points_contradicted", 0)),
+        existence_log_odds=float(record.get("existence_log_odds", 0.0)),
         point_membership=np.asarray(membership, dtype=np.float64),
         trajectory=[(float(s), np.asarray(c, dtype=np.float64), str(st)) for s, c, st in record.get("trajectory", [])],
         embedding=(np.asarray(record["embedding"], dtype=np.float32) if record.get("embedding") is not None else None),
@@ -165,6 +168,8 @@ def save_map(object_map: ObjectMap, path: str | Path, metadata: dict | None = No
         arrays[f"points_{obj.instance_id}"] = np.asarray(obj.points_world, dtype=np.float64).reshape(-1, 3)
         arrays[f"log_odds_{obj.instance_id}"] = np.asarray(obj.point_log_odds, dtype=np.float32)
         arrays[f"membership_{obj.instance_id}"] = np.asarray(obj.point_membership, dtype=np.float32)
+        if len(obj.point_support) and obj.point_support.shape[0] == obj.points_world.shape[0]:
+            arrays[f"support_{obj.instance_id}"] = np.asarray(obj.point_support, dtype=np.float32)
     arrays_file = f"{_ARRAYS_PREFIX}-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.npz"
     header = {
         "format_version": MAP_FORMAT_VERSION,
@@ -219,6 +224,8 @@ def load_map(path: str | Path, object_map: ObjectMap, resume: bool = True) -> di
                 arrays[f"log_odds_{instance_id}"],
                 arrays[f"membership_{instance_id}"],
             )
+            if f"support_{instance_id}" in arrays:
+                obj.point_support = np.asarray(arrays[f"support_{instance_id}"], dtype=np.float64)
             if resume:
                 prepare_for_resume(obj)
             objects[instance_id] = obj

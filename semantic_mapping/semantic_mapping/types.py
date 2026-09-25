@@ -145,6 +145,11 @@ class ObjectInstance:
     projecting outside the detected region, which is how background caught in
     a loose box gets pruned instead of inflating the object's 3D extent."""
 
+    point_support: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    """Per-point count of frames whose lifted detection points re-hit the point
+    (ObjectMap bbox_min_support); only maintained when that option is on, and
+    a length that disagrees with ``points_world`` means "one frame each"."""
+
     trajectory: list[tuple[float, np.ndarray, str]] = field(default_factory=list)
     """Temporal edge history E_t: (stamp, world centroid, status) samples tracing this
     instance's trajectory (Sec. IV-C), used for temporal-edge queries such as
@@ -160,6 +165,10 @@ class ObjectInstance:
     """Completed detector observations that did not match this object; geometry-only frames do not count."""
     geometry_stamp: float | None = None
     """Last accepted 3D measurement; a 2D-only match must not refresh geometry age."""
+    existence_log_odds: float = 0.0
+    """Log-odds that this instance is a real object (ObjectMap existence_*): raised
+    by score-weighted detections, lowered by frames in which the detector could
+    have seen it and did not. Only maintained when existence_hit_gain > 0."""
 
     @property
     def label(self) -> str:

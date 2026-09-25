@@ -71,7 +71,7 @@ from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithP
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
-from semantic_mapping.geometry_utils import invert_se3, rasterize_depth, transform_points
+from semantic_mapping.geometry_utils import invert_se3, occlusion_grid_for, rasterize_depth, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.ros_msgs import (
     camera_info_has_distortion, camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy, numpy_to_image,
@@ -383,6 +383,16 @@ class SemanticMappingNode(AutostartLifecycleNode):
         d("depth_scale", 1000.0, "Units per metre of 16-bit depth images.")
         d("pointcloud_accumulate_scans", 1, "Rasterize the last N scans (via TF) for sparse LiDAR.",
           range=(1, 100))
+        d("pointcloud_splat_radius_m", 0.05,
+          "Occlusion-aware point-cloud depth: each point hides the points behind it within a disc of this "
+          "radius (m). A one-pixel z-buffer lets background show through a sparse foreground. 0 disables.",
+          range=(0.0, 10.0))
+        d("pointcloud_splat_max_px", 8, "Cap on a point's occlusion footprint radius (px).", range=(1, 64))
+        d("pointcloud_occlusion_gap_m", 0.3, "A footprint this far in front of a point hides it (m).",
+          range=(0.0, 100.0))
+        d("pointcloud_occlusion_grid_px", 0,
+          "Decide occlusion on cells of this many pixels (bounds the cost at high resolution); "
+          "0 = auto (the longer image side / 640).", range=(0, 64))
         d("rgb_compressed", False, "rgb_topic carries sensor_msgs/CompressedImage.")
         d("sensor_qos", "best_effort", "best_effort | reliable | sensor_data.")
         d("sensor_qos_depth", 10, "History depth of sensor subscriptions.", range=(1, 1000))
@@ -452,7 +462,9 @@ class SemanticMappingNode(AutostartLifecycleNode):
         d("map_autosave_sec", 0.0, "> 0: save to map_save_path every N seconds.")
 
         for name, value in PipelineConfig().__dict__.items():
-            d(name, value, f"PipelineConfig.{name}; see config/semantic_mapping.yaml.")
+            # An empty list default would be typed BYTE_ARRAY and reject a YAML string list.
+            declare(self, name, value, f"PipelineConfig.{name}; see config/semantic_mapping.yaml.",
+                    dynamic_typing=isinstance(value, list) and not value)
         d("yoloe.checkpoint", "yoloe-v8l-seg.pt", "YOLOE checkpoint.")
         d("yoloe.device", "cuda", "YOLOE device.")
         d("yoloe.confidence_threshold", 0.25, "YOLOE confidence threshold.")
@@ -599,6 +611,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self._scan_history = _ScanRing(int(self._param("pointcloud_accumulate_scans")))
+        self._splat_radius_m = float(self._param("pointcloud_splat_radius_m"))
+        self._splat_max_px = int(self._param("pointcloud_splat_max_px"))
+        self._occlusion_gap_m = float(self._param("pointcloud_occlusion_gap_m"))
+        self._occlusion_grid_px = int(self._param("pointcloud_occlusion_grid_px"))
         self._next_frame_id = 0
         self._pending_frames: deque[_PendingFrame] = deque()
         self._pending_by_id: dict[int, _PendingFrame] = {}
@@ -764,7 +780,11 @@ class SemanticMappingNode(AutostartLifecycleNode):
         return prompts
 
     def _build_pipeline_config(self) -> PipelineConfig:
-        return PipelineConfig(**{name: self._param(name) for name in PipelineConfig().__dict__})
+        defaults = PipelineConfig().__dict__
+        values = {name: self._param(name) for name in defaults}
+        # A YAML `[]` arrives as an unset (None) parameter.
+        values.update({name: list(values[name] or []) for name, value in defaults.items() if isinstance(value, list)})
+        return PipelineConfig(**values)
 
     def _detector_kwargs(self) -> dict:
         backend = self._param_str("detector", "offline")
@@ -936,6 +956,9 @@ class SemanticMappingNode(AutostartLifecycleNode):
         stat.add("grounding_outstanding", str(self._grounding_outstanding))
         pipeline = getattr(self, "pipeline", None)
         stat.add("instances", str(len(pipeline.object_map.objects) if pipeline is not None else 0))
+        if pipeline is not None and (pipeline.object_map.size_limits or any(pipeline.object_map.stats.values())):
+            for key, value in pipeline.object_map.stats.items():
+                stat.add(key, str(value))
         return stat
 
     def _tick(self, name: str) -> None:
@@ -1445,7 +1468,11 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 points_cam = transform_points(T_cam_from_world, self._scan_history.points())
             else:
                 points_cam = transform_points(T_cam_from_world @ T_world_from_cloud, points_cloud_frame)
-            depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
+            depth = rasterize_depth(
+                points_cam, intrinsics.K, intrinsics.width, intrinsics.height,
+                splat_radius_m=self._splat_radius_m, splat_max_px=self._splat_max_px,
+                occlusion_gap_m=self._occlusion_gap_m,
+                occlusion_grid_px=self._occlusion_grid_px or occlusion_grid_for(intrinsics.width, intrinsics.height))
 
         observation = Observation(
             stamp=stamp,
@@ -1747,7 +1774,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
             if obj.status == ObjectStatus.OCCLUDED:
                 measured = obj.geometry_stamp if obj.geometry_stamp is not None else obj.latest_stamp
                 status = f"occluded {max(now - measured, 0.0):.0f}s"
-            label_marker.text = f"{obj.instance_id}:{obj.label} ({status})"
+            confidence = ""
+            if obj.existence_log_odds:  # only maintained with existence_hit_gain > 0
+                confidence = f" {1.0 / (1.0 + np.exp(-obj.existence_log_odds)):.2f}"
+            label_marker.text = f"{obj.instance_id}:{obj.label}{confidence} ({status})"
             marker_array.markers.append(label_marker)
 
         self.obj_boxes_pub.publish(marker_array)
