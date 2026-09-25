@@ -41,11 +41,23 @@
 - Ubuntu 22.04 / 24.04, NVIDIA GPU with ≥ 16 GB VRAM, Python ≥ 3.10
 - ROS2 Jazzy workspace for live mode
 
+## Repository layout
+
+This fork ([jcfurey/SuperMap](https://github.com/jcfurey/SuperMap), upstream
+[superxslam/SuperMap](https://github.com/superxslam/SuperMap)) holds two colcon packages:
+
+| path | package | contents |
+|---|---|---|
+| `semantic_mapping/` | `semantic_mapping` (ament_python) | the library (`semantic_mapping/semantic_mapping/`), ROS 2 nodes, `launch/`, `config/`, `examples/`, `test/` |
+| `supermap_msgs/` | `supermap_msgs` (ament_cmake) | `MaskDetection`, `CameraAnnotations`, `Region`, `RegionArray`; `SaveMap`, `LoadMap` services; `GroundInstruction` action |
+
+Offline commands below run from `semantic_mapping/`. Licensed MIT (see `LICENSE`).
+
 ## Setup
 
 ```bash
-git clone https://github.com/superxslam/SuperMap.git
-cd SuperMap
+git clone https://github.com/jcfurey/SuperMap.git
+cd SuperMap/semantic_mapping
 conda create -n supermap python=3.11 && conda activate supermap
 
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
@@ -64,6 +76,7 @@ and adds visibility-tested camera labels. The cloud core loads no models; an exp
 YOLOE exception enables automatic image labels through a separate adapter.
 
 ```bash
+cd semantic_mapping                          # the package directory
 python examples/prepare_example_dataset.py   # generate a synthetic demo sequence (one-time)
 python examples/example.py                   # run the mapping pipeline
 python examples/evaluate.py                  # score it with the paper's metrics (Sec. V-D / V-E)
@@ -98,14 +111,51 @@ Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--confi
 ## Run (live ROS2)
 
 ```bash
-# Clone into your workspace src/ as `semantic_mapping`, then:
-colcon build --packages-select semantic_mapping && source install/setup.bash
-ros2 launch semantic_mapping semantic_mapping.launch.py
+# Clone this repository into your workspace src/, then:
+colcon build --packages-select supermap_msgs semantic_mapping && source install/setup.bash
+ros2 launch semantic_mapping semantic_mapping.launch.py                       # autostart: configures + activates itself
+ros2 launch semantic_mapping semantic_mapping.launch.py namespace:=robot1 use_sim_time:=true
+ros2 launch semantic_mapping semantic_mapping.launch.py autostart:=false      # let nav2_lifecycle_manager drive it
 ```
 
-In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`/obj_points`), labeled boxes (`/obj_boxes`), and annotated images. The detector runs in its own thread at `detector_rate_hz` (default 1 Hz). Sensor frames are fused exactly once in timestamp order, under their own pose and depth. Later frames wait behind a pending detection for at most `detector_timeout_sec` (default 2 seconds of steady time), with a buffer of `max_pending_frames` (default 30). A timeout or overflow releases the waiting frame without detections; late results are discarded. This bounds detector-induced mapping latency and prevents old observations from reversing newer map state. A steady-clock timer delivers completed results even when inputs or bag playback stop. Duplicate and out-of-order input stamps are skipped; loading a map starts a new input timestamp sequence and invalidates pending observations. Map outputs are published at `publish_rate_hz`; annotated images retain their original camera frame and timestamp.
+`semantic_mapping_node` is a managed (lifecycle) node. Models, subscriptions and
+publishers are created in `on_configure`; input is processed only while active.
+With `autostart:=true` (default) it configures and activates itself once
+spinning, so `ros2 run` and plain launch `Node` actions keep working; with
+`autostart:=false` add it to a `nav2_lifecycle_manager` `node_names` list.
+`config/semantic_mapping.yaml` is keyed `/**`, all topic names are relative, and
+the launch file takes `namespace`, `use_sim_time`, `autostart`, `config` and
+`log_level`; its other arguments (`prompts_file`, `detector`, `world_frame`,
+`camera_frame`, `map_load_path`, `map_save_path`) override the YAML only when set.
+It runs on a multi-threaded executor: sensor input, map save/load and grounding
+have separate callback groups, and one lock guards the map.
 
-Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 at the RGB timestamp; each point cloud is first transformed into the world at its own timestamp, then projected into that RGB-time camera. A `sensor_frame -> camera_frame` extrinsic must be in the TF tree (via a URDF/`robot_state_publisher`, or the `static_transform_publisher` the launch file includes by default — override its `camera_x`/`camera_y`/.../`camera_qw` arguments with your calibration). Detector masks must be boolean arrays at camera resolution; the YOLOE adapter requests original-resolution masks and converts RGB to the backend's BGR input convention.
+| interface | type | notes |
+|---|---|---|
+| `camera/color/image_raw`, `camera/color/camera_info` | `sensor_msgs/Image` (or `CompressedImage`), `CameraInfo` | inputs, synchronized |
+| `lidar/points` or `camera/aligned_depth_to_color/image_raw` | `PointCloud2` / `Image` | depth source (`depth_source`) |
+| `odometry` | `nav_msgs/Odometry` | paces processing when `sync_odometry: true`; poses always come from TF |
+| `obj_points` | `sensor_msgs/PointCloud2` | label-coloured object points; latched, republished only when the map changes |
+| `obj_boxes` | `visualization_msgs/MarkerArray` | boxes + labels; latched; `DELETEALL` on start and on map load |
+| `objects` | `vision_msgs/Detection3DArray` | per object: `id` = instance ID, map-frame box, label hypotheses with belief scores; latched |
+| `semantic_mapping/annotated_image` | `sensor_msgs/Image` | detections on the detector frame (depth-2 reliable) |
+| `supermap/camera_annotations` | `supermap_msgs/CameraAnnotations` | YOLOE masks for dense-cloud labelling (`publish_dense_camera_annotations`) |
+| `~/ground_instruction` | `supermap_msgs/action/GroundInstruction` | language grounding (primary interface), see below |
+| `semantic_mapping/query` -> `semantic_mapping/answer` | `std_msgs/String` | legacy grounding (JSON answer with `request_id`) |
+| `semantic_mapping/goal`, `semantic_mapping/waypoints` | `PoseStamped`, `nav_msgs/Path` | approach poses of the latest grounding; latched |
+| `~/save_map`, `~/load_map` | `supermap_msgs/srv/SaveMap`, `LoadMap` | `path` argument; empty uses the configured path |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | detector / mapping / publish rates; TF failures, drops, pending frames, grounding queue, failures |
+
+Runtime-tunable parameters (`ros2 param set`): `detector_rate_hz`,
+`publish_rate_hz`, `detector_timeout_sec`, `max_pending_frames`,
+`publish_disappeared_objects`, `tf_wait_sec`, `input_time_jump_reset_sec`,
+`vlm.local_radius_m`, `vlm.max_objects`, `vlm.stale_after_sec`,
+`grounding_max_queue`, `goal_*` and `nav2_send_goal`. All others are read-only
+and applied on (re)configure; setting one fails instead of silently doing nothing.
+
+In live mode, the system subscribes to RGB, CameraInfo, PointCloud2, and Odometry topics published by an upstream geometric SLAM backbone (Sec. IV-A) and publishes per-object voxels (`obj_points`), labeled boxes (`obj_boxes`, `objects`), and annotated images. The detector runs in its own thread at `detector_rate_hz` (default 1 Hz). Sensor frames are fused exactly once in timestamp order, under their own pose and depth. Later frames wait behind a pending detection for at most `detector_timeout_sec` (default 2 seconds of steady time), with a buffer of `max_pending_frames` (default 30). A timeout or overflow releases the waiting frame without detections; late results are discarded. This bounds detector-induced mapping latency and prevents old observations from reversing newer map state. A steady-clock timer delivers completed results even when inputs or bag playback stop. Duplicate and out-of-order input stamps are skipped. When the clock (sim time) or the input stamps jump backwards by more than `input_time_jump_reset_sec` (e.g. `ros2 bag play --loop`), queued input and rate schedules reset and the map continues in the new time epoch; loading a map does the same and invalidates pending observations. A frame whose transforms have not arrived yet waits up to `tf_wait_sec` (default 0.2 s) instead of being dropped at once. Exceptions while processing or publishing a frame are logged (throttled), counted in diagnostics, and the frame is skipped; they never stop the executor. Map outputs are published at `publish_rate_hz`; annotated images retain their original camera frame and timestamp.
+
+Topic and detector settings are configured in `config/semantic_mapping.yaml`, and the detection vocabulary is defined in `config/prompts.yaml`. The world-from-camera pose (Eq. 3) is resolved through TF2 at the RGB timestamp; each point cloud is first transformed into the world at its own timestamp, then projected into that RGB-time camera. A `sensor_frame -> camera_frame` extrinsic must be in the TF tree, normally from a URDF/`robot_state_publisher` or the camera driver. The launch file can publish it with `static_transform_publisher`, but only on request: `publish_static_camera_tf:=true` requires `sensor_frame`, `camera_frame` and the calibrated `camera_x ... camera_qw` (there is no placeholder default, which would silently mis-calibrate the camera or fight the URDF). Detector masks must be boolean arrays at camera resolution; the YOLOE adapter requests original-resolution masks and converts RGB to the backend's BGR input convention.
 
 Sensor inputs subscribe best-effort by default (`sensor_qos`), which matches both best-effort and reliable drivers; RGB can arrive as `CompressedImage` (`rgb_compressed: true`), and RGB-D cameras can feed their color-aligned depth stream directly (`depth_source: depth_image`, `depth_topic`, `depth_scale`) instead of a point cloud. Images are decoded with plain numpy, so the node does not depend on cv_bridge.
 
@@ -114,9 +164,13 @@ are subtracted from the principal point before scaling by binning. An all-zero
 ROI means the full image and zero binning means one. Images must match the
 resulting crop dimensions; neither the live node nor the bag converter silently
 resizes a mismatched image. Invalid calibration or mismatched live inputs are
-skipped without stopping the node. The existing pinhole model uses `K`; inputs
-must already have matching pinhole calibration (this conversion does not apply
-distortion correction or stereo rectification).
+skipped without stopping the node. The pinhole model does not undistort:
+with `camera_images_rectified: false` (default) the image is taken as raw,
+CameraInfo `D` must be all zero (frames with distortion are rejected) and `K`
+is used; for a distorted camera run `image_proc` and set
+`camera_images_rectified: true`, which projects with `P` (its left 3x3) and
+ignores `D`/`R`. Dense-annotation export requires rectified input and embeds
+the matching calibration (`K` = `P`, `D` = 0) in each `CameraAnnotations`.
 
 For Ouster pinhole panels, use each panel's matching `camera_info` and metric
 `depth_image` (`32FC1` metres), not its radial `range_image`. Full-panel `K`
@@ -140,6 +194,11 @@ and percentile bounds can trim thin extremities. The stationary D435i demo
 uses 0.15–6 m, a factor of 3, and 2nd–98th percentile bounds; see the
 [live validation report](doc/live-d435i-2026-09-24.md).
 
+`prompts_file` resolves a relative path against the package share directory
+(then the working directory), so the default works under `ros2 run`; a real
+detector (`yoloe`, `groundingdino`) with an empty or unreadable vocabulary
+fails `configure` instead of running with no prompts.
+
 Set `detector_rate_hz` and `publish_rate_hz` to suit the input and hardware.
 Runtime logs include actual rates, inference time, and map-publication time.
 Geometry-only frames still update evidence, but do not count as failed
@@ -156,10 +215,20 @@ docker run --rm -it supermap/semantic_mapping:lite \
   bash -lc "python3 examples/prepare_example_dataset.py && python3 examples/example.py"       # offline demo, no GPU needed
 
 docker run --rm -it --gpus all --network host supermap/semantic_mapping                       # live ROS2 mode
-# or: docker compose up --build
+# or: docker compose up --build                        (full image, reserves a GPU)
+#     docker compose --profile lite up --build semantic_mapping_lite   (no GPU)
 ```
 
-Continuous integration (`.github/workflows/ci.yml`) runs the unit tests on Python 3.11 and 3.12, the offline pipeline with a metric regression gate on the synthetic scene (detection recall, change recall, final-map F1, mIoU, mAP50), and builds the lite image to run the tests, the offline example, and the launch file under ROS 2 Jazzy.
+The image builds both packages in `/workspace` and starts in the package
+directory. `cv2` comes from apt `python3-opencv`; the pip `opencv-python` that
+ultralytics pulls in is removed so it cannot shadow it.
+
+Continuous integration (`.github/workflows/ci.yml`, on pushes to `master`/`main`/`dev` and on pull requests) runs the unit tests on Python 3.11 and 3.12, the offline pipeline with a metric regression gate on the synthetic scene (detection recall, change recall, final-map F1, mIoU, mAP50), and builds the lite image to run `colcon build` + `colcon test` (unit, ROS 2 end-to-end and ament linter tests), the offline example, and the launch file under ROS 2 Jazzy.
+
+Tests locally (from `semantic_mapping/`): `python3 -m pytest test -q` without ROS;
+with ROS sourced, `python3 -m pytest test -q -p no:launch_testing -p no:launch_ros`
+(ROS's launch_testing plugin otherwise collects `test/ros` even with `--ignore`),
+or `colcon test --packages-select semantic_mapping` in the workspace.
 
 ### Query the map (visual-language navigation, Sec. IV-D)
 
@@ -170,11 +239,36 @@ python examples/query.py "go to the chair next to the table"                    
 python examples/query.py --client openai_compatible --model gpt-4o "return to where the trash can was"
 python examples/query.py --client anthropic --model claude-opus-5 "..."
 
-ros2 topic pub --once /semantic_mapping/query std_msgs/String "{data: 'go to the whiteboard next to the painting'}"
-ros2 topic echo /semantic_mapping/goal           # geometry_msgs/PoseStamped, first target
-ros2 topic echo /semantic_mapping/waypoints      # nav_msgs/Path, all targets in order
-ros2 topic echo /semantic_mapping/answer         # JSON: target_ids, waypoints, raw response
+# Live, primary interface: an action with feedback (serializing, queued, querying, parsing) and cancel.
+ros2 action send_goal --feedback /semantic_mapping_node/ground_instruction supermap_msgs/action/GroundInstruction \
+    "{instruction: 'go to the whiteboard next to the painting', local_radius_m: 0.0}"
+
+# Legacy topics (still supported): plain text, or JSON carrying your own request ID.
+ros2 topic pub --once /semantic_mapping/query std_msgs/String "{data: '{\"instruction\": \"go to the sofa\", \"request_id\": \"42\"}'}"
+ros2 topic echo /semantic_mapping/answer         # JSON: request_id, target_ids, waypoints (centroids), goals, response, error
+ros2 topic echo /semantic_mapping/goal           # geometry_msgs/PoseStamped, first approach pose
+ros2 topic echo /semantic_mapping/waypoints      # nav_msgs/Path, all approach poses in order
 ```
+
+The action result carries `target_ids`, `target_labels`, `unresolved_ids`, the
+raw model `response`, and one approach pose per target (`goals`, also as
+`path`). A goal is never the object's centroid, which lies inside an occupied
+costmap cell: it is `goal_standoff_m` (default 0.6 m) outside the object's
+footprint, on the side facing the robot (`robot_frame`, looked up at the
+latest transform) or, without a robot pose, on the object's narrowest side;
+directions whose pose falls on another object (grown by `goal_clearance_m`)
+are skipped, an object on a table is approached from beside the table, and the
+pose faces the object. Its height is the robot frame's (`goal_use_robot_z`) or
+`goal_z_m`. At most `grounding_max_queue` requests are queued or running; more
+goals are rejected and legacy queries answered with a "busy" error.
+
+**Nav2.** Set `robot_frame: base_link` (or your base frame) and a standoff
+larger than the robot radius plus costmap inflation. Either consume
+`semantic_mapping/goal` / the action result in your own behaviour tree, or set
+`nav2_send_goal: true` to forward the first approach pose to Nav2's
+`navigate_to_pose` action (`nav2_action_name`); `nav2_msgs` is imported only
+then, so the node runs without Nav2 installed. For Nav2's lifecycle manager,
+launch with `autostart:=false` and add `semantic_mapping_node` to its node list.
 
 The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `openai_compatible` talks to any `/chat/completions` endpoint (OpenAI, Gemini's OpenAI-compatible endpoint, vLLM, Ollama, ...), `anthropic` to the Messages API, both via the standard library with keys read from the environment. The default `keyword` client is a deterministic no-network stand-in that matches labels named in the instruction, so everything runs without credentials -- it cannot do the relational or temporal reasoning that a real model does over the graph. Configure under `vlm:` in `config/semantic_mapping.yaml`.
 
@@ -208,6 +302,7 @@ The paper's instance IDs are meant to be stable "even across relocations", which
 Record RGB, CameraInfo, a point cloud (or an aligned depth image), odometry, and TF from any robot, then convert the bag into the offline layout so `example.py`, `evaluate.py`, `benchmark.py`, and `query.py` run on it unchanged:
 
 ```bash
+cd semantic_mapping
 python examples/rosbag_to_sequence.py my_capture.bag --out_dir data/my_capture \
     --rgb_topic /camera/color/image_raw --camera_info_topic /camera/color/camera_info \
     --pointcloud_topic /lidar/points --odometry_topic /odometry \
@@ -241,12 +336,19 @@ python examples/example.py --save_map data/office_map                       # of
 python examples/example.py --load_map data/office_map --save_map data/office_map   # continue from it
 
 ros2 launch semantic_mapping semantic_mapping.launch.py map_load_path:=/maps/office map_save_path:=/maps/office
-ros2 service call /semantic_mapping_node/save_map std_srvs/srv/Trigger     # or set map_autosave_sec
+ros2 service call /semantic_mapping_node/save_map supermap_msgs/srv/SaveMap "{path: ''}"            # '' = map_save_path; or set map_autosave_sec
+ros2 service call /semantic_mapping_node/save_map supermap_msgs/srv/SaveMap "{path: /maps/snapshot}"
+ros2 service call /semantic_mapping_node/load_map supermap_msgs/srv/LoadMap "{path: /maps/office}"  # '' = map_load_path, else map_save_path
 ```
 
-Restored instances resume as *occluded* with a reset 2D tracklet (a tracklet is camera-relative and meaningless after a restart); re-observation runs through the 3D re-activation stage like any object that left the field of view, and the geometric-consistency update retires objects that are gone. New instances keep counting from the saved ID counter, so IDs recorded by downstream consumers stay unique. Format: `map.json` + `map_arrays.npz` (`semantic_mapping/persistence.py`).
+Saving snapshots the map under the lock and writes it in the service's own
+callback group, so it does not stall sensor processing; the response carries
+the directory written. Loading replaces the map, clears RViz markers and
+restarts the input sequence.
 
-Offline frames and live query payloads use the shared JSON serialization helpers (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, `latest_stamp`, and `seconds_since_seen`. The optional `geometry_stamp` and `seconds_since_geometry` fields describe the last accepted 3D measurement; they are null when its timestamp is unavailable. A newer 2D detection may update `latest_stamp` without refreshing the mapped location. The live node publishes geometry as ROS point clouds and markers; it does not publish a per-frame JSON topic. Occluded locations carry their geometry age in RViz labels and the VLM prompt, falling back to observation age for legacy instances. Past `vlm.stale_after_sec`, the prompt marks them as possibly gone. The offline `evaluate.py --stale_after N` policy still uses observation age to score instances unseen longer than N seconds as unknown rather than present (on the synthetic scene that turns the two removed-but-unconfirmed objects from false positives into unknowns and final-map precision from 0.80 into 1.00).
+Restored instances resume as *occluded* with a reset 2D tracklet (a tracklet is camera-relative and meaningless after a restart); re-observation runs through the 3D re-activation stage like any object that left the field of view, and the geometric-consistency update retires objects that are gone. New instances keep counting from the saved ID counter, so IDs recorded by downstream consumers stay unique. Format: a `map_arrays-<timestamp>-<id>.npz` array file plus `map.json`, which names it and is written last as the commit marker, so an interrupted save never pairs new arrays with an old header; maps saved as `map_arrays.npz` by older versions still load (`semantic_mapping/persistence.py`).
+
+Offline frames and live query payloads use the shared JSON serialization helpers (`semantic_mapping.serialization`) with `bbox3d`, `label`, `id`, `center`, `spatial_relations`, `status`, `latest_stamp`, and `seconds_since_seen`. The optional `geometry_stamp` and `seconds_since_geometry` fields describe the last accepted 3D measurement; they are null when its timestamp is unavailable. A newer 2D detection may update `latest_stamp` without refreshing the mapped location. The live node publishes geometry as ROS point clouds, markers and `vision_msgs/Detection3DArray`; it does not publish a per-frame JSON topic. Occluded locations carry their geometry age in RViz labels and the VLM prompt, falling back to observation age for legacy instances. Past `vlm.stale_after_sec`, the prompt marks them as possibly gone. The offline `evaluate.py --stale_after N` policy still uses observation age to score instances unseen longer than N seconds as unknown rather than present (on the synthetic scene that turns the two removed-but-unconfirmed objects from false positives into unknowns and final-map precision from 0.80 into 1.00).
 
 ## Citation
 

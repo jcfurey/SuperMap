@@ -1,25 +1,23 @@
 # syntax=docker/dockerfile:1
 #
-# semantic_mapping (SuperMap) container: ROS2 Jazzy on Ubuntu 24.04, per the
-# project README's stated requirements. Builds this repo as a colcon
-# workspace and installs its Python dependencies.
+# SuperMap container: ROS 2 Jazzy on Ubuntu 24.04. The repository root holds
+# two colcon packages -- semantic_mapping (ament_python) and supermap_msgs
+# (interfaces) -- which are built together in /workspace.
 #
-# The heavy open-vocabulary detector stack (torch, ultralytics/YOLOE,
-# GroundingDINO, SAM2) is behind the INSTALL_DETECTORS build arg since it is
-# multi-gigabyte and only needed for the yoloe/groundingdino backends; the
-# offline (pre-baked detection replay) backend, the offline example, and the
-# test suite all work without it. GPU access at runtime comes from the NVIDIA
-# Container Toolkit (`docker run --gpus all ...`), not from CUDA baked into
-# this image; building GroundingDINO's optional custom CUDA op requires an
-# nvcc devel image and is out of scope here (it has a slower pure-Python
-# fallback when the extension isn't compiled).
+# The heavy open-vocabulary detector stack (torch, ultralytics/YOLOE) is
+# behind the INSTALL_DETECTORS build arg since it is multi-gigabyte and only
+# needed for the yoloe/groundingdino backends; the offline (pre-baked
+# detection replay) backend, the offline example, and the test suite all work
+# without it. GPU access at runtime comes from the NVIDIA Container Toolkit
+# (`docker run --gpus all ...`), not from CUDA baked into this image.
+# GroundingDINO/SAM2 are installed from source per their READMEs if needed.
 #
 # Build:
 #   docker build -f docker/Dockerfile -t supermap/semantic_mapping .
 #   docker build -f docker/Dockerfile --build-arg INSTALL_DETECTORS=0 -t supermap/semantic_mapping:lite .
 #
-# Run (offline example, no GPU needed):
-#   docker run --rm -it supermap/semantic_mapping \
+# Run (offline example, no GPU needed; the working directory is the package):
+#   docker run --rm -it supermap/semantic_mapping:lite \
 #     bash -lc "python3 examples/prepare_example_dataset.py && python3 examples/example.py"
 #
 # Run (live ROS2, GPU + host networking so DDS discovery reaches other
@@ -37,64 +35,64 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# package.xml exec/test dependencies, installed directly as apt packages (no
+# rosdep resolve step: this pins the exact ros-${ROS_DISTRO}-* packages and
+# needs no access to raw.githubusercontent.com at build time).
+#
+# numpy/scipy/opencv/pyyaml come from apt, not pip, so the package shares one
+# numpy and one cv2 with the distro's ROS Python bindings. Image messages are
+# decoded with plain numpy (semantic_mapping/ros_msgs.py); cv_bridge is not needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         python3-colcon-common-extensions \
-        python3-rosdep \
         python3-numpy \
         python3-scipy \
         python3-yaml \
         python3-opencv \
+        python3-pytest \
         ros-${ROS_DISTRO}-tf2-ros \
         ros-${ROS_DISTRO}-message-filters \
         ros-${ROS_DISTRO}-sensor-msgs-py \
+        ros-${ROS_DISTRO}-vision-msgs \
+        ros-${ROS_DISTRO}-diagnostic-updater \
+        ros-${ROS_DISTRO}-diagnostic-msgs \
+        ros-${ROS_DISTRO}-nav2-msgs \
+        ros-${ROS_DISTRO}-rosbag2-py \
+        ros-${ROS_DISTRO}-rosidl-default-generators \
         ros-${ROS_DISTRO}-launch \
         ros-${ROS_DISTRO}-launch-ros \
+        ros-${ROS_DISTRO}-ament-flake8 \
+        ros-${ROS_DISTRO}-ament-pep257 \
+        ros-${ROS_DISTRO}-ament-copyright \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace/src/semantic_mapping
-COPY package.xml requirements.txt ./
-
-# package.xml's ROS exec_depends are satisfied directly by the apt packages
-# installed above (no rosdep resolve step: this pins the exact ros-${ROS_DISTRO}-*
-# packages rather than depending on network access to raw.githubusercontent.com
-# at build time, which is both fragile in restricted CI environments and
-# unnecessary once the mapping from package.xml keys to apt packages is known).
-#
-# numpy/scipy/opencv/pyyaml come from apt (above), not pip, so the package
-# shares one numpy with the distro's ROS Python bindings (sensor_msgs_py,
-# tf2_ros) instead of a newer pip numpy shadowing them. Image messages are
-# decoded with plain numpy (semantic_mapping/ros_msgs.py), so cv_bridge and
-# its numpy-ABI coupling are not needed.
-RUN pip3 install --no-cache-dir --break-system-packages "pytest>=7.4,<8"
-
 # Detector backends (large: torch + CUDA runtime wheels, ultralytics).
-# GroundingDINO/SAM2 are not on PyPI as installable packages by their
-# canonical names -- install them from source per their own READMEs
-# (https://github.com/IDEA-Research/GroundingDINO,
-#  https://github.com/facebookresearch/sam2) if you need that backend.
-# "numpy<2" is pinned on both installs below (not just left to whatever
-# torch/ultralytics would pull in) so the apt-provided numpy stays the
-# one in use -- pip resolves a whole command's requirements together, so
-# this constrains any transitive numpy pull, not just a direct one.
+# "numpy<2" is pinned on both installs so the apt numpy stays the one in use
+# (pip resolves a whole command's requirements together, so this constrains
+# any transitive numpy pull, not just a direct one). ultralytics depends on
+# pip's opencv-python, which would shadow apt's python3-opencv with a second
+# cv2 built against a different numpy; it is removed again so `import cv2`
+# resolves to the apt build.
 RUN if [ "$INSTALL_DETECTORS" = "1" ]; then \
         pip3 install --no-cache-dir --break-system-packages \
             "numpy<2" torch==2.5.1 torchvision==0.20.1 \
             --index-url https://download.pytorch.org/whl/cu124 \
         && pip3 install --no-cache-dir --break-system-packages \
-            "numpy<2" ultralytics rerun-sdk; \
-    fi
+            "numpy<2" ultralytics rerun-sdk \
+        && pip3 uninstall -y --break-system-packages opencv-python opencv-python-headless || true; \
+    fi \
+    && python3 -c "import cv2, numpy; assert cv2.__file__.startswith('/usr/lib/python3/'), cv2.__file__; print('cv2', cv2.__version__, 'numpy', numpy.__version__)"
 
-WORKDIR /workspace/src/semantic_mapping
+WORKDIR /workspace/src/SuperMap
 COPY . .
 
 WORKDIR /workspace
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
-    && colcon build --packages-select semantic_mapping --symlink-install
+    && colcon build --symlink-install --packages-select supermap_msgs semantic_mapping
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-WORKDIR /workspace/src/semantic_mapping
+WORKDIR /workspace/src/SuperMap/semantic_mapping
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["ros2", "launch", "semantic_mapping", "semantic_mapping.launch.py"]

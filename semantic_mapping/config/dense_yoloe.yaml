@@ -1,0 +1,21 @@
+# dense_yoloe_labels. Keyed /** so it applies under any namespace; topics are relative.
+/**:
+  ros__parameters:
+    # Explicit policy exception: YOLOE is not a US-created model.
+    allow_yoloe: false
+    images_rectified: false
+    use_projection_matrix: true  # raw CameraInfo next to image_rect*: describe masks with P
+    checkpoint: ""  # existing local YOLOE segmentation checkpoint
+    text_encoder_path: ""  # matching local MobileCLIP TorchScript encoder
+    device: cuda
+    half: true  # FP16 on CUDA only
+    confidence_threshold: 0.35  # runtime-settable
+    prompts: [person, pipe, cable, door, box]
+    rgb_topic: camera/image_rect_color
+    camera_info_topic: camera/camera_info
+    annotations_topic: supermap/camera_annotations  # supermap_msgs/CameraAnnotations
+    annotated_image_topic: supermap/annotated_image
+    max_camera_time_delta: 0.20
+    max_rate_hz: 20.0  # runtime-settable
+    sync_queue_size: 10
+    sync_slop_s: 0.05
