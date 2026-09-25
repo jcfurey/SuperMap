@@ -35,10 +35,34 @@ def stamp_to_seconds(stamp) -> float:
 
 
 def camera_info_to_intrinsics(info) -> CameraIntrinsics:
-    """Pinhole intrinsics from a sensor_msgs/CameraInfo (its ``k`` matrix)."""
+    """Convert full-resolution ``K`` into the emitted image's pixel coordinates.
+
+    CameraInfo dimensions and ROI are unbinned sensor coordinates. Subtract
+    the crop origin before dividing intrinsics and ROI size by binning; zero
+    binning means one, and an all-zero ROI means the full image. This adjusts
+    the existing K-based pinhole model; it does not rectify distorted images.
+    The incoming message is never modified.
+    """
+    full_width, full_height = int(info.width), int(info.height)
+    if full_width <= 0 or full_height <= 0:
+        raise ValueError("CameraInfo must have positive calibration dimensions")
+    fx, fy, cx, cy = (float(info.k[i]) for i in (0, 4, 2, 5))
+    if not np.all(np.isfinite([fx, fy, cx, cy])) or fx <= 0 or fy <= 0:
+        raise ValueError("CameraInfo K must contain finite, positive focal lengths and a finite principal point")
+    x, y, width, height = (int(getattr(info.roi, name))
+                           for name in ('x_offset', 'y_offset', 'width', 'height'))
+    if (x, y, width, height) == (0, 0, 0, 0):
+        width, height = full_width, full_height
+    elif (x < 0 or y < 0 or width <= 0 or height <= 0
+          or x + width > full_width or y + height > full_height):
+        raise ValueError("CameraInfo ROI must be a nonempty rectangle within the calibration dimensions")
+    bx, by = max(1, int(info.binning_x)), max(1, int(info.binning_y))
+    width, height = width // bx, height // by
+    if width <= 0 or height <= 0:
+        raise ValueError("CameraInfo binning leaves an empty image")
     return CameraIntrinsics(
-        fx=float(info.k[0]), fy=float(info.k[4]), cx=float(info.k[2]), cy=float(info.k[5]),
-        width=int(info.width), height=int(info.height),
+        fx=fx / bx, fy=fy / by, cx=(cx - x) / bx, cy=(cy - y) / by,
+        width=width, height=height,
     )
 
 

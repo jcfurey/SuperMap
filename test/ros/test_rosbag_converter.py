@@ -45,7 +45,7 @@ def _tf(parent, child, T, stamp):
     return msg
 
 
-def _write_bag(dataset, bag_dir):
+def _write_bag(dataset, bag_dir, cropped=False):
     writer = rosbag2_py.SequentialWriter()
     writer.open(rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3"),
                 rosbag2_py.ConverterOptions("cdr", "cdr"))
@@ -69,7 +69,16 @@ def _write_bag(dataset, bag_dir):
                 _tf("sensor", "lidar", T_SENSOR_FROM_LIDAR, t)]), t)
         header = Header(stamp=stamp_msg(t), frame_id="camera_color_optical_frame")
         put("/camera/color/image_raw", numpy_to_image(frame.rgb, "rgb8", header), t)
-        put("/camera/color/camera_info", camera_info(intr, header), t)
+        info = camera_info(intr, header)
+        if cropped:
+            # Same emitted image, calibrated as a crop of a larger, unbinned sensor.
+            info.binning_x, info.binning_y = 2, 3
+            info.width, info.height = intr.width * 2 + 64, intr.height * 3 + 32
+            info.k[0], info.k[4] = intr.fx * 2, intr.fy * 3
+            info.k[2], info.k[5] = intr.cx * 2 + 32, intr.cy * 3 + 16
+            info.roi.x_offset, info.roi.y_offset = 32, 16
+            info.roi.width, info.roi.height = intr.width * 2, intr.height * 3
+        put("/camera/color/camera_info", info, t)
         T_world_from_sensor = frame.T_world_from_cam @ invert_se3(T_SENSOR_FROM_CAM)
         T_world_from_lidar = T_world_from_sensor @ T_SENSOR_FROM_LIDAR
         pts_world = transform_points(frame.T_world_from_cam, back_project_depth(intr.K, frame.depth))
@@ -84,9 +93,10 @@ def _write_bag(dataset, bag_dir):
     writer.close()
 
 
-def test_bag_round_trip_reproduces_the_sequence_and_its_metrics(dataset, tmp_path):
+@pytest.mark.parametrize('cropped', [False, True])
+def test_bag_round_trip_reproduces_the_sequence_and_its_metrics(dataset, tmp_path, cropped):
     bag_dir, out_dir = tmp_path / "synthetic", tmp_path / "seq"
-    _write_bag(dataset, bag_dir)
+    _write_bag(dataset, bag_dir, cropped=cropped)
 
     subprocess.run([sys.executable, str(ROOT / "examples" / "rosbag_to_sequence.py"), str(bag_dir), "--out_dir", str(out_dir),
                     "--pointcloud_topic", "/lidar/points", "--odometry_topic", "/odometry",
@@ -96,6 +106,7 @@ def test_bag_round_trip_reproduces_the_sequence_and_its_metrics(dataset, tmp_pat
     assert info["frames"] == len(dataset), info
 
     converted = SequenceDataset(out_dir)
+    assert converted.intrinsics == dataset.intrinsics
     for a, b in zip(dataset, converted):
         assert np.allclose(a.T_world_from_cam, b.T_world_from_cam, atol=1e-5)
         assert np.array_equal(a.rgb, b.rgb)

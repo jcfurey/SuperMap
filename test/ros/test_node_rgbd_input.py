@@ -106,3 +106,75 @@ def test_disabling_odometry_sync_still_requires_camera_tf(node_factory, dataset)
         numpy_to_image(frame.depth.astype(np.float32), "32FC1", header))
     assert node._last_result is None
     assert not node._pending_frames
+
+
+@pytest.mark.parametrize('depth_source', ['depth_image', 'pointcloud'])
+@pytest.mark.parametrize('binning', [1, 2])
+def test_cropped_camera_input_preserves_pixels_and_mapped_geometry(node_factory, depth_source, binning):
+    from types import SimpleNamespace
+    from sensor_msgs.msg import RegionOfInterest
+    from sensor_msgs_py import point_cloud2 as pc2
+    from semantic_mapping.types import Detection2D
+
+    node = node_factory('-p', f'depth_source:={depth_source}', '-p', 'min_hits_to_confirm:=1',
+                        '-p', 'voxel_size:=0.001')
+    T = np.eye(4)
+    T[:3, 3] = [1., 2., 3.]
+    node._lookup_se3 = lambda *args: T
+    header = Header(stamp=stamp_msg(10.), frame_id=node.camera_frame)
+    info = CameraInfo(header=header, width=256, height=128, binning_x=binning, binning_y=binning,
+                      k=[128., 0., 127.5, 0., 96., 63.5, 0., 0., 1.],
+                      roi=RegionOfInterest(x_offset=32, y_offset=8, width=192, height=96))
+    h, w = 96 // binning, 192 // binning
+    rgb = (np.arange(h * w * 3) % 256).astype(np.uint8).reshape(h, w, 3)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[12:20, 28:40] = True
+    depth = np.where(mask, 2., 0.).astype(np.float32)
+    ys, xs = np.nonzero(mask)
+    points = np.column_stack(((32 + xs * binning - 127.5) * 2 / 128,
+                              (8 + ys * binning - 63.5) * 2 / 96, np.full(len(xs), 2.)))
+    detection = Detection2D(np.array([28., 12., 40., 20.]), 'person', .99, mask=mask)
+    node.detector = SimpleNamespace(detect=lambda *args, **kwargs: [detection])
+    observations = []
+    process = node._process_and_publish
+
+    def record(obs, hdr):
+        observations.append(obs)
+        return process(obs, hdr)
+
+    node._process_and_publish = record
+    # Cover both raw and compressed images without hiding a resize in the decoder.
+    rgb_msg = (CompressedImage(header=header, format='png', data=_png(rgb)) if binning == 2
+               else numpy_to_image(rgb, 'rgb8', header))
+    depth_msg = (numpy_to_image(depth, '32FC1', header) if depth_source == 'depth_image'
+                 else pc2.create_cloud_xyz32(header, points))
+    node._on_synced_frame(rgb_msg, info, depth_msg)
+    spin_until(node, lambda: node._last_result is not None)
+    assert len(observations) == 1
+    np.testing.assert_array_equal(observations[0].rgb, rgb)
+    np.testing.assert_allclose(observations[0].depth, depth)
+    obj, = node._last_result.objects
+    expected = points + T[:3, 3]
+    ordered = lambda p: p[np.lexsort((p[:, 1], p[:, 0]))]
+    np.testing.assert_allclose(ordered(obj.points_world), ordered(expected), atol=1e-6)
+
+
+@pytest.mark.parametrize('invalid', ['roi', 'calibration', 'image_size'])
+def test_bad_camera_input_is_skipped_and_next_valid_frame_recovers(node_factory, dataset, invalid):
+    node = node_factory('-p', 'depth_source:=depth_image')
+    frame = next(iter(dataset))
+    set_camera_tf(node, frame)
+    header = Header(stamp=stamp_msg(frame.stamp), frame_id=node.camera_frame)
+    info = camera_info(dataset.intrinsics, header)
+    if invalid == 'roi':
+        info.roi.width = info.width + 1
+        info.roi.height = info.height
+    elif invalid == 'calibration':
+        info.k[0] = 0.
+    rgb = frame.rgb[:-1] if invalid == 'image_size' else frame.rgb
+    depth_msg = numpy_to_image(frame.depth.astype(np.float32), '32FC1', header)
+    node._on_synced_frame(numpy_to_image(rgb, 'rgb8', header), info, depth_msg)
+    assert node._last_result is None and not node._pending_frames and node._next_frame_id == 0
+    node._on_synced_frame(numpy_to_image(frame.rgb, 'rgb8', header), camera_info(dataset.intrinsics, header), depth_msg)
+    spin_until(node, lambda: node._last_result is not None)
+    assert node.pipeline._frame_index == 1

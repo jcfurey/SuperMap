@@ -103,6 +103,20 @@ Topic and detector settings are configured in `config/semantic_mapping.yaml`, an
 
 Sensor inputs subscribe best-effort by default (`sensor_qos`), which matches both best-effort and reliable drivers; RGB can arrive as `CompressedImage` (`rgb_compressed: true`), and RGB-D cameras can feed their color-aligned depth stream directly (`depth_source: depth_image`, `depth_topic`, `depth_scale`) instead of a point cloud. Images are decoded with plain numpy, so the node does not depend on cv_bridge.
 
+CameraInfo calibration is adjusted for `roi` and `binning_x/y`: crop offsets
+are subtracted from the principal point before scaling by binning. An all-zero
+ROI means the full image and zero binning means one. Images must match the
+resulting crop dimensions; neither the live node nor the bag converter silently
+resizes a mismatched image. Invalid calibration or mismatched live inputs are
+skipped without stopping the node. The existing pinhole model uses `K`; inputs
+must already have matching pinhole calibration (this conversion does not apply
+distortion correction or stereo rectification).
+
+For Ouster pinhole panels, use each panel's matching `camera_info` and metric
+`depth_image` (`32FC1` metres), not its radial `range_image`. Full-panel `K`
+and dimensions plus a cropped `CameraInfo.roi` are supported directly. The
+panorama is not a pinhole camera and requires a separate projection model.
+
 For a pose source that publishes TF without an Odometry topic, set
 `sync_odometry: false`. This synchronizes only RGB, CameraInfo, and depth;
 the camera pose is still resolved from TF at the image timestamp. A camera
