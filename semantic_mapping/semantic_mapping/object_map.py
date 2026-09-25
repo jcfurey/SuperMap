@@ -14,7 +14,9 @@ from semantic_mapping import geometric_consistency as gc
 from semantic_mapping.association import DEFAULT_LABEL_MIN_MASS, beliefs_compatible
 from semantic_mapping import semantic_fusion as sf
 from semantic_mapping.appearance import cosine_similarity, update_running_embedding
-from semantic_mapping.geometry_utils import bbox3d_from_points, invert_se3, iou_3d, project_points
+from semantic_mapping.geometry_utils import (
+    bbox3d_from_points, exceeds_size_limit, invert_se3, iou_3d, project_points,
+)
 from semantic_mapping.tracking import TrackKalmanState, init_track
 from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus
 
@@ -53,6 +55,10 @@ def voxel_downsample_indices(points: np.ndarray, voxel_size: float) -> np.ndarra
     else:
         _unique_keys, first_indices = np.unique(keys, axis=0, return_index=True)
     return np.sort(first_indices)
+
+
+_MIN_SUPPORTED_POINTS = 3
+"""Fewest supported points a support-based box is computed from; fewer fall back to all points."""
 
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -101,6 +107,16 @@ class ObjectMap:
         contradiction_window_px: int = 1,
         reconcile_max_distance_m: float = 10.0,
         reconcile_max_gap_sec: float = 120.0,
+        bbox_min_support: int = 1,
+        bbox_support_radius_m: float = 0.0,
+        size_limits: dict[str, tuple[float, ...]] | None = None,
+        bbox_support_miss: float = 0.0,
+        bbox_support_cull_at: float = 0.0,
+        bbox_support_max: float = 0.0,
+        existence_hit_gain: float = 0.0,
+        existence_miss_penalty: float = 1.0,
+        existence_cull_log_odds: float = -3.0,
+        existence_max_log_odds: float = 6.0,
     ) -> None:
         self.voxel_size = voxel_size
         self.tau_eps = tau_eps
@@ -125,6 +141,27 @@ class ObjectMap:
         self.reconcile_max_distance_m = reconcile_max_distance_m
         self.reconcile_max_gap_sec = reconcile_max_gap_sec
         """Plausibility gate for reconcile_retired (0 disables either bound)."""
+        self.bbox_min_support = bbox_min_support
+        """Frames a point must be re-observed in to bound a static instance's box; 1 = off."""
+        self.bbox_support_radius_m = bbox_support_radius_m or voxel_size * np.sqrt(3.0)
+        self.size_limits = dict(size_limits or {})
+        """label -> geometry_utils.parse_size_limits limit."""
+        self.bbox_support_miss = bbox_support_miss
+        """Support a mapped point loses when a matched frame looked at it (in the
+        image, not occluded) and its lifted points did not re-hit it; 0 = support only grows."""
+        self.bbox_support_cull_at = bbox_support_cull_at
+        """With bbox_support_miss, points whose support falls to this value are removed."""
+        self.bbox_support_max = bbox_support_max
+        """Cap on per-point support so long-supported regions can still decay; 0 = uncapped."""
+        self.existence_hit_gain = existence_hit_gain
+        """Existence log-odds gained per matched detection, times its score; 0 = off."""
+        self.existence_miss_penalty = existence_miss_penalty
+        self.existence_cull_log_odds = existence_cull_log_odds
+        self.existence_max_log_odds = existence_max_log_odds
+        self.stats = {"size_rejected_observations": 0, "size_refused_associations": 0, "size_refused_merges": 0,
+                      "mask_completions": 0, "ground_contact_completions": 0,
+                      "support_culled_points": 0, "existence_culled": 0}
+        """Cumulative counts of size-limit and mask-completion decisions (the pipeline counts all but merges)."""
 
         self.objects: dict[int, ObjectInstance] = {}
         self._next_id = 1
@@ -143,12 +180,102 @@ class ObjectMap:
         pad = self.voxel_size / 2.0
         return bbox3d_from_points(points, self.bbox_trim_percentile) + np.array([-pad, -pad, -pad, pad, pad, pad])
 
+    @property
+    def tracks_support(self) -> bool:
+        return self.bbox_min_support > 1
+
+    @staticmethod
+    def _support(instance: ObjectInstance) -> np.ndarray:
+        """Per-point support aligned with the points; points without a record count once."""
+        if instance.point_support.shape[0] != instance.points_world.shape[0]:
+            instance.point_support = np.ones(instance.points_world.shape[0])
+        return instance.point_support
+
+    def _instance_bbox(self, instance: ObjectInstance) -> np.ndarray:
+        """Reported box: with support tracking, a static instance that has been
+        detected ``bbox_min_support`` times is bounded by the points re-observed
+        in at least that many frames, so unconfirmed outliers (ground, background
+        caught in one mask) stop inflating it and the box shrinks once they are
+        not re-supported. Young instances, moving classes, and instances with
+        too few supported points use all points."""
+        if (self.tracks_support and instance.hits >= self.bbox_min_support
+                and instance.label not in self.dynamic_geometry_labels):
+            supported = self._support(instance) >= self.bbox_min_support
+            if np.count_nonzero(supported) >= _MIN_SUPPORTED_POINTS:
+                return self._bbox(instance.points_world[supported])
+        return self._bbox(instance.points_world)
+
+    def _reinforce_support(
+        self,
+        instance: ObjectInstance,
+        new_points_world: np.ndarray,
+        K: np.ndarray | None = None,
+        T_world_from_cam: np.ndarray | None = None,
+        depth_image: np.ndarray | None = None,
+    ) -> None:
+        """Count this frame for every mapped point that one of its lifted points lies near.
+
+        With ``bbox_support_miss``, a point this frame looked at but did not
+        re-hit loses support, so the box trims regions later observations no
+        longer confirm; support stays two-sided evidence, not a hit counter.
+        "Looked at" means it projects inside the image in front of the camera
+        and the depth does not show a nearer surface on its pixel (occluded
+        points and points outside a truncated view keep their support).
+        """
+        if not self.tracks_support or not len(new_points_world) or not len(instance.points_world):
+            return
+        distances, _ = cKDTree(new_points_world).query(
+            instance.points_world, distance_upper_bound=self.bbox_support_radius_m)
+        hit = distances <= self.bbox_support_radius_m
+        support = self._support(instance) + hit
+        if self.bbox_support_miss > 0 and K is not None and T_world_from_cam is not None and depth_image is not None:
+            pixels, depths = project_points(K, invert_se3(T_world_from_cam), instance.points_world)
+            h, w = depth_image.shape[:2]
+            seen = (depths > 0) & (pixels[:, 0] >= 0) & (pixels[:, 1] >= 0) & (pixels[:, 0] < w) & (pixels[:, 1] < h)
+            states, _, _ = gc.project_and_classify(K, T_world_from_cam, depth_image, instance.points_world,
+                                                   self.tau_eps, self.contradiction_window_px)
+            seen &= states != gc.GeometricState.UNOBSERVABLE
+            support = support - self.bbox_support_miss * (seen & ~hit)
+        if self.bbox_support_max > 0:
+            support = np.minimum(support, self.bbox_support_max)
+        instance.point_support = support
+        if self.bbox_support_miss > 0:
+            keep = support > self.bbox_support_cull_at
+            if not keep.all():
+                self.stats["support_culled_points"] += int(np.count_nonzero(~keep))
+                self._subset_points(instance, keep)
+
+    def growth_exceeds_limit(self, instance: ObjectInstance, bbox3d: np.ndarray, labels=()) -> bool:
+        """Whether adding ``bbox3d`` (unpadded) would grow ``instance`` past a size
+        limit of its label or of ``labels``. An instance with no geometry, or one
+        the addition does not grow, is never refused."""
+        limits = [self.size_limits[label] for label in {instance.label, *labels} if label in self.size_limits]
+        if not limits or not len(instance.points_world):
+            return False
+        pad = self.voxel_size / 2.0
+        box = np.asarray(bbox3d, dtype=np.float64) + np.array([-pad, -pad, -pad, pad, pad, pad])
+        union = np.concatenate([np.minimum(instance.bbox3d[:3], box[:3]), np.maximum(instance.bbox3d[3:], box[3:])])
+        if np.all(union == instance.bbox3d):
+            return False
+        return any(exceeds_size_limit(union, limit) for limit in limits)
+
+    @property
+    def tracks_existence(self) -> bool:
+        return self.existence_hit_gain > 0
+
+    def _raise_existence(self, instance: ObjectInstance, score: float) -> None:
+        if self.tracks_existence:
+            instance.existence_log_odds = min(
+                instance.existence_log_odds + self.existence_hit_gain * float(score), self.existence_max_log_odds)
+
     def _subset_points(self, instance: ObjectInstance, keep: np.ndarray) -> None:
+        if self.tracks_support:
+            instance.point_support = self._support(instance)[keep]
         instance.points_world = instance.points_world[keep]
         instance.point_log_odds = instance.point_log_odds[keep]
         instance.point_membership = instance.point_membership[keep]
         if instance.points_world.shape[0] > 0:
-            instance.bbox3d = self._bbox(instance.points_world)
+            instance.bbox3d = self._instance_bbox(instance)
 
     def _fuse_points(self, instance: ObjectInstance, new_points_world: np.ndarray) -> None:
         """Union new points into the instance, keeping per-point arrays aligned.
@@ -162,6 +289,8 @@ class ObjectMap:
         if new_points_world.shape[0] == 0:
             return
         n_new = new_points_world.shape[0]
+        if self.tracks_support:
+            instance.point_support = np.concatenate([self._support(instance), np.ones(n_new)])
         instance.points_world = np.concatenate([instance.points_world, new_points_world], axis=0)
         instance.point_log_odds = np.concatenate([instance.point_log_odds, np.zeros(n_new)])
         instance.point_membership = np.concatenate([instance.point_membership, np.zeros(n_new)])
@@ -186,6 +315,8 @@ class ObjectMap:
             return keep
         n_existing = instance.points_world.shape[0] if n_existing is None else n_existing
         evidence = (instance.point_log_odds[keep] != 0) | (instance.point_membership[keep] != 0)
+        if self.tracks_support:
+            evidence |= self._support(instance)[keep] > 1
         existing = keep < n_existing
         rng = np.random.default_rng(instance.instance_id)
         chosen: list[np.ndarray] = []
@@ -324,6 +455,7 @@ class ObjectMap:
             points_world=fused_points,
             point_log_odds=np.zeros(n, dtype=np.float64),
             point_membership=np.zeros(n, dtype=np.float64),
+            point_support=np.ones(n) if self.tracks_support else np.zeros(0),
             bbox3d=self._bbox(fused_points) if n else np.zeros(6),
             status=ObjectStatus.TENTATIVE,
             track=init_track(bbox_2d),
@@ -335,6 +467,7 @@ class ObjectMap:
         )
         if embedding is not None:
             instance.embedding, instance.embedding_count = update_running_embedding(None, 0, embedding)
+        self._raise_existence(instance, score)
         self.objects[instance_id] = instance
         return instance
 
@@ -367,6 +500,7 @@ class ObjectMap:
         instance.frames_since_seen = 0
         instance.missed_detection_frames = 0
         instance.hits += 1
+        self._raise_existence(instance, detection.score)
         # Newly matched tentative tracks still need the configured hit check.
         # Retired tracks also pass through it: a retired identity may have
         # expired before it was ever confirmed. Confirmed ones already have
@@ -390,6 +524,9 @@ class ObjectMap:
             instance.points_world = np.zeros((0, 3), dtype=np.float64)
             instance.point_log_odds = np.zeros(0)
             instance.point_membership = np.zeros(0)
+            instance.point_support = np.zeros(0)
+        else:
+            self._reinforce_support(instance, new_points_world, K, T_world_from_cam, depth_image)
         self._fuse_points(instance, new_points_world)
         if has_geometry:
             instance.geometry_stamp = stamp
@@ -427,6 +564,7 @@ class ObjectMap:
             instance.points_world = np.zeros((0, 3), dtype=np.float64)
             instance.point_log_odds = np.zeros(0, dtype=np.float64)
             instance.point_membership = np.zeros(0, dtype=np.float64)
+            instance.point_support = np.zeros(0)
         self.update_matched(
             instance, init_track(detection.bbox), new_points_world, detection, stamp, K, T_world_from_cam, depth_image,
         )
@@ -485,6 +623,14 @@ class ObjectMap:
             visible = observed
         if detections_evaluated and visible:
             instance.missed_detection_frames += 1
+            if self.tracks_existence:
+                instance.existence_log_odds -= self.existence_miss_penalty
+                if instance.existence_log_odds < self.existence_cull_log_odds:
+                    # Repeatedly visible to the detector and not re-detected:
+                    # culled even when confirmed, whatever its geometry says.
+                    self.stats["existence_culled"] += 1
+                    instance.status = ObjectStatus.DISAPPEARED
+                    return
 
         if instance.status == ObjectStatus.TENTATIVE and instance.missed_detection_frames > self.tentative_max_age:
             # Never corroborated: a one-off false detection, not an object.
@@ -534,17 +680,30 @@ class ObjectMap:
             # Preserve the oldest ID without reviving an older body position.
             newest = max((keep, drop), key=lambda o: (o.geometry_stamp if o.geometry_stamp is not None else -np.inf,
                                                      len(o.points_world)))
-            for name in ('points_world', 'point_log_odds', 'point_membership', 'bbox3d'):
+            for name in ('points_world', 'point_log_odds', 'point_membership', 'point_support', 'bbox3d'):
                 setattr(keep, name, getattr(newest, name).copy())
             keep.geometry_stamp = newest.geometry_stamp
         else:
             # Keep both instances' per-point evidence, then dedupe; `keep`
             # comes first so its points win shared voxels.
+            support = None
+            if self.tracks_support:
+                support = np.concatenate([self._support(keep), self._support(drop)])
             keep.points_world = np.concatenate([keep.points_world, drop.points_world], axis=0)
             keep.point_log_odds = np.concatenate([keep.point_log_odds, drop.point_log_odds])
             keep.point_membership = np.concatenate([keep.point_membership, drop.point_membership])
+            if support is not None and len(support):
+                # A shared voxel keeps the better-supported record of the two.
+                _, cells = np.unique(np.floor(keep.points_world / self.voxel_size).astype(np.int64), axis=0,
+                                     return_inverse=True)
+                cells = cells.ravel()
+                best = np.zeros(cells.max() + 1)
+                np.maximum.at(best, cells, support)
+                keep.point_support = best[cells]
             idx = self._cap_indices(keep, voxel_downsample_indices(keep.points_world, self.voxel_size))
+            keep.hits += drop.hits  # the merged box is judged by the merged hit count
             self._subset_points(keep, idx)
+            keep.hits -= drop.hits
             stamps = [o.geometry_stamp for o in (keep, drop) if o.geometry_stamp is not None]
             keep.geometry_stamp = max(stamps, default=None)
 
@@ -566,6 +725,7 @@ class ObjectMap:
                 keep.embedding_count = total
 
         keep.hits = total_hits
+        keep.existence_log_odds = max(keep.existence_log_odds, drop.existence_log_odds)
         keep.missed_detection_frames = min(keep.missed_detection_frames, drop.missed_detection_frames)
         keep.frames_since_seen = min(keep.frames_since_seen, drop.frames_since_seen)
         keep.first_seen_stamp = min(keep.first_seen_stamp, drop.first_seen_stamp)
@@ -624,6 +784,12 @@ class ObjectMap:
                     continue
                 overlapping = iou_3d(keep.bbox3d, drop.bbox3d) > iou_threshold
                 close = float(np.linalg.norm(keep.center - drop.center)) < distance_threshold
+                if (overlapping or close) and self.size_limits:
+                    pad = self.voxel_size / 2.0
+                    unpadded = drop.bbox3d + np.array([pad, pad, pad, -pad, -pad, -pad])
+                    if self.growth_exceeds_limit(keep, unpadded, (drop.label,)):
+                        self.stats["size_refused_merges"] += 1
+                        continue
                 if overlapping or close:
                     self._merge_into(keep, drop)
                     merged.append((keep.instance_id, drop.instance_id))
@@ -681,6 +847,7 @@ class ObjectMap:
         keep.points_world = moved.points_world
         keep.point_log_odds = moved.point_log_odds
         keep.point_membership = moved.point_membership
+        keep.point_support = moved.point_support
         keep.bbox3d = moved.bbox3d
         keep.track = moved.track
         keep.status = moved.status  # the pipeline confirms tentative reconciliations using the combined hits
@@ -728,6 +895,7 @@ class ObjectMap:
                 instance.points_world = np.zeros((0, 3), dtype=np.float64)
                 instance.point_log_odds = np.zeros(0, dtype=np.float64)
                 instance.point_membership = np.zeros(0, dtype=np.float64)
+                instance.point_support = np.zeros(0)
         evicted: list[int] = []
         if len(retired) > max_retired:
             for instance in sorted(retired, key=lambda o: o.latest_stamp)[: len(retired) - max_retired]:

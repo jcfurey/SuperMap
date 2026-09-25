@@ -109,6 +109,32 @@
     foreground_depth_min_image_span: 0.0 # 0 disables; require this fraction of mask width AND height in real returns
     foreground_depth_max_extent_m: 0.0   # 0 disables; reject compact foreground geometry exceeding this extent on any camera axis
     foreground_depth_labels: [person]    # apply only to compact foreground classes; preserve deep structures
+    # Outdoor sparse-LiDAR options (README "Outdoor objects on sparse LiDAR"). All off by default.
+    # foreground_depth_largest_labels: []  # of foreground_depth_labels: keep the supported layer with the most
+    #                                      # real returns, not the nearest (often the ground strip in front)
+    # ground_removal_labels: []            # drop masked returns on the local ground (plane fitted in world
+    #                                      # frame, z up, to returns in/around the mask) before layer selection
+    ground_clearance_m: 0.15             # returns lower than this above the fitted ground are dropped
+    ground_context_px: 20                # margin around the mask box whose returns inform the ground fit
+    ground_max_slope: 0.25               # steeper fitted ground (rise/run) falls back to a level ground
+    # mask_completion_labels: []           # complete the mask silhouette at the median range of its kept returns
+    #                                      # (geometry only; never used as depth evidence or for layer selection)
+    mask_completion_min_returns: 3       # kept real returns needed for completion (fewer: ground contact, if enabled)
+    mask_completion_stride_px: 4         # completed pixels on this grid (+ silhouette extremes), within max_points_per_detection
+    # ground_contact_depth_labels: []      # masks with too few returns: range where the bottom-centre ray meets the
+    #                                      # fitted ground (no fit, off-image bottom, or beyond max_depth_m: no geometry)
+    bbox_min_support: 1                  # >1: static boxes use only points re-hit in >= N frames (young: all); 1 = off
+    bbox_support_radius_m: 0.0           # a frame re-hits a point within this distance; 0 = voxel diagonal (LiDAR: ~0.3)
+    bbox_support_miss: 0.0               # >0: points a matched frame looked at (in image, not occluded) but did not re-hit lose this support
+    bbox_support_cull_at: 0.0            # with bbox_support_miss: points whose support falls to this are removed
+    bbox_support_max: 0.0                # cap per-point support so old regions can still decay; 0 = uncapped
+    existence_hit_gain: 0.0              # >0: instance existence log-odds += gain * score per matched detection
+    existence_miss_penalty: 1.0          # ... -= this per frame the detector could have seen it and did not
+    existence_cull_log_odds: -3.0        # ... below this the instance is culled (disappeared), even when confirmed
+    existence_max_log_odds: 6.0          # ... capped here so long-lived instances can still be culled
+    # class_size_limits: []                # 'label:D' (max 3D diagonal) or 'label:H,V' (max footprint diagonal,
+    #                                      # max height), metres: oversized observations lose geometry, and
+    #                                      # associations/merges growing an instance past its limit are refused
     dynamic_geometry_enabled: false      # latest supported geometry instead of unioning past positions
     dynamic_geometry_labels: [person]    # identity and trajectory survive each geometry replacement
     dynamic_geometry_min_extent_fraction: 0.0 # 0 disables; retire a contradicted body instead of retaining small fragments

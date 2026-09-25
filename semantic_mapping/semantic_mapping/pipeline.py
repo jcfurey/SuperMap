@@ -23,8 +23,11 @@ from semantic_mapping.geometry_utils import (
     back_project_depth,
     bbox3d_from_points,
     clip_bbox_to_image,
+    exceeds_size_limit,
     fill_sparse_depth,
+    fit_ground_plane,
     foreground_depth_mask,
+    parse_size_limits,
     transform_points,
 )
 from semantic_mapping.object_map import ObjectMap
@@ -56,6 +59,68 @@ class PipelineConfig:
     foreground_depth_max_extent_m: float = 0.0
     """Optional compact-object bound per camera axis; reject implausible layers, never clip them."""
     foreground_depth_labels: list[str] = field(default_factory=lambda: ["person"])
+    foreground_depth_largest_labels: list[str] = field(default_factory=list)
+    """Of foreground_depth_labels, those that keep the supported layer with the
+    most real returns instead of the nearest (which is often the ground strip
+    in front of the object). Empty = nearest for all."""
+    ground_removal_labels: list[str] = field(default_factory=list)
+    """Drop masked depth samples on the local ground surface before layer
+    selection and back-projection (world z up; geometry_utils.fit_ground_plane
+    over the real returns in and around the mask). Empty disables it."""
+    ground_clearance_m: float = 0.15
+    """Samples less than this above the fitted ground are dropped; the rest of an object on the ground is kept."""
+    ground_context_px: int = 20
+    """Margin around the mask's box whose returns also inform the ground fit (the ground in front of and beside it)."""
+    ground_max_slope: float = 0.25
+    """Steepest local ground accepted (rise over run); steeper fits fall back to a level ground."""
+    mask_completion_labels: list[str] = field(default_factory=list)
+    """Complete these classes' instance masks: when the kept layer (after
+    ground removal and layer selection) has at least
+    ``mask_completion_min_returns`` real returns, every mask pixel without a
+    reading (on a ``mask_completion_stride_px`` grid, plus the silhouette's
+    extreme pixels) is back-projected at their median range, so the box's
+    width/height follow the mask and its depth extent the real returns.
+    Completed points are geometry only: they never enter layer selection or
+    the evidence depth. Empty disables it."""
+    mask_completion_min_returns: int = 3
+    mask_completion_stride_px: int = 4
+    ground_contact_depth_labels: list[str] = field(default_factory=list)
+    """Masks of these classes with fewer than ``mask_completion_min_returns``
+    kept returns are completed at the range where the ray through the mask's
+    bottom-centre pixel meets the local ground (fitted as for ground removal;
+    a level fallback or a hit behind the camera or beyond max_depth_m gives
+    no geometry). Empty disables it."""
+    bbox_min_support: int = 1
+    """Report a static instance's box from points re-observed in at least this
+    many frames (ObjectMap.point_support); young instances use all points. 1
+    disables support tracking."""
+    bbox_support_radius_m: float = 0.0
+    """A frame supports a mapped point when one of its lifted points lies this
+    close; 0 = one voxel diagonal. Sparse LiDAR rings move between frames, so
+    outdoors use a few ring spacings (e.g. 0.3)."""
+    bbox_support_miss: float = 0.0
+    """With support tracking, a mapped point that a matched frame looked at (in
+    the image, in front, not occluded by nearer depth) but did not re-hit loses
+    this much support, so boxes trim regions later views no longer confirm and
+    expand once new regions reach bbox_min_support. 0 = support only grows."""
+    bbox_support_cull_at: float = 0.0
+    """With bbox_support_miss, points whose support falls to this value are removed."""
+    bbox_support_max: float = 0.0
+    """Cap on per-point support so a long-supported wrong region can still decay; 0 = uncapped."""
+    existence_hit_gain: float = 0.0
+    """Per-instance existence log-odds gained per matched detection, times its
+    score. Frames in which the detector could have seen the instance and did
+    not subtract existence_miss_penalty; below existence_cull_log_odds the
+    instance is culled (disappeared), confirmed or not. 0 disables."""
+    existence_miss_penalty: float = 1.0
+    existence_cull_log_odds: float = -3.0
+    existence_max_log_odds: float = 6.0
+    """Cap so a long-lived instance can still be culled after sustained misses."""
+    class_size_limits: list[str] = field(default_factory=list)
+    """Per-class size priors as 'label:D' (max 3D box diagonal) or 'label:H,V'
+    (max footprint diagonal, max height), metres. Oversized observations lose
+    their geometry (the 2D detection is kept), and associations or merges that
+    would grow an instance past its limit are refused. Empty disables it."""
     dynamic_geometry_enabled: bool = False
     dynamic_geometry_labels: list[str] = field(default_factory=lambda: ["person"])
     """Use the latest supported geometry for these moving classes; keep identity/history."""
@@ -161,16 +226,37 @@ class PipelineConfig:
                 raise ValueError(f"{name} must be in [0, 1]")
         if not np.isfinite(self.foreground_depth_max_extent_m) or self.foreground_depth_max_extent_m < 0:
             raise ValueError("foreground_depth_max_extent_m must be finite and nonnegative")
+        for name in ('foreground_depth_largest_labels', 'ground_removal_labels', 'class_size_limits',
+                     'mask_completion_labels', 'ground_contact_depth_labels'):
+            if isinstance(getattr(self, name), str) or not all(isinstance(v, str) for v in getattr(self, name)):
+                raise ValueError(f"{name} must be a list of strings")
+        for name in ('ground_clearance_m', 'ground_max_slope'):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not np.isfinite(self.bbox_support_radius_m) or self.bbox_support_radius_m < 0:
+            raise ValueError("bbox_support_radius_m must be finite and nonnegative")
+        parse_size_limits(self.class_size_limits)
+        for name in ('bbox_support_miss', 'bbox_support_max', 'existence_hit_gain', 'existence_miss_penalty'):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        for name in ('bbox_support_cull_at', 'existence_cull_log_odds', 'existence_max_log_odds'):
+            if not np.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if self.existence_cull_log_odds >= self.existence_max_log_odds:
+            raise ValueError("existence_cull_log_odds must be below existence_max_log_odds")
+        if self.bbox_support_max and self.bbox_support_max < self.bbox_min_support:
+            raise ValueError("bbox_support_max must be 0 or at least bbox_min_support")
         # Counts and budgets that the per-frame update divides by, indexes
         # with, or feeds to bbox3d_from_points: a zero here used to be
         # accepted and crash mid-frame after the map had already changed.
         for name in ('min_points_for_3d_association', 'max_points_per_object', 'max_points_per_detection',
-                     'min_hits_to_confirm', 'prune_min_contradictions', 'max_retired_instances'):
+                     'min_hits_to_confirm', 'prune_min_contradictions', 'max_retired_instances', 'bbox_min_support',
+                     'mask_completion_min_returns', 'mask_completion_stride_px'):
             value = getattr(self, name)
             if int(value) != value or value < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
         for name in ('tentative_max_age', 'max_occlusion_frames', 'disappeared_prune_grace_frames',
-                     'contradiction_window_px', 'depth_fill_radius_px'):
+                     'contradiction_window_px', 'depth_fill_radius_px', 'ground_context_px'):
             value = getattr(self, name)
             if int(value) != value or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
@@ -238,6 +324,16 @@ class SemanticMappingPipeline:
             contradiction_window_px=self.config.contradiction_window_px,
             reconcile_max_distance_m=self.config.reconcile_max_distance_m,
             reconcile_max_gap_sec=self.config.reconcile_max_gap_sec,
+            bbox_min_support=self.config.bbox_min_support,
+            bbox_support_radius_m=self.config.bbox_support_radius_m,
+            size_limits=parse_size_limits(self.config.class_size_limits),
+            bbox_support_miss=self.config.bbox_support_miss,
+            bbox_support_cull_at=self.config.bbox_support_cull_at,
+            bbox_support_max=self.config.bbox_support_max,
+            existence_hit_gain=self.config.existence_hit_gain,
+            existence_miss_penalty=self.config.existence_miss_penalty,
+            existence_cull_log_odds=self.config.existence_cull_log_odds,
+            existence_max_log_odds=self.config.existence_max_log_odds,
         )
         self._frame_index = 0
         self._last_stamp: float | None = None
@@ -310,6 +406,92 @@ class SemanticMappingPipeline:
         filled[y1:y2, x1:x2] = fill_sparse_depth(crop, radius_px)
         return filled
 
+    def _remove_ground(
+        self, depth: np.ndarray, mask: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
+        remove: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """``depth`` without the masked readings that lie on the local ground,
+        and the ground plane if it was fitted (None for the level fallback).
+
+        The ground is fitted (fit_ground_plane) to the real returns in the
+        mask's box grown by ``ground_context_px``, i.e. including the ground
+        in front of and beside the object; readings inside the mask less than
+        ``ground_clearance_m`` above it (or below it) become invalid, unless
+        ``remove`` is False (plane only).
+        """
+        cfg = self.config
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return depth, None
+        h, w = depth.shape
+        m = cfg.ground_context_px
+        y1, y2 = max(int(ys.min()) - m, 0), min(int(ys.max()) + m + 1, h)
+        x1, x2 = max(int(xs.min()) - m, 0), min(int(xs.max()) + m + 1, w)
+        crop = depth[y1:y2, x1:x2]
+        valid = np.isfinite(crop) & (crop > 0)
+        vs, us = np.nonzero(valid)
+        if vs.size == 0:
+            return depth, None
+        z = crop[vs, us].astype(np.float64)
+        cam = np.stack(((us + x1 - K[0, 2]) * z / K[0, 0], (vs + y1 - K[1, 2]) * z / K[1, 1], z), axis=1)
+        world = transform_points(T_world_from_cam, cam)
+        plane, fitted = fit_ground_plane(world, cfg.ground_clearance_m, cfg.ground_max_slope, return_fitted=True)
+        ground = world[:, 2] - world[:, :2] @ plane[:2] - plane[2] < cfg.ground_clearance_m
+        ground &= mask[vs + y1, us + x1]
+        if not remove or not ground.any():
+            return depth, plane if fitted else None
+        filtered = np.array(depth, dtype=np.float64, copy=True)
+        filtered[vs[ground] + y1, us[ground] + x1] = 0.0
+        return filtered, plane if fitted else None
+
+    def _ground_contact_range(self, mask: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
+                              plane: np.ndarray) -> float | None:
+        """Camera depth at which the ray through the mask's bottom-centre pixel meets the ground plane."""
+        ys, xs = np.nonzero(mask)
+        v = int(ys.max())
+        if v >= mask.shape[0] - 1:
+            return None  # cut off by the image: the bottom is not the ground contact
+        u = float(np.mean(xs[ys == v]))
+        direction = T_world_from_cam[:3, :3] @ np.array([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], 1.0])
+        origin = T_world_from_cam[:3, 3]
+        denominator = direction[2] - plane[0] * direction[0] - plane[1] * direction[1]
+        if abs(denominator) < 1e-9:
+            return None
+        t = (plane[0] * origin[0] + plane[1] * origin[1] + plane[2] - origin[2]) / denominator
+        cfg = self.config
+        if not np.isfinite(t) or t <= max(cfg.min_depth_m, 0.0) or (cfg.max_depth_m > 0 and t > cfg.max_depth_m):
+            return None
+        return float(t)
+
+    def _complete_mask(self, mask: np.ndarray, depth: np.ndarray, K: np.ndarray, z: float, budget: int,
+                       T_world_from_cam: np.ndarray, plane: np.ndarray | None) -> np.ndarray:
+        """Camera-frame points at depth ``z`` for mask pixels without a reading in
+        ``depth``: a ``mask_completion_stride_px`` grid plus the silhouette's
+        extreme pixels, at most ``budget`` (extremes first). With a ground
+        ``plane``, pixels that would complete below the ground (a mask bled
+        onto the ground in front) are left out first."""
+        if budget <= 0:
+            return np.zeros((0, 3))
+        empty = mask & ~(np.isfinite(depth) & (depth > 0))
+        vs, us = np.nonzero(empty)
+        if plane is not None and vs.size:
+            cam = np.stack(((us - K[0, 2]) * z / K[0, 0], (vs - K[1, 2]) * z / K[1, 1], np.full(us.size, z)), axis=1)
+            world = transform_points(T_world_from_cam, cam)
+            above = world[:, 2] >= world[:, :2] @ plane[:2] + plane[2]
+            vs, us = vs[above], us[above]
+        if vs.size == 0:
+            return np.zeros((0, 3))
+        s = self.config.mask_completion_stride_px
+        extremes = np.unique([np.argmin(us), np.argmax(us), np.argmin(vs), np.argmax(vs)])
+        grid = np.flatnonzero((vs % s == 0) & (us % s == 0))
+        grid = np.setdiff1d(grid, extremes)
+        room = budget - extremes.size
+        if room < grid.size:
+            grid = np.random.default_rng(0).choice(grid, size=max(room, 0), replace=False)
+        chosen = np.concatenate((extremes, grid))[:budget]
+        us, vs = us[chosen].astype(np.float64), vs[chosen].astype(np.float64)
+        return np.stack(((us - K[0, 2]) * z / K[0, 0], (vs - K[1, 2]) * z / K[1, 1], np.full(us.size, z)), axis=1)
+
     def _detection_points_world(
         self, detection: Detection2D, depth: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
     ) -> np.ndarray:
@@ -324,6 +506,11 @@ class SemanticMappingPipeline:
             mask[y1:y2, x1:x2] = True
 
         cfg = self.config
+        plane = None
+        remove = detection.label in cfg.ground_removal_labels
+        contact = has_instance_mask and detection.label in cfg.ground_contact_depth_labels
+        if remove or contact:
+            depth, plane = self._remove_ground(depth, mask, K, T_world_from_cam, remove=remove)
         if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
             # Count real returns, not pixels synthesized by sparse filling.
             pixels = min_span = None
@@ -336,10 +523,24 @@ class SemanticMappingPipeline:
                 depth[mask], cfg.foreground_depth_gap_m,
                 cfg.foreground_depth_min_points, cfg.foreground_depth_min_fraction,
                 pixels=pixels, min_span=min_span,
+                select="largest" if detection.label in cfg.foreground_depth_largest_labels else "nearest",
             )
             filtered = np.zeros_like(depth)
             filtered[mask] = np.where(selected, depth[mask], 0.0)
             depth = filtered
+        completion_range = None
+        if has_instance_mask and (contact or detection.label in cfg.mask_completion_labels):
+            # Range for the silhouette from kept real returns only (before filling).
+            kept = depth[mask]
+            kept = kept[np.isfinite(kept) & (kept > 0)]
+            if kept.size >= cfg.mask_completion_min_returns:
+                if detection.label in cfg.mask_completion_labels:
+                    completion_range = float(np.median(kept))
+                    self.object_map.stats["mask_completions"] += 1
+            elif contact and plane is not None:
+                completion_range = self._ground_contact_range(mask, K, T_world_from_cam, plane)
+                if completion_range is not None:
+                    self.object_map.stats["ground_contact_completions"] += 1
         if self.config.depth_fill_radius_px > 0:
             depth = self._fill_within(depth, mask, self.config.depth_fill_radius_px)
         points_cam = back_project_depth(
@@ -347,12 +548,42 @@ class SemanticMappingPipeline:
             depth_mad_factor=self.config.mask_depth_mad_factor if has_instance_mask else 3.0,
             depth_min_tolerance=self.config.mask_depth_min_tolerance_m if has_instance_mask else 0.05,
         )
+        if completion_range is not None:
+            points_cam = np.concatenate((points_cam, self._complete_mask(
+                mask, depth, K, completion_range, cfg.max_points_per_detection - len(points_cam),
+                T_world_from_cam, plane)))
         if (cfg.foreground_depth_max_extent_m > 0 and detection.label in cfg.foreground_depth_labels
                 and len(points_cam)):
             bounds = bbox3d_from_points(points_cam, cfg.bbox_trim_percentile)
             if np.any(bounds[3:] - bounds[:3] > cfg.foreground_depth_max_extent_m):
                 return np.zeros((0, 3))
-        return transform_points(T_world_from_cam, points_cam)
+        points_world = transform_points(T_world_from_cam, points_cam)
+        limit = self.object_map.size_limits.get(detection.label)
+        if limit is not None and len(points_world) \
+                and exceeds_size_limit(bbox3d_from_points(points_world, cfg.bbox_trim_percentile), limit):
+            # Too big for its class: background or ground, not the object. The
+            # 2D detection still associates; it just carries no geometry.
+            self.object_map.stats["size_rejected_observations"] += 1
+            return np.zeros((0, 3))
+        return points_world
+
+    def _refuse_oversized(self, result: association.AssociationResult, objects: list[ObjectInstance],
+                          detections: list[Detection2D], det_points: list[np.ndarray]) -> None:
+        """Unmatch pairs whose fusion would grow the instance past its class size limit."""
+        if not self.object_map.size_limits:
+            return
+        kept = []
+        for track_idx, det_idx in result.matches:
+            points = det_points[det_idx]
+            box = bbox3d_from_points(points, self.config.bbox_trim_percentile) if len(points) else None
+            if box is not None and self.object_map.growth_exceeds_limit(
+                    objects[track_idx], box, (detections[det_idx].label,)):
+                self.object_map.stats["size_refused_associations"] += 1
+                result.unmatched_tracks.append(track_idx)
+                result.unmatched_detections.append(det_idx)
+            else:
+                kept.append((track_idx, det_idx))
+        result.matches = kept
 
     def process_frame(self, observation: Observation) -> FrameResult:
         """Run one full P(I_t, M_t, P_t | M_t-1, Q_t) update step (Eq. 2), given
@@ -468,6 +699,7 @@ class SemanticMappingPipeline:
             candidate_detections=high, track_label_beliefs=track_beliefs, detection_labels=detection_labels,
             label_min_mass=cfg.label_compatibility_min_mass,
         )
+        self._refuse_oversized(stage1, live_objects, detections, det_points)
         # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no motion gate.
         stage2 = association.associate(
             predicted_tracks, predicted_bboxes, detection_bboxes,
@@ -476,6 +708,7 @@ class SemanticMappingPipeline:
             track_label_beliefs=track_beliefs, detection_labels=detection_labels,
             label_min_mass=cfg.label_compatibility_min_mass,
         )
+        self._refuse_oversized(stage2, live_objects, detections, det_points)
         # Stage 3: 3D-aware re-activation for high-confidence detections still unmatched.
         stage3 = association.associate_3d(
             det_boxes3d, detection_labels, live_objects,
@@ -483,6 +716,7 @@ class SemanticMappingPipeline:
             candidate_objects=stage2.unmatched_tracks, candidate_detections=stage1.unmatched_detections,
             label_min_mass=cfg.label_compatibility_min_mass,
         )
+        self._refuse_oversized(stage3, live_objects, detections, det_points)
 
         t_associate = time.perf_counter()
 

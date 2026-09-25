@@ -260,7 +260,7 @@ def depth_consistency_mask(depths: Array, mad_factor: float = 3.0, min_tolerance
 
 def foreground_depth_mask(
     depths: Array, gap_m: float, min_points: int = 5, min_fraction: float = 0.1,
-    *, pixels: Array | None = None, min_span: Array | None = None,
+    *, pixels: Array | None = None, min_span: Array | None = None, select: str = "nearest",
 ) -> Array:
     """Keep the nearest supported depth layer, even when background dominates.
 
@@ -272,7 +272,12 @@ def foreground_depth_mask(
     compact foreground objects, not structures extending through many depths.
     Optional image coordinates and minimum spans require each candidate to
     cover the silhouette in both image axes, rather than just its feet.
+    ``select="largest"`` keeps the supported layer with the most readings
+    instead (ties go to the nearer), for classes whose nearest layer is often
+    the ground strip in front of them rather than the object.
     """
+    if select not in ("nearest", "largest"):
+        raise ValueError(f"unknown layer selection {select!r}")
     keep = np.zeros(depths.shape, dtype=bool)
     valid_indices = np.flatnonzero(np.isfinite(depths) & (depths > 0))
     if valid_indices.size == 0:
@@ -282,6 +287,7 @@ def foreground_depth_mask(
     boundaries = np.concatenate(([0], splits, [order.size]))
     required = max(min_points, int(np.ceil(min_fraction * order.size)))
     supported = np.flatnonzero(np.diff(boundaries) >= required)
+    chosen = None
     for i in supported:
         indices = order[boundaries[i]:boundaries[i + 1]]
         if min_span is not None:
@@ -290,9 +296,92 @@ def foreground_depth_mask(
             span = np.diff(np.percentile(pixels[indices], [5, 95], axis=0), axis=0)[0] + 1
             if np.any(span < min_span):
                 continue
-        keep[indices] = True
-        break
+        if select == "nearest":
+            chosen = indices
+            break
+        if chosen is None or indices.size > chosen.size:
+            chosen = indices
+    if chosen is not None:
+        keep[chosen] = True
     return keep
+
+
+def fit_ground_plane(
+    points: Array, tolerance_m: float = 0.15, max_slope: float = 0.25, cell_m: float = 0.5,
+    iterations: int = 3, return_fitted: bool = False,
+):
+    """Local ground ``z = a x + b y + c`` under a set of world points (z up).
+
+    Built for sparse LiDAR: the points are gridded in XY into ``cell_m``
+    cells and only the lowest return of each cell is a ground candidate, so
+    objects standing in a cell never pull the fit up as long as some ground
+    return shares the cell. The fit is anchored at the 10th percentile of
+    those minima (robust to a few below-ground noise returns); candidates are
+    kept when a surface of at most ``max_slope`` through the anchor can reach
+    them, a least-squares plane is fitted to those, and the fit is refined on
+    candidates within ``tolerance_m`` of it. Too few or collinear candidates,
+    or a fit steeper than ``max_slope``, fall back to the level anchor
+    height. Returns ``[a, b, c]``, or None without points; with
+    ``return_fitted``, ``(plane, fitted)`` where ``fitted`` is False for the
+    level fallback (and None plane).
+    """
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if points.shape[0] == 0:
+        return (None, False) if return_fitted else None
+    _, cell = np.unique(np.floor(points[:, :2] / cell_m).astype(np.int64), axis=0, return_inverse=True)
+    cell = cell.ravel()
+    order = np.lexsort((points[:, 2], cell))
+    first = np.ones(order.size, dtype=bool)
+    first[1:] = cell[order][1:] != cell[order][:-1]
+    seeds = points[order[first]]
+    anchor = seeds[np.argsort(seeds[:, 2], kind="stable")[int(0.1 * (len(seeds) - 1))]]
+    level = np.array([0.0, 0.0, anchor[2]])
+    reach = tolerance_m + max_slope * np.linalg.norm(seeds[:, :2] - anchor[:2], axis=1)
+    inliers = np.abs(seeds[:, 2] - anchor[2]) <= reach
+    plane = level
+    for _ in range(iterations):
+        xy = seeds[inliers, :2]
+        if xy.shape[0] < 3 or np.linalg.eigvalsh(np.cov(xy.T)).min() < (cell_m / 2) ** 2:
+            return (level, False) if return_fitted else level
+        A = np.column_stack((xy, np.ones(xy.shape[0])))
+        plane = np.linalg.lstsq(A, seeds[inliers, 2], rcond=None)[0]
+        if np.hypot(plane[0], plane[1]) > max_slope:
+            return (level, False) if return_fitted else level
+        inliers = np.abs(seeds[:, 2] - seeds[:, :2] @ plane[:2] - plane[2]) <= tolerance_m
+    return (plane, True) if return_fitted else plane
+
+
+def parse_size_limits(entries) -> dict[str, tuple[float, ...]]:
+    """Parse ``"label:D"`` / ``"label:H,V"`` class size limits (metres).
+
+    ``D`` bounds the 3D diagonal of an axis-aligned box; ``H,V`` bound the
+    diagonal of its XY footprint (invariant to the object's heading) and its
+    Z extent. The label may contain spaces; the last colon separates it.
+    """
+    limits: dict[str, tuple[float, ...]] = {}
+    for entry in entries or ():
+        label, sep, values = str(entry).rpartition(":")
+        label = label.strip()
+        try:
+            numbers = tuple(float(v) for v in values.split(","))
+        except ValueError:
+            numbers = ()
+        if not sep or not label or len(numbers) not in (1, 2) \
+                or not all(np.isfinite(v) and v > 0 for v in numbers):
+            raise ValueError(f"size limit {entry!r} must be 'label:diagonal' or 'label:horizontal,vertical'")
+        if label in limits:
+            raise ValueError(f"duplicate size limit for {label!r}")
+        limits[label] = numbers
+    return limits
+
+
+def exceeds_size_limit(bbox3d: Array, limit: tuple[float, ...]) -> bool:
+    """Whether an axis-aligned box violates a :func:`parse_size_limits` limit."""
+    extent = np.clip(np.asarray(bbox3d[3:], dtype=np.float64) - bbox3d[:3], 0.0, None)
+    if len(limit) == 1:
+        return bool(np.linalg.norm(extent) > limit[0])
+    return bool(np.hypot(extent[0], extent[1]) > limit[0] or extent[2] > limit[1])
 
 
 def iou_xyxy(box_a: Array, box_b: Array) -> float:

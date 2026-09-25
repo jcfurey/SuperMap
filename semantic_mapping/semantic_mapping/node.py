@@ -452,7 +452,9 @@ class SemanticMappingNode(AutostartLifecycleNode):
         d("map_autosave_sec", 0.0, "> 0: save to map_save_path every N seconds.")
 
         for name, value in PipelineConfig().__dict__.items():
-            d(name, value, f"PipelineConfig.{name}; see config/semantic_mapping.yaml.")
+            # An empty list default would be typed BYTE_ARRAY and reject a YAML string list.
+            declare(self, name, value, f"PipelineConfig.{name}; see config/semantic_mapping.yaml.",
+                    dynamic_typing=isinstance(value, list) and not value)
         d("yoloe.checkpoint", "yoloe-v8l-seg.pt", "YOLOE checkpoint.")
         d("yoloe.device", "cuda", "YOLOE device.")
         d("yoloe.confidence_threshold", 0.25, "YOLOE confidence threshold.")
@@ -764,7 +766,11 @@ class SemanticMappingNode(AutostartLifecycleNode):
         return prompts
 
     def _build_pipeline_config(self) -> PipelineConfig:
-        return PipelineConfig(**{name: self._param(name) for name in PipelineConfig().__dict__})
+        defaults = PipelineConfig().__dict__
+        values = {name: self._param(name) for name in defaults}
+        # A YAML `[]` arrives as an unset (None) parameter.
+        values.update({name: list(values[name] or []) for name, value in defaults.items() if isinstance(value, list)})
+        return PipelineConfig(**values)
 
     def _detector_kwargs(self) -> dict:
         backend = self._param_str("detector", "offline")
@@ -936,6 +942,9 @@ class SemanticMappingNode(AutostartLifecycleNode):
         stat.add("grounding_outstanding", str(self._grounding_outstanding))
         pipeline = getattr(self, "pipeline", None)
         stat.add("instances", str(len(pipeline.object_map.objects) if pipeline is not None else 0))
+        if pipeline is not None and (pipeline.object_map.size_limits or any(pipeline.object_map.stats.values())):
+            for key, value in pipeline.object_map.stats.items():
+                stat.add(key, str(value))
         return stat
 
     def _tick(self, name: str) -> None:
@@ -1747,7 +1756,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
             if obj.status == ObjectStatus.OCCLUDED:
                 measured = obj.geometry_stamp if obj.geometry_stamp is not None else obj.latest_stamp
                 status = f"occluded {max(now - measured, 0.0):.0f}s"
-            label_marker.text = f"{obj.instance_id}:{obj.label} ({status})"
+            confidence = ""
+            if obj.existence_log_odds:  # only maintained with existence_hit_gain > 0
+                confidence = f" {1.0 / (1.0 + np.exp(-obj.existence_log_odds)):.2f}"
+            label_marker.text = f"{obj.instance_id}:{obj.label}{confidence} ({status})"
             marker_array.markers.append(label_marker)
 
         self.obj_boxes_pub.publish(marker_array)
