@@ -47,8 +47,10 @@ from semantic_mapping.dense_cloud_io import (
     camera_labels_from_msg, check_rectified_camera_info, dumps_json, full_pointcloud_xyz,
     region_array_msg, result_metadata, voxel_map_message, _transform_msg_to_se3,
 )
+from semantic_mapping.platform_mask import exclude_platform
 from semantic_mapping.ros_msgs import camera_info_to_intrinsics, stamp_to_seconds, transform_to_se3
 from semantic_mapping.ros_node_utils import AutostartLifecycleNode, TransitionCallbackReturn, declare, run_node
+from semantic_mapping.ros_platform_mask import PlatformMaskSource, PlatformUnavailable, declare_platform_mask_parameters
 
 _THROTTLE = 5.0
 
@@ -156,6 +158,7 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         self._diag_previous = ({}, time.monotonic())
         self.tf_buffer = None
         self.tf_listener = None
+        self._platform = None
         self.cloud_pub = self.map_pub = self.regions_pub = self.regions_json_pub = None
         self.cloud_sub = self.annotation_sub = self.manual_annotation_sub = self.info_sub = None
         self._tf_timer = self._publish_timer = None
@@ -202,6 +205,7 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         declare(self, "max_detections", 64, "Reject annotations with more masks", range=(1, 10_000))
         declare(self, "max_image_pixels", 16_777_216, "Reject annotations for larger images", range=(1, 1 << 31))
         declare(self, "max_label_length", 128, "Reject longer class names", range=(1, 4096))
+        declare_platform_mask_parameters(self)
 
     def _param(self, name):
         return self.get_parameter(name).value
@@ -270,6 +274,8 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         # A dedicated listener thread keeps TF current while clouds are segmented.
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=float(self._param("tf_cache_s"))))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, None, spin_thread=True)
+        # Masks on the robot's own body (from any annotation source) never label the map.
+        self._platform = PlatformMaskSource(self)
         self._cloud_group = MutuallyExclusiveCallbackGroup()
         self._annotation_group = MutuallyExclusiveCallbackGroup()
         self._info_group = MutuallyExclusiveCallbackGroup()
@@ -332,6 +338,9 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
             if sub is not None:
                 self.destroy_subscription(sub)
                 setattr(self, name, None)
+        if self._platform is not None:
+            self._platform.destroy()
+            self._platform = None
         for name in ("_tf_timer", "_publish_timer"):
             timer = getattr(self, name)
             if timer is not None:
@@ -599,17 +608,28 @@ class DenseCloudMappingNode(AutostartLifecycleNode):
         try:
             allow = self.pipeline.config.allow_yoloe_labels
             if entry.msg is not None:
+                stamp = Time.from_msg(entry.msg.header.stamp)
                 if entry.msg.has_world_from_camera:
                     transform = _transform_msg_to_se3(entry.msg.world_from_camera)
                 else:
-                    transform = self._world_pose(entry.frame_id, Time.from_msg(entry.msg.header.stamp))
+                    transform = self._world_pose(entry.frame_id, stamp)
                 camera = camera_labels_from_msg(entry.msg, T_world_from_camera=transform, allow_yoloe=allow,
                                                 limits=self._limits)
             else:
-                transform = self._world_pose(entry.frame_id, Time(nanoseconds=int(round(entry.stamp*1e9))))
+                stamp = Time(nanoseconds=int(round(entry.stamp*1e9)))
+                transform = self._world_pose(entry.frame_id, stamp)
                 camera = camera_labels_from_dict(entry.payload, T_world_from_camera=transform, allow_yoloe=allow,
                                                  limits=self._limits)
+            if self._platform.enabled:
+                platform = self._platform.mask(self.tf_buffer, entry.frame_id, stamp, camera.intrinsics,
+                                               timeout=self._tf_timeout)
+                camera.detections, dropped = exclude_platform(camera.detections, platform, self._platform.max_overlap)
+                self._stats.add("platform_detections", dropped)
             result = self.pipeline.annotate(camera)
+        except PlatformUnavailable as exc:
+            self._stats.add("platform_unavailable")
+            self._reject_annotation(exc)
+            return None
         except tf2_ros.TransformException as exc:
             self._stats.add("tf_failures")
             self._reject_annotation(exc)

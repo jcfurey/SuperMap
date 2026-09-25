@@ -36,6 +36,22 @@
     max_label_length: 128
     max_labels: 1024
 
+    # Platform (robot self) mask: mask pixels on the robot's own links
+    # (robot_description at TF poses) never label the map, whatever produced
+    # them. The object node applies the same mask to its detections before
+    # exporting them, so this matters for other annotation sources.
+    platform_mask:
+      enabled: false
+      robot_description_topic: robot_description
+      geometry: visual          # visual | collision
+      mesh_paths: []            # roots for package:// meshes, before the ament index
+      mesh_resolution_m: 0.02
+      near_clip_m: 0.15
+      padding_px: 8
+      exclude_links: []
+      frame_prefix: ""
+      max_overlap: 0.5
+
     voxel_size: 0.05
     neighbor_radius: 0.15
     normal_radius: 0.20
