@@ -93,3 +93,28 @@ def test_d4_a_returning_object_scores_the_gap_between_its_phases_once():
         evaluator.observe(frame_id, np.eye(4), [])
     assert evaluator.stats[0].absence_frames == 2  # frames 2-3, after the first phase
     assert evaluator.stats[1].absence_frames == 0  # the same frames are not scored again
+
+
+# ------------------------------------------------------------------ D21
+def test_d21_a_relocation_on_appearance_alone_must_be_plausible():
+    retired = make_object(1, "chair", [-0.3, -0.3, -0.3, 0.3, 0.3, 0.3], status=ObjectStatus.DISAPPEARED)
+    retired.latest_stamp = 0.0
+    retired.embedding = np.ones(8, dtype=np.float32) / np.sqrt(8)
+
+    def match(offset, now, **bounds):
+        box = np.array([-0.3, -0.3, -0.3, 0.3, 0.3, 0.3]) + np.array([offset, 0, 0] * 2)
+        result, _ = association.reidentify([box], ["chair"], [retired.embedding], [retired], now=now, **bounds)
+        return bool(result.matches)
+
+    bounds = dict(relocation_max_distance=10.0, relocation_max_gap_sec=120.0)
+    assert match(3.0, 30.0, **bounds)            # moved across the room shortly after: same object
+    assert not match(20.0, 30.0, **bounds)       # too far to have been carried there
+    assert not match(3.0, 300.0, **bounds)       # a lookalike turning up much later is a new object
+    assert match(0.0, 1000.0, **bounds)          # back in its own place: geometry decides, no time bound
+    assert match(20.0, 300.0)                    # 0 disables both bounds
+    # A descriptor of another dimension (older map, other embedder) neither vetoes nor supports.
+    other = [np.ones(5, dtype=np.float32)]
+    same_place = np.array([-0.3, -0.3, -0.3, 0.3, 0.3, 0.3])
+    assert association.reidentify([same_place], ["chair"], other, [retired], now=1.0)[0].matches == [(0, 0)]
+    moved = same_place + np.array([3.0, 0, 0] * 2)
+    assert association.reidentify([moved], ["chair"], other, [retired], now=1.0)[0].matches == []

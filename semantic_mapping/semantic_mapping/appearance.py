@@ -64,12 +64,25 @@ class ColorHistogramEmbedder(Embedder):
     ``min_intensity`` (0-255 scale) are therefore left out of the chroma
     histogram; a detection with fewer than ``min_pixels`` lit pixels gets no
     descriptor at all rather than a misleading one.
+
+    Neutral pixels (channel spread below ``achromatic_saturation`` times the
+    brightest channel, or below ``achromatic_spread`` for sensor noise in dark
+    pixels) all share one
+    chromaticity, so black, grey and white objects had identical descriptors
+    and re-identification could hand a new white chair a retired grey chair's
+    ID (doc/paper-review-2026-09-25.md, D21). They go instead into
+    ``achromatic_bins`` intensity bins, spaced logarithmically from
+    ``min_intensity`` to 255 with linear (soft) assignment between adjacent
+    bins, so a halving of the light moves a grey object's mass less than one
+    bin while black and white stay apart. ``achromatic_bins=0`` restores the
+    pure chromaticity descriptor.
     """
 
     name = "color_histogram"
 
     def __init__(self, bins: int = 8, min_pixels: int = 16, space: str = "chromaticity",
-                 max_pixels: int = 4096, min_intensity: float = 20.0) -> None:
+                 max_pixels: int = 4096, min_intensity: float = 20.0, achromatic_bins: int = 3,
+                 achromatic_saturation: float = 0.15, achromatic_spread: float = 16.0) -> None:
         if space not in ("chromaticity", "rgb"):
             raise ValueError(f"unknown colour space {space!r} (chromaticity | rgb)")
         self.bins = int(bins)
@@ -79,7 +92,12 @@ class ColorHistogramEmbedder(Embedder):
         larger regions are sampled with a fixed stride (doc/audit-2026-09.md, P3)."""
         self.space = space
         self.min_intensity = float(min_intensity)
-        self.dim = self.bins ** (2 if space == "chromaticity" else 3)
+        self.achromatic_bins = int(achromatic_bins) if space == "chromaticity" else 0
+        self.achromatic_saturation = float(achromatic_saturation)
+        self.achromatic_spread = float(achromatic_spread)
+        if self.achromatic_bins < 0 or not 0 < self.min_intensity < 255:
+            raise ValueError("achromatic_bins must be >= 0 and min_intensity in (0, 255)")
+        self.dim = self.bins ** (2 if space == "chromaticity" else 3) + self.achromatic_bins
 
     def _histogram(self, pixels: np.ndarray) -> np.ndarray | None:
         """Raw bin counts, or None when too few pixels carry a colour."""
@@ -92,10 +110,32 @@ class ColorHistogramEmbedder(Embedder):
         lit = (total > 0) & (total >= 3.0 * self.min_intensity)
         if int(lit.sum()) < self.min_pixels:
             return None
-        chroma = pixels[lit, :2] / total[lit, None]
+        pixels, total = pixels[lit], total[lit]
+        neutral = np.zeros(len(pixels), dtype=bool)
+        if self.achromatic_bins:
+            neutral = np.ptp(pixels, axis=1) < np.maximum(self.achromatic_spread,
+                                                          self.achromatic_saturation * pixels.max(axis=1))
+        chroma = pixels[~neutral, :2] / total[~neutral, None]
         edges = np.linspace(0.0, 1.0 + 1e-9, self.bins + 1)
         hist, _, _ = np.histogram2d(chroma[:, 0], chroma[:, 1], bins=(edges, edges))
-        return hist.ravel()
+        if not self.achromatic_bins:
+            return hist.ravel()
+        return np.concatenate([hist.ravel(), self._intensity_histogram(total[neutral] / 3.0)])
+
+    def _intensity_histogram(self, intensity: np.ndarray) -> np.ndarray:
+        """Soft histogram of neutral pixels over log-spaced intensity bin centres."""
+        n = self.achromatic_bins
+        hist = np.zeros(n)
+        if n == 1 or not len(intensity):
+            hist[0] = len(intensity)
+            return hist
+        position = (np.log(np.clip(intensity, self.min_intensity, 255.0)) - np.log(self.min_intensity)) \
+            / (np.log(255.0) - np.log(self.min_intensity)) * (n - 1)
+        low = np.minimum(np.floor(position).astype(np.int64), n - 2)
+        upper = position - low
+        np.add.at(hist, low, 1.0 - upper)
+        np.add.at(hist, low + 1, upper)
+        return hist
 
     def embed(self, rgb: np.ndarray, detections: list[Detection2D]) -> list[np.ndarray | None]:
         out: list[np.ndarray | None] = []
@@ -168,7 +208,9 @@ def build_embedder(name: str | None, **kwargs) -> Embedder | None:
         return None
     if key in ("color_histogram", "histogram", "color"):
         return ColorHistogramEmbedder(
-            **{k: v for k, v in kwargs.items() if k in ("bins", "min_pixels", "space", "max_pixels", "min_intensity")})
+            **{k: v for k, v in kwargs.items()
+               if k in ("bins", "min_pixels", "space", "max_pixels", "min_intensity", "achromatic_bins",
+                        "achromatic_saturation", "achromatic_spread")})
     if key == "clip":
         return CLIPEmbedder(**{k: v for k, v in kwargs.items() if k in ("model_name", "pretrained", "device", "crop_margin")})
     raise ValueError(f"Unknown appearance embedder: {name!r}")

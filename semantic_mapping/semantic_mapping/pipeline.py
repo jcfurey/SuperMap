@@ -204,9 +204,11 @@ class PipelineConfig:
     """How long after it was last seen a retired instance may be re-identified (0 = unlimited)."""
     reconcile_max_distance_m: float = 10.0
     reconcile_max_gap_sec: float = 120.0
-    """Plausibility gate for folding a provisional instance into a just-retired
-    one (ObjectMap.reconcile_retired): how far it may have moved and how long
-    after it was last seen it may have turned up. 0 disables either bound."""
+    """Plausibility gate for a relocation, both when folding a provisional
+    instance into a just-retired one (ObjectMap.reconcile_retired) and when
+    re-identifying a retired instance elsewhere by appearance (association.
+    reidentify): how far it may have moved and how long after it was last seen
+    it may have turned up. 0 disables either bound."""
     scene_graph_cluster_radius: float = 2.0
     scene_graph_z_tolerance: float = 0.1
     scene_graph_xy_iou_threshold: float = 0.05
@@ -829,6 +831,8 @@ class SemanticMappingPipeline:
                     containment_margin=cfg.reactivation_margin_m, max_age_sec=cfg.reid_max_age_sec,
                     now=observation.stamp, candidate_detections=unmatched_detections,
                     label_min_mass=cfg.label_compatibility_min_mass,
+                    relocation_max_distance=cfg.reconcile_max_distance_m,
+                    relocation_max_gap_sec=cfg.reconcile_max_gap_sec,
                 )
                 for obj_idx, det_idx in stage4.matches:
                     self.object_map.revive(

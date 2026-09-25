@@ -293,6 +293,8 @@ def reidentify(
     now: float = 0.0,
     candidate_detections: list[int] | None = None,
     label_min_mass: float = DEFAULT_LABEL_MIN_MASS,
+    relocation_max_distance: float = 0.0,
+    relocation_max_gap_sec: float = 0.0,
 ) -> tuple[AssociationResult, set[tuple[int, int]]]:
     """Match still-unmatched detections against retired (disappeared) instances.
 
@@ -306,6 +308,15 @@ def reidentify(
     spot gets a new ID. ``max_age_sec`` (0 = unlimited) bounds how long ago
     the instance was last seen. Returns the assignment and the set of
     (instance index, detection index) pairs that matched by place.
+
+    Appearance alone is weak evidence of identity: two chairs of one model
+    look the same, and a new object must get a new ID (Fig. 3). A relocation
+    is therefore only claimed when it is also physically plausible: within
+    ``relocation_max_distance`` metres of where the instance was, and at most
+    ``relocation_max_gap_sec`` after it was last seen (0 disables either
+    bound; ObjectMap.reconcile_retired applies the same bounds). Descriptors
+    of different dimension (another embedder, or a map saved with an older
+    descriptor) are not comparable: they neither veto nor support a match.
 
     The pair tests are evaluated as arrays over (retired x detections): with
     up to ``max_retired_instances`` identities kept, a per-pair Python loop
@@ -353,15 +364,11 @@ def reidentify(
         | inside(obj_centers, det_boxes)
     )
 
-    # Cosine similarity where both sides carry an embedding; descriptors of
-    # different dimension are dissimilar (appearance.cosine_similarity).
+    # Cosine similarity where both sides carry an embedding of the same dimension.
     has_similarity = np.zeros_like(admissible)
     similarity = np.zeros(admissible.shape, dtype=np.float64)
     obj_embeddings = [retired[r].embedding for r in row_idx]
     det_embeddings = [detection_embeddings[cols[c]] for c in col_idx]
-    obj_with = np.array([e is not None for e in obj_embeddings])
-    det_with = np.array([e is not None for e in det_embeddings])
-    has_similarity[np.ix_(obj_with, det_with)] = True
     for dim in {np.asarray(e).size for e in det_embeddings if e is not None}:
         r_sel = np.flatnonzero([e is not None and np.asarray(e).size == dim for e in obj_embeddings])
         c_sel = np.flatnonzero([e is not None and np.asarray(e).size == dim for e in det_embeddings])
@@ -369,15 +376,21 @@ def reidentify(
             continue
         a = np.array([np.asarray(obj_embeddings[r], dtype=np.float64).ravel() for r in r_sel])
         b = np.array([np.asarray(det_embeddings[c], dtype=np.float64).ravel() for c in c_sel])
+        has_similarity[np.ix_(r_sel, c_sel)] = True
         a_norm, b_norm = np.linalg.norm(a, axis=1), np.linalg.norm(b, axis=1)
         denominator = a_norm[:, None] * b_norm[None, :]
         dot = a @ b.T
         similarity[np.ix_(r_sel, c_sel)] = np.where(denominator > 0, dot / np.where(denominator > 0, denominator, 1.0), 0.0)
 
-    valid = admissible & ~(has_similarity & (similarity < min_similarity))  # a different object, wherever it is
-    valid &= same_place | has_similarity  # a relocation can only be claimed on appearance
-    appearance_cost = np.where(has_similarity, 1.0 - similarity, 0.5)
     distance = np.linalg.norm(det_centers[None, :, :] - obj_centers[:, None, :], axis=2)
+    plausible = np.ones_like(admissible)
+    if relocation_max_distance > 0:
+        plausible &= distance <= relocation_max_distance
+    if relocation_max_gap_sec > 0:
+        plausible &= (now - np.array([retired[r].latest_stamp for r in row_idx]) <= relocation_max_gap_sec)[:, None]
+    valid = admissible & ~(has_similarity & (similarity < min_similarity))  # a different object, wherever it is
+    valid &= same_place | (has_similarity & plausible)  # a relocation needs appearance and plausibility
+    appearance_cost = np.where(has_similarity, 1.0 - similarity, 0.5)
     pair_cost = appearance_cost - np.where(same_place, 0.5, 0.0) + 0.01 * distance
     sub = cost[row_idx]
     sub[:, col_idx] = np.where(valid, pair_cost, INVALID_COST)

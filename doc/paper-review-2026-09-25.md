@@ -116,4 +116,18 @@ tests for each item are in `test/test_paper_review_2026_09_25.py`.
   - On the synthetic scene the paper-literal settings (`contradiction_window_px: 0`, `prune_min_contradictions: 1`) give identical metrics. That scene has perfect poses and depth, so it cannot show the failure the guards address.
   - Deciding this needs a real recording with ground truth.
 - **Test fix for ac159e9.** The dense-launch test compared only top-level YAML keys with declared parameters. It now flattens nested keys such as `platform_mask.enabled`, as ROS does.
-- **Open:** D5–D28.
+- **D21 fixed**, in two parts:
+  - **Descriptor.** The colour histogram now bins neutral pixels by intensity (3 soft, log-spaced bins) instead of putting them all at one chromaticity. A pixel is neutral when its channel spread is below 15% of its brightest channel, or below 16 levels, so dark sensor noise stays neutral.
+
+    | Pair | Before | After |
+    |---|---|---|
+    | black vs white | 0.83 | 0.19 |
+    | black vs grey | 0.83 | 0.48 |
+    | grey vs white | 1.00 | 0.85 |
+
+    Coloured objects stay shading-invariant: beige at half the light scores 0.94.
+
+    The cost is that a *neutral* object at half the light drops to 0.70. Its relocation is then not claimed, so it gets a new ID, which is the safe direction (Fig. 3). The descriptor grows from 64 to 67 dimensions. Descriptors of different dimension are now treated as not comparable, so older saved maps still re-identify by place; before, they would have been vetoed as dissimilar.
+  - **Plausibility.** A relocation claimed on appearance alone must also be plausible: within `reconcile_max_distance_m` (10 m) of where the instance was, and within `reconcile_max_gap_sec` (120 s) of when it was last seen. These are the bounds `reconcile_retired` already applied. Re-identification in the old place is unaffected. A lookalike that turns up far away or much later is a new object.
+  - Synthetic-scene metrics are unchanged, and both identities (moved and returned) are still kept.
+- **Open:** D5–D20 and D22–D28.
