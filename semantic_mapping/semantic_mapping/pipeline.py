@@ -1,0 +1,608 @@
+"""Online pipeline orchestration: wires detection, association, tracking,
+geometric consistency, semantic fusion, the object map, and the scene graph
+into the single per-frame update described by Sec. III, Eq. (1)-(2).
+
+This module is imported by both the ROS2 node (live mode) and the offline
+example runner, so all sensor I/O concerns live outside it: callers hand in
+an :class:`~semantic_mapping.types.Observation` already carrying pose,
+intrinsics, RGB/depth, and (asynchronously arriving) detections, and get
+back the updated map and scene graph.
+"""
+from __future__ import annotations
+
+import dataclasses
+import time
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+
+import numpy as np
+
+from semantic_mapping import association, persistence, scene_graph as sg, tracking
+from semantic_mapping.appearance import build_embedder
+from semantic_mapping.geometry_utils import (
+    back_project_depth,
+    bbox3d_from_points,
+    clip_bbox_to_image,
+    fill_sparse_depth,
+    foreground_depth_mask,
+    transform_points,
+)
+from semantic_mapping.object_map import ObjectMap
+from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus, Observation
+
+
+LOADED_MAP_EPOCH_GAP_SEC = 1e-3
+"""After a clock-epoch rebase, how long before the first new observation the
+loaded map's newest stamp is placed (SemanticMappingPipeline.load)."""
+
+
+@dataclass
+class PipelineConfig:
+    voxel_size: float = 0.05
+    min_depth_m: float = 0.0
+    max_depth_m: float = 0.0
+    """Usable optical depth interval for geometry and evidence; max 0 disables the upper bound."""
+    bbox_trim_percentile: float = 0.0
+    """Optional per-axis percentile trimming for object bounds; 0 retains full extents."""
+    mask_depth_mad_factor: float = 0.0
+    """Optional robust depth gate inside instance masks; 0 disables it for full-depth objects."""
+    mask_depth_min_tolerance_m: float = 0.15
+    foreground_depth_gap_m: float = 0.0
+    """Separate masked sensor depths into layers; 0 disables foreground selection."""
+    foreground_depth_min_points: int = 5
+    foreground_depth_min_fraction: float = 0.1
+    foreground_depth_min_image_span: float = 0.0
+    """Minimum fraction of the visible mask span covered by real returns in each image axis."""
+    foreground_depth_max_extent_m: float = 0.0
+    """Optional compact-object bound per camera axis; reject implausible layers, never clip them."""
+    foreground_depth_labels: list[str] = field(default_factory=lambda: ["person"])
+    dynamic_geometry_enabled: bool = False
+    dynamic_geometry_labels: list[str] = field(default_factory=lambda: ["person"])
+    """Use the latest supported geometry for these moving classes; keep identity/history."""
+    dynamic_geometry_min_extent_fraction: float = 0.0
+    """Retire a contradicted compact body as a whole when a supported axis collapses; 0 disables."""
+    tau_eps: float = 0.15
+    max_points_per_object: int = 5000
+    prune_log_odds: float = -1.5
+    prune_min_contradictions: int = 2
+    """Contradicting frames a fresh point needs before it is pruned; lowers
+    ``prune_log_odds`` where needed (gc.min_contradiction_prune_threshold). 1
+    restores single-frame pruning."""
+    contradiction_window_px: int = 1
+    """Radius of the window whose nearest depth reading must also lie behind a
+    point to contradict it (gc.project_and_classify); protects silhouettes. 0 = off."""
+    prune_membership: float = -1.5
+    membership_margin_px: float = 2.0
+    active_occupied_fraction: float = 0.6
+    disappeared_occupied_fraction: float = 0.2
+    max_occlusion_frames: int = 30
+    min_label_confidence: float = 0.4
+    min_observations_for_confidence_check: int = 5
+    min_hits_to_confirm: int = 2
+    tentative_max_age: int = 10
+    association_iou_threshold: float = 0.3
+    high_score_threshold: float = 0.5
+    low_score_iou_threshold: float = 0.2
+    reactivation_iou_threshold: float = 0.05
+    reactivation_margin_m: float = 0.25
+    label_compatibility_min_mass: float = 0.1
+    """Belief mass the detection's label must hold in an instance for any
+    association stage to fuse it there, and that a shared label must hold in
+    both instances for them to merge or reconcile (association.labels_compatible)."""
+    min_points_for_3d_association: int = 5
+    merge_iou_threshold: float = 0.3
+    merge_distance_m: float = 0.25
+    disappeared_prune_grace_frames: int = 60
+    """Frames after which a disappeared instance's points are released; its
+    identity stays in the map for re-identification (ObjectMap.compact_disappeared)."""
+
+    max_retired_instances: int = 1000
+    appearance_embedder: str = "color_histogram"
+    """none | color_histogram | clip: descriptor attached to detections and kept
+    per instance for re-identification (semantic_mapping.appearance)."""
+
+    embedder_device: str = "cuda"
+    clip_model: str = "ViT-B-32"
+    clip_pretrained: str = "openai"
+    reid_enabled: bool = True
+    reid_min_similarity: float = 0.85
+    """Appearance similarity below which a retired instance is not the same object."""
+
+    reid_max_age_sec: float = 0.0
+    """How long after it was last seen a retired instance may be re-identified (0 = unlimited)."""
+    reconcile_max_distance_m: float = 10.0
+    reconcile_max_gap_sec: float = 120.0
+    """Plausibility gate for folding a provisional instance into a just-retired
+    one (ObjectMap.reconcile_retired): how far it may have moved and how long
+    after it was last seen it may have turned up. 0 disables either bound."""
+    scene_graph_cluster_radius: float = 2.0
+    scene_graph_z_tolerance: float = 0.1
+    scene_graph_xy_iou_threshold: float = 0.05
+    scene_graph_beside_max_distance: float = 1.0
+    scene_graph_support_classes: list[str] = field(default_factory=lambda: list(sg.DEFAULT_SUPPORT_CLASSES))
+    max_points_per_detection: int = 4000
+    size_prior_weight: float = 0.0
+    """How far the predicted 2D box size follows the projected, image-clipped
+    3D box (0 = Kalman size only, 1 = projection only); see tracking.predict."""
+    cull_out_of_view: bool = True
+    """Skip the per-point geometric update for instances whose 3D box lies
+    entirely outside the current view (ObjectMap.may_be_in_view)."""
+
+    depth_fill_radius_px: int = 0
+    """Fill pixels without a depth reading from valid neighbours within this
+    radius (geometry_utils.fill_sparse_depth). 0 for dense depth sources; 2-3
+    for a LiDAR scan rasterized into the camera. The geometric-consistency
+    evidence uses the image filled from all readings; a detection is
+    back-projected through depth filled only from readings inside its own
+    mask (or box). Background returns already inside the silhouette require
+    separate foreground selection."""
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.min_depth_m) or self.min_depth_m < 0:
+            raise ValueError("min_depth_m must be finite and nonnegative")
+        if not np.isfinite(self.max_depth_m) or self.max_depth_m < 0:
+            raise ValueError("max_depth_m must be finite and nonnegative")
+        if self.max_depth_m and self.max_depth_m <= self.min_depth_m:
+            raise ValueError("max_depth_m must exceed min_depth_m (or be zero to disable)")
+        if not 0 <= self.bbox_trim_percentile < 50:
+            raise ValueError("bbox_trim_percentile must be in [0, 50)")
+        if not np.isfinite(self.mask_depth_mad_factor) or self.mask_depth_mad_factor < 0:
+            raise ValueError("mask_depth_mad_factor must be finite and nonnegative")
+        if not np.isfinite(self.mask_depth_min_tolerance_m) or self.mask_depth_min_tolerance_m <= 0:
+            raise ValueError("mask_depth_min_tolerance_m must be finite and positive")
+        if not np.isfinite(self.foreground_depth_gap_m) or self.foreground_depth_gap_m < 0:
+            raise ValueError("foreground_depth_gap_m must be finite and nonnegative")
+        if self.foreground_depth_min_points < 1 or int(self.foreground_depth_min_points) != self.foreground_depth_min_points:
+            raise ValueError("foreground_depth_min_points must be a positive integer")
+        if not 0 <= self.foreground_depth_min_fraction <= 1:
+            raise ValueError("foreground_depth_min_fraction must be in [0, 1]")
+        for name in ('foreground_depth_min_image_span', 'dynamic_geometry_min_extent_fraction'):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if not np.isfinite(self.foreground_depth_max_extent_m) or self.foreground_depth_max_extent_m < 0:
+            raise ValueError("foreground_depth_max_extent_m must be finite and nonnegative")
+        # Counts and budgets that the per-frame update divides by, indexes
+        # with, or feeds to bbox3d_from_points: a zero here used to be
+        # accepted and crash mid-frame after the map had already changed.
+        for name in ('min_points_for_3d_association', 'max_points_per_object', 'max_points_per_detection',
+                     'min_hits_to_confirm', 'prune_min_contradictions', 'max_retired_instances'):
+            value = getattr(self, name)
+            if int(value) != value or value < 1:
+                raise ValueError(f"{name} must be an integer >= 1")
+        for name in ('tentative_max_age', 'max_occlusion_frames', 'disappeared_prune_grace_frames',
+                     'contradiction_window_px', 'depth_fill_radius_px'):
+            value = getattr(self, name)
+            if int(value) != value or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        for name in ('voxel_size', 'tau_eps'):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 0 <= self.label_compatibility_min_mass <= 1:
+            raise ValueError("label_compatibility_min_mass must be in [0, 1]")
+        for name in ('reconcile_max_distance_m', 'reconcile_max_gap_sec', 'reid_max_age_sec'):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+
+    @classmethod
+    def from_dict(cls, params: dict) -> "PipelineConfig":
+        """Build a config from a flat dict (e.g. a loaded YAML ``ros__parameters``
+        block), silently ignoring keys that aren't pipeline fields (topics,
+        detector settings, etc. live alongside these in the same file).
+        """
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in params.items() if k in known})
+
+
+@dataclass
+class FrameResult:
+    objects: list[ObjectInstance] = field(default_factory=list)
+    stamp: float = 0.0
+    """Timestamp of the observation this result reflects; the reference for
+    "not seen for N s" ages of occluded instances."""
+    scene_graph: sg.SceneGraph | None = None
+    detection_instance_ids: list[int] = field(default_factory=list)
+    """For each detection in the processed observation, the instance ID it was
+    fused into (matched, re-activated, or newly spawned), or -1 if it was
+    discarded (e.g. a low-confidence detection with no existing track)."""
+
+    timings: dict[str, float] = field(default_factory=dict)
+    """Wall-clock seconds spent in each stage of this update (``embed``,
+    ``predict``, ``backproject``, ``associate``, ``map_update``, ``scene_graph``,
+    ``total``), the raw material for the Sec. V-H runtime accounting."""
+
+
+class SemanticMappingPipeline:
+    """Maintains M_t and G across frames; see Sec. III for the underlying model."""
+
+    def __init__(self, config: PipelineConfig | None = None) -> None:
+        self.config = config or PipelineConfig()
+        self.object_map = ObjectMap(
+            voxel_size=self.config.voxel_size,
+            tau_eps=self.config.tau_eps,
+            max_points_per_object=self.config.max_points_per_object,
+            prune_log_odds=self.config.prune_log_odds,
+            prune_membership=self.config.prune_membership,
+            membership_margin_px=self.config.membership_margin_px,
+            active_occupied_fraction=self.config.active_occupied_fraction,
+            disappeared_occupied_fraction=self.config.disappeared_occupied_fraction,
+            max_occlusion_frames=self.config.max_occlusion_frames,
+            min_label_confidence=self.config.min_label_confidence,
+            min_observations_for_confidence_check=self.config.min_observations_for_confidence_check,
+            tentative_max_age=self.config.tentative_max_age,
+            cull_out_of_view=self.config.cull_out_of_view,
+            bbox_trim_percentile=self.config.bbox_trim_percentile,
+            dynamic_geometry_labels=self.config.dynamic_geometry_labels if self.config.dynamic_geometry_enabled else (),
+            dynamic_geometry_min_extent_fraction=self.config.dynamic_geometry_min_extent_fraction,
+            label_min_mass=self.config.label_compatibility_min_mass,
+            prune_min_contradictions=self.config.prune_min_contradictions,
+            contradiction_window_px=self.config.contradiction_window_px,
+            reconcile_max_distance_m=self.config.reconcile_max_distance_m,
+            reconcile_max_gap_sec=self.config.reconcile_max_gap_sec,
+        )
+        self._frame_index = 0
+        self._last_stamp: float | None = None
+        self._rebase_loaded_stamps = False
+        self._edge_cache = sg.SpatialEdgeCache()
+        self.embedder = build_embedder(
+            self.config.appearance_embedder, device=self.config.embedder_device,
+            model_name=self.config.clip_model, pretrained=self.config.clip_pretrained,
+        )
+
+    # ------------------------------------------------------------ persistence
+    def save(self, path: str | Path, metadata: dict | None = None) -> Path:
+        """Write the current map M_t to a directory (see :mod:`semantic_mapping.persistence`)."""
+        return persistence.save_map(
+            self.object_map, path, metadata={"frame_index": self._frame_index, **(metadata or {})},
+        )
+
+    def load(self, path: str | Path, resume: bool = True) -> dict:
+        """Replace the current map with a saved one and continue from it.
+
+        Instance IDs keep counting from where the saved session stopped, so
+        histories recorded by downstream consumers stay valid. Returns the
+        saved header.
+
+        The new session may run on a different clock epoch (sim time from a
+        bag, a rebooted machine). Loaded stamps are therefore checked against
+        the first observation fused after the load: if the saved map's newest
+        stamp lies at or after it, every stored stamp is shifted so that the
+        saved session ends just before the new one begins (the downtime
+        between the two is unknown and taken as zero). Stamps already in the
+        past of the new clock are kept, so they simply read as old. Either
+        way ages, Kalman time steps, re-identification age limits, and
+        reconciliation gaps never see negative or mixed-epoch intervals.
+        """
+        header = persistence.load_map(path, self.object_map, resume=resume)
+        self._frame_index = int(header.get("metadata", {}).get("frame_index", 0))
+        self.begin_new_epoch()
+        self._edge_cache = sg.SpatialEdgeCache()
+        return header
+
+    def begin_new_epoch(self) -> None:
+        """Accept observations from a new clock epoch (map load, time jump backwards).
+
+        Stored stamps are rebased against the next fused observation, as
+        described in :meth:`load`.
+        """
+        self._last_stamp = None
+        self._rebase_loaded_stamps = True
+
+    def _rebase_stamps_for(self, stamp: float) -> None:
+        if not self._rebase_loaded_stamps:
+            return
+        self._rebase_loaded_stamps = False
+        newest = self.object_map.newest_stamp()
+        if newest is not None and newest >= stamp:
+            self.object_map.shift_stamps(stamp - newest - LOADED_MAP_EPOCH_GAP_SEC)
+
+    @staticmethod
+    def _fill_within(depth: np.ndarray, region: np.ndarray, radius_px: int) -> np.ndarray:
+        """Depth filled only from readings inside ``region`` (elsewhere invalid),
+        computed on the region's bounding crop to keep the per-detection cost small."""
+        ys, xs = np.nonzero(region)
+        if xs.size == 0:
+            return depth
+        h, w = depth.shape
+        y1, y2 = max(int(ys.min()) - radius_px, 0), min(int(ys.max()) + radius_px + 1, h)
+        x1, x2 = max(int(xs.min()) - radius_px, 0), min(int(xs.max()) + radius_px + 1, w)
+        crop = np.where(region[y1:y2, x1:x2], depth[y1:y2, x1:x2], 0.0)
+        filled = np.zeros_like(depth, dtype=np.float64)
+        filled[y1:y2, x1:x2] = fill_sparse_depth(crop, radius_px)
+        return filled
+
+    def _detection_points_world(
+        self, detection: Detection2D, depth: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
+    ) -> np.ndarray:
+        has_instance_mask = detection.mask is not None
+        if has_instance_mask:
+            mask = detection.mask
+        else:
+            mask = np.zeros(depth.shape, dtype=bool)
+            x1, y1, x2, y2 = detection.bbox.astype(int)
+            x1, y1 = max(x1, 0), max(y1, 0)
+            x2, y2 = min(x2, depth.shape[1]), min(y2, depth.shape[0])
+            mask[y1:y2, x1:x2] = True
+
+        cfg = self.config
+        if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
+            # Count real returns, not pixels synthesized by sparse filling.
+            pixels = min_span = None
+            if cfg.foreground_depth_min_image_span > 0:
+                ys, xs = np.nonzero(mask)
+                pixels = np.column_stack((xs, ys))
+                if len(pixels):
+                    min_span = (np.ptp(pixels, axis=0) + 1) * cfg.foreground_depth_min_image_span
+            selected = foreground_depth_mask(
+                depth[mask], cfg.foreground_depth_gap_m,
+                cfg.foreground_depth_min_points, cfg.foreground_depth_min_fraction,
+                pixels=pixels, min_span=min_span,
+            )
+            filtered = np.zeros_like(depth)
+            filtered[mask] = np.where(selected, depth[mask], 0.0)
+            depth = filtered
+        if self.config.depth_fill_radius_px > 0:
+            depth = self._fill_within(depth, mask, self.config.depth_fill_radius_px)
+        points_cam = back_project_depth(
+            K, depth, mask=mask, max_points=self.config.max_points_per_detection,
+            depth_mad_factor=self.config.mask_depth_mad_factor if has_instance_mask else 3.0,
+            depth_min_tolerance=self.config.mask_depth_min_tolerance_m if has_instance_mask else 0.05,
+        )
+        if (cfg.foreground_depth_max_extent_m > 0 and detection.label in cfg.foreground_depth_labels
+                and len(points_cam)):
+            bounds = bbox3d_from_points(points_cam, cfg.bbox_trim_percentile)
+            if np.any(bounds[3:] - bounds[:3] > cfg.foreground_depth_max_extent_m):
+                return np.zeros((0, 3))
+        return transform_points(T_world_from_cam, points_cam)
+
+    def process_frame(self, observation: Observation) -> FrameResult:
+        """Run one full P(I_t, M_t, P_t | M_t-1, Q_t) update step (Eq. 2), given
+        that pose P_t was already estimated upstream (Sec. IV-A) and is
+        carried on ``observation.pose``.
+        """
+        if not np.isfinite(observation.stamp):
+            raise ValueError("observation timestamp must be finite")
+        if self._last_stamp is not None and observation.stamp <= self._last_stamp:
+            raise ValueError("observations must be fused in strictly increasing timestamp order")
+        image_shape = (observation.intrinsics.height, observation.intrinsics.width)
+        for detection in observation.detections:
+            detection.validate_mask(image_shape)
+        # Everything above validates; state changes start here.
+        self._rebase_stamps_for(observation.stamp)
+        self._last_stamp = observation.stamp
+        self._frame_index += 1
+        t_start = time.perf_counter()
+        K = observation.intrinsics.K
+        T_world_from_cam = observation.pose.T_world_from_frame
+        # Shallow copies: embeddings computed here must not be written back
+        # into the caller's detections, where a later run with another
+        # embedder would silently reuse them. Masks are shared, read-only.
+        detections = [dataclasses.replace(d) for d in observation.detections]
+        cfg = self.config
+        depth = observation.depth
+        if depth is not None and (cfg.min_depth_m > 0 or cfg.max_depth_m > 0):
+            valid = np.isfinite(depth) & (depth > 0) & (depth >= cfg.min_depth_m)
+            if cfg.max_depth_m > 0:
+                valid &= depth <= cfg.max_depth_m
+            # Out-of-range readings mean unknown, not free space. The same
+            # filtered depth must drive both back-projection and contradiction
+            # evidence, and the caller's observation must remain unmodified.
+            depth = np.where(valid, depth, 0.0)
+        # Evidence (Eq. 7-9) runs on depth filled from every reading; detections
+        # are back-projected through the raw depth, filled per detection from
+        # readings inside their own mask (see _detection_points_world).
+        evidence_depth = depth
+        if depth is not None and cfg.depth_fill_radius_px > 0:
+            evidence_depth = fill_sparse_depth(depth, cfg.depth_fill_radius_px)
+
+        live_objects = [
+            obj for obj in self.object_map.objects.values() if obj.status != ObjectStatus.DISAPPEARED
+        ]
+        retired_before = {o.instance_id for o in self.object_map.objects.values() if o.status == ObjectStatus.DISAPPEARED}
+
+        if self.embedder is not None and observation.rgb is not None:
+            missing = [d for d in detections if d.embedding is None]
+            if missing:
+                for detection, embedding in zip(missing, self.embedder.embed(observation.rgb, missing)):
+                    detection.embedding = embedding
+        t_embed = time.perf_counter()
+
+        image_size = (observation.intrinsics.width, observation.intrinsics.height)
+        # One batched frustum test decides which instances can be seen at all;
+        # the rest skip prediction, association, and per-point evidence this
+        # frame, so the update cost follows the view, not the map size.
+        in_view = np.ones(len(live_objects), dtype=bool)
+        if cfg.cull_out_of_view and live_objects:
+            has_points = np.array([o.points_world.shape[0] > 0 for o in live_objects])
+            boxes = np.array([o.bbox3d for o in live_objects], dtype=np.float64).reshape(-1, 6)
+            in_view = ~has_points | self.object_map.boxes_in_view(
+                boxes, K, T_world_from_cam, (image_size[1], image_size[0]))
+        visible_indices = [i for i, flag in enumerate(in_view) if flag]
+
+        predicted_tracks: list[tracking.TrackKalmanState] = []
+        predicted_bboxes: list[np.ndarray] = []
+        for obj, flag in zip(live_objects, in_view):
+            if not flag:
+                predicted_tracks.append(obj.track)
+                predicted_bboxes.append(tracking.current_bbox(obj.track))
+                continue
+            # obj.track is the state at the last match (latest_stamp); a
+            # prediction is never stored, so each frame predicts once over
+            # the whole gap instead of compounding one prediction per frame.
+            dt = max(observation.stamp - obj.latest_stamp, 1e-3)
+            predicted = tracking.predict(
+                obj.track, dt, K=K, T_world_from_cam=T_world_from_cam,
+                object_centroid_world=obj.center if len(obj.points_world) else None,
+                object_bbox3d_world=obj.bbox3d if obj.points_world.shape[0] > 0 else None,
+                image_size=image_size, size_prior_weight=cfg.size_prior_weight,
+            )
+            predicted_tracks.append(predicted)
+            # Detections never extend past the frame, so score the prediction's visible part.
+            bbox = tracking.current_bbox(predicted)
+            visible = clip_bbox_to_image(bbox, *image_size)
+            predicted_bboxes.append(bbox if visible is None else visible)
+        t_predict = time.perf_counter()
+
+        # Back-project every detection once; the 3D boxes feed the re-activation
+        # stage, the points feed whichever instance the detection ends up in.
+        det_points: list[np.ndarray] = []
+        det_boxes3d: list[np.ndarray | None] = []
+        for detection in detections:
+            points = (self._detection_points_world(detection, depth, K, T_world_from_cam)
+                      if depth is not None else np.zeros((0, 3)))
+            det_points.append(points)
+            det_boxes3d.append(
+                bbox3d_from_points(points, cfg.bbox_trim_percentile)
+                if points.shape[0] >= max(cfg.min_points_for_3d_association, 1) else None
+            )
+        t_backproject = time.perf_counter()
+        detection_bboxes = [d.bbox for d in detections]
+        detection_labels = [d.label for d in detections]
+        track_beliefs = [o.label_belief for o in live_objects]
+        high = [i for i, d in enumerate(detections) if d.score >= cfg.high_score_threshold]
+        low = [i for i, d in enumerate(detections) if d.score < cfg.high_score_threshold]
+
+        # Stage 1: 2D, high-confidence detections, gated by motion and label.
+        stage1 = association.associate(
+            predicted_tracks, predicted_bboxes, detection_bboxes,
+            iou_threshold=cfg.association_iou_threshold, candidate_tracks=visible_indices,
+            candidate_detections=high, track_label_beliefs=track_beliefs, detection_labels=detection_labels,
+            label_min_mass=cfg.label_compatibility_min_mass,
+        )
+        # Stage 2 (ByteTrack): leftover tracks vs. low-confidence detections, looser IoU, no motion gate.
+        stage2 = association.associate(
+            predicted_tracks, predicted_bboxes, detection_bboxes,
+            iou_threshold=cfg.low_score_iou_threshold, use_mahalanobis_gate=False,
+            candidate_tracks=stage1.unmatched_tracks, candidate_detections=low,
+            track_label_beliefs=track_beliefs, detection_labels=detection_labels,
+            label_min_mass=cfg.label_compatibility_min_mass,
+        )
+        # Stage 3: 3D-aware re-activation for high-confidence detections still unmatched.
+        stage3 = association.associate_3d(
+            det_boxes3d, detection_labels, live_objects,
+            iou_threshold=cfg.reactivation_iou_threshold, containment_margin=cfg.reactivation_margin_m,
+            candidate_objects=stage2.unmatched_tracks, candidate_detections=stage1.unmatched_detections,
+            label_min_mass=cfg.label_compatibility_min_mass,
+        )
+
+        t_associate = time.perf_counter()
+
+        detection_instance_ids = [-1] * len(detections)
+        for track_idx, det_idx in stage1.matches + stage2.matches:
+            detection = detections[det_idx]
+            updated_track = tracking.update(predicted_tracks[track_idx], detection.bbox)
+            # Matched instances are all in view: pass the batched verdict on
+            # instead of repeating the frustum test per instance.
+            self.object_map.update_matched(
+                live_objects[track_idx], updated_track, det_points[det_idx], detection,
+                observation.stamp, K, T_world_from_cam, evidence_depth, in_view=bool(in_view[track_idx]),
+            )
+            detection_instance_ids[det_idx] = live_objects[track_idx].instance_id
+        for track_idx, det_idx in stage3.matches:
+            self.object_map.reactivate(
+                live_objects[track_idx], det_points[det_idx], detections[det_idx],
+                observation.stamp, K, T_world_from_cam, evidence_depth, in_view=bool(in_view[track_idx]),
+            )
+            detection_instance_ids[det_idx] = live_objects[track_idx].instance_id
+
+        # Unmatched instances keep the track state of their last match (see
+        # the prediction loop above). Without depth, update_unmatched applies
+        # no evidence but still counts detector misses, so tentative tracks
+        # expire; out-of-view instances are never charged a miss.
+        for track_idx in stage3.unmatched_tracks:
+            self.object_map.update_unmatched(
+                live_objects[track_idx], K, T_world_from_cam, evidence_depth, in_view=bool(in_view[track_idx]),
+                detections_evaluated=observation.detections_evaluated)
+        for track_idx in np.nonzero(~in_view)[0]:
+            self.object_map.update_unmatched(
+                live_objects[track_idx], K, T_world_from_cam, evidence_depth, in_view=False,
+                detections_evaluated=observation.detections_evaluated)
+
+        # Stage 4: re-identification against retired instances, so an object
+        # that was removed and comes back -- in place or elsewhere -- keeps its ID.
+        unmatched_detections = stage3.unmatched_detections
+        if cfg.reid_enabled and unmatched_detections:
+            retired = [o for o in self.object_map.objects.values() if o.status == ObjectStatus.DISAPPEARED]
+            if retired:
+                stage4, by_place = association.reidentify(
+                    det_boxes3d, detection_labels, [d.embedding for d in detections], retired,
+                    min_similarity=cfg.reid_min_similarity, iou_threshold=cfg.reactivation_iou_threshold,
+                    containment_margin=cfg.reactivation_margin_m, max_age_sec=cfg.reid_max_age_sec,
+                    now=observation.stamp, candidate_detections=unmatched_detections,
+                    label_min_mass=cfg.label_compatibility_min_mass,
+                )
+                for obj_idx, det_idx in stage4.matches:
+                    self.object_map.revive(
+                        retired[obj_idx], det_points[det_idx], detections[det_idx], observation.stamp,
+                        K, T_world_from_cam, evidence_depth, relocated=(obj_idx, det_idx) not in by_place,
+                    )
+                    detection_instance_ids[det_idx] = retired[obj_idx].instance_id
+                unmatched_detections = stage4.unmatched_detections
+
+        # Only high-confidence detections may start a new object (ByteTrack).
+        for det_idx in unmatched_detections:
+            detection = detections[det_idx]
+            spawned = self.object_map.spawn(
+                detection.bbox, det_points[det_idx], detection.label, detection.score, observation.stamp,
+                embedding=detection.embedding,
+            )
+            detection_instance_ids[det_idx] = spawned.instance_id
+
+        for obj in self.object_map.objects.values():
+            self.object_map.confirm_tentative(obj, cfg.min_hits_to_confirm)
+        merged = dict(
+            (dropped, kept)
+            for kept, dropped in self.object_map.merge_duplicates(cfg.merge_iou_threshold, cfg.merge_distance_m)
+        )
+        detection_instance_ids = [merged.get(i, i) for i in detection_instance_ids]
+        for obj in self.object_map.objects.values():
+            sg.record_trajectory_sample(obj, observation.stamp)
+
+        # An object that moved before its old spot was confirmed empty got a
+        # provisional ID meanwhile; now that the old instance has retired,
+        # reconcile the two under the original ID (ObjectMap.reconcile_retired).
+        if cfg.reid_enabled:
+            newly_retired = [
+                o for o in self.object_map.objects.values()
+                if o.status == ObjectStatus.DISAPPEARED and o.instance_id not in retired_before
+            ]
+            if newly_retired:
+                reconciled = dict(
+                    (dropped, kept)
+                    for kept, dropped in self.object_map.reconcile_retired(newly_retired, cfg.reid_min_similarity)
+                )
+                detection_instance_ids = [reconciled.get(i, i) for i in detection_instance_ids]
+                for kept in set(reconciled.values()):
+                    obj = self.object_map.objects[kept]
+                    self.object_map.confirm_tentative(obj, cfg.min_hits_to_confirm)
+                    sg.record_trajectory_sample(obj, observation.stamp)
+
+        self.object_map.compact_disappeared(cfg.disappeared_prune_grace_frames, cfg.max_retired_instances)
+        t_update = time.perf_counter()
+
+        graph = sg.build_scene_graph(
+            list(self.object_map.objects.values()),
+            cluster_radius=self.config.scene_graph_cluster_radius,
+            z_tolerance=self.config.scene_graph_z_tolerance,
+            xy_iou_threshold=self.config.scene_graph_xy_iou_threshold,
+            beside_max_distance=self.config.scene_graph_beside_max_distance,
+            support_classes=self.config.scene_graph_support_classes,
+            cache=self._edge_cache,
+        )
+
+        t_graph = time.perf_counter()
+
+        return FrameResult(
+            objects=list(self.object_map.objects.values()),
+            stamp=float(observation.stamp),
+            scene_graph=graph,
+            detection_instance_ids=detection_instance_ids,
+            timings={
+                "embed": t_embed - t_start,
+                "predict": t_predict - t_embed,
+                "backproject": t_backproject - t_predict,
+                "associate": t_associate - t_backproject,
+                "map_update": t_update - t_associate,
+                "scene_graph": t_graph - t_update,
+                "total": t_graph - t_start,
+            },
+        )

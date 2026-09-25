@@ -1,19 +1,27 @@
-# Convenience wrapper around `docker build`/`docker run` for the semantic_mapping
-# image. Uses host networking, the standard way to let ROS2 DDS discovery work
-# when a separate upstream SLAM backbone node is also running on the host.
+# Convenience wrapper around `docker build`/`docker run` for the SuperMap
+# images. Uses host networking, the standard way to let ROS 2 DDS discovery
+# work when a separate upstream SLAM backbone node is also running on the host.
 #
 # Usage:
-#   docker compose up --build
+#   docker compose up --build                          # full image, reserves one NVIDIA GPU
+#   docker compose --profile lite up --build semantic_mapping_lite   # no detector stack, no GPU
+#
+# Extra launch arguments go after the service, e.g.
+#   docker compose run --rm semantic_mapping ros2 launch semantic_mapping semantic_mapping.launch.py use_sim_time:=true
+x-common: &common
+  network_mode: host
+  ipc: host
+  environment:
+    - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+  command: ["ros2", "launch", "semantic_mapping", "semantic_mapping.launch.py"]
+
 services:
   semantic_mapping:
+    <<: *common
     build:
       context: .
       dockerfile: docker/Dockerfile
     image: supermap/semantic_mapping
-    network_mode: host
-    ipc: host
-    environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
     deploy:
       resources:
         reservations:
@@ -21,4 +29,13 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: ["ros2", "launch", "semantic_mapping", "semantic_mapping.launch.py"]
+
+  semantic_mapping_lite:
+    <<: *common
+    profiles: [lite]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        INSTALL_DETECTORS: "0"
+    image: supermap/semantic_mapping:lite

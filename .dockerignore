@@ -1,11 +1,12 @@
 .git/
-data/
+.github/
 doc/
-__pycache__/
-*.pyc
-.pytest_cache/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
 build/
 install/
 log/
 .venv/
 venv/
+semantic_mapping/data/

@@ -1,0 +1,18 @@
+# Ground a natural-language instruction against the current scene graph.
+string instruction
+# Search radius around the robot for the local subgraph. <= 0 uses the node parameter.
+float64 local_radius_m
+---
+bool success
+string message
+uint64[] target_ids
+string[] target_labels
+uint64[] unresolved_ids
+# Reachable approach poses, one per target, in the map frame.
+geometry_msgs/PoseStamped[] goals
+nav_msgs/Path path
+# Raw VLM response text.
+string response
+---
+# "queued", "serializing", "querying", "parsing"
+string stage

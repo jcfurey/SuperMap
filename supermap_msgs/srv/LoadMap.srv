@@ -1,0 +1,6 @@
+# Directory to load from. Empty uses the node's configured map_load_path.
+string path
+---
+bool success
+string message
+string path

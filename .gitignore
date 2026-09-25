@@ -1,5 +1,5 @@
 # Generated example dataset (regenerate with examples/prepare_example_dataset.py)
-/data/
+/semantic_mapping/data/
 
 # Python
 __pycache__/

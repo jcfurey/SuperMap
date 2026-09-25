@@ -1,0 +1,7 @@
+# Directory to save into. Empty uses the node's configured map_save_path.
+string path
+---
+bool success
+string message
+# The directory that was written.
+string path

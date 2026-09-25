@@ -1,0 +1,60 @@
+# dense_cloud_mapping. Keyed /** so it applies under any namespace; topics are
+# relative so a namespace moves every input and output.
+/**:
+  ros__parameters:
+    # snapshot: each message is an authoritative accumulated map/submap.
+    # scan: union registered scans into a persistent world-voxel map.
+    input_mode: snapshot
+    cloud_topic: points
+    world_frame: map
+    output_cloud_topic: supermap/dense_cloud     # input cloud + label fields, per processed cloud
+    voxel_map_topic: supermap/voxel_map          # latched
+    regions_topic: supermap/regions              # supermap_msgs/RegionArray, latched
+    regions_json_topic: ""                       # optional JSON metadata + counters
+    publish_voxel_map: true
+    publish_period_s: 1.0  # throttle for voxel map / regions (runtime-settable); 0 = every update
+
+    # TF: wait briefly, then hold clouds whose TF has not arrived yet.
+    tf_timeout_s: 0.05
+    tf_max_wait_s: 0.5
+    tf_queue_size: 8
+    tf_cache_s: 30.0
+
+    # Optional camera annotations. No camera or RGB message is needed for geometry.
+    # The tunnel bag is Ouster + Lucid. D435i is a separate indoor depth source.
+    # Typed supermap_msgs/CameraAnnotations carry manual masks or explicitly
+    # allowed YOLOE masks; the cloud node itself loads no learned models.
+    allow_yoloe_labels: false
+    camera_annotation_queue_size: 512  # masks retained for delayed map snapshots
+    camera_annotations_topic: supermap/camera_annotations
+    manual_annotations_topic: ""  # JSON std_msgs/String input for hand-made masks; empty disables
+    camera_info_topic: ""  # only for JSON annotations without intrinsics
+    # Untrusted-input bounds.
+    max_annotation_bytes: 8000000
+    max_detections: 64
+    max_image_pixels: 16777216
+    max_label_length: 128
+    max_labels: 1024
+
+    voxel_size: 0.05
+    neighbor_radius: 0.15
+    normal_radius: 0.20
+    max_neighbors: 24
+    normal_angle_deg: 25.0
+    plane_tolerance: 0.04
+    min_region_voxels: 4
+    max_map_voxels: 500000  # explicit error at capacity, never a silent crop
+    chunk_size: 4096
+    incremental_segmentation: true  # re-segment only near changed voxels
+    camera_depth_tolerance: 0.05
+    max_camera_time_delta: 0.20  # image capture time, not annotation arrival time
+    min_camera_score: 0.5
+    label_propagation_radius: 0.0  # metres; 0 keeps unseen geometry semantically unknown
+    label_ttl_sec: 0.0  # 0 preserves labels on surviving world voxels indefinitely
+    # Keep labels from bleeding through sparse LiDAR onto background behind a mask.
+    camera_splat_radius: 0.05        # m footprint of each projected point in the z-buffer; 0 = off
+    camera_max_splat_pixels: 8
+    camera_splat_occlusion_gap: 0.30 # a footprint this far in front hides a point
+    mask_depth_gap: 1.0              # m; split a mask's points into depth layers; 0 = off
+    mask_depth_gap_ratio: 0.25       # plus this fraction of depth (receding surfaces stay one layer)
+    mask_min_layer_points: 3         # nearest layer with this many points takes the label
