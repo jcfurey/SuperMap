@@ -28,6 +28,7 @@ from semantic_mapping.geometry_utils import (
     fill_sparse_depth,
     fit_ground_plane,
     foreground_depth_mask,
+    mask_bounds,
     parse_size_limits,
     transform_points,
 )
@@ -42,6 +43,13 @@ images cost no more per detection than a sparse LiDAR raster."""
 LOADED_MAP_EPOCH_GAP_SEC = 1e-3
 """After a clock-epoch rebase, how long before the first new observation the
 loaded map's newest stamp is placed (SemanticMappingPipeline.load)."""
+
+
+def _box_pixels(bbox: np.ndarray, image_shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Integer pixel bounds ``(x1, y1, x2, y2)`` of a box, clipped to the image."""
+    h, w = image_shape
+    x1, y1, x2, y2 = (int(np.clip(v, 0, limit)) for v, limit in zip(np.asarray(bbox).astype(int), (w, h, w, h)))
+    return x1, y1, x2, y2
 
 
 @dataclass
@@ -337,9 +345,10 @@ class FrameResult:
     discarded (e.g. a low-confidence detection with no existing track)."""
 
     timings: dict[str, float] = field(default_factory=dict)
-    """Wall-clock seconds spent in each stage of this update (``embed``,
-    ``predict``, ``backproject``, ``associate``, ``map_update``, ``scene_graph``,
-    ``total``), the raw material for the Sec. V-H runtime accounting."""
+    """Wall-clock seconds spent in each stage of this update (``depth``: range
+    gating and sparse filling of the frame's depth, ``embed``, ``predict``,
+    ``backproject``, ``associate``, ``map_update``, ``scene_graph``, ``total``),
+    the raw material for the Sec. V-H runtime accounting."""
 
 
 class SemanticMappingPipeline:
@@ -455,7 +464,7 @@ class SemanticMappingPipeline:
 
     def _remove_ground(
         self, depth: np.ndarray, mask: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
-        remove: bool = True, min_off_ground: int = 0,
+        remove: bool = True, min_off_ground: int = 0, origin: tuple[int, int] = (0, 0),
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """``depth`` without the masked readings that lie on the local ground,
         and the ground plane if it was fitted (None for the level fallback).
@@ -467,6 +476,8 @@ class SemanticMappingPipeline:
         ``remove`` is False (plane only). ``min_off_ground > 0`` removes them
         only from a fitted ground below the camera, and only when at least
         that many masked readings stand above it (ground_exclusion).
+        ``origin`` is the (column, row) of ``depth[0, 0]`` in the image ``K``
+        describes; a crop must include the ``ground_context_px`` margin.
         """
         cfg = self.config
         ys, xs = np.nonzero(mask)
@@ -481,10 +492,11 @@ class SemanticMappingPipeline:
         vs, us = np.nonzero(valid)
         if vs.size == 0:
             return depth, None
+        u0, v0 = x1 + origin[0], y1 + origin[1]
 
         def world_of(rows, cols):
             z = crop[rows, cols].astype(np.float64)
-            cam = np.stack(((cols + x1 - K[0, 2]) * z / K[0, 0], (rows + y1 - K[1, 2]) * z / K[1, 1], z), axis=1)
+            cam = np.stack(((cols + u0 - K[0, 2]) * z / K[0, 0], (rows + v0 - K[1, 2]) * z / K[1, 1], z), axis=1)
             return transform_points(T_world_from_cam, cam)
 
         sample = slice(None)
@@ -507,13 +519,16 @@ class SemanticMappingPipeline:
         return filtered, plane if fitted else None
 
     def _ground_contact_range(self, mask: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
-                              plane: np.ndarray) -> float | None:
-        """Camera depth at which the ray through the mask's bottom-centre pixel meets the ground plane."""
+                              plane: np.ndarray, origin: tuple[int, int] = (0, 0),
+                              image_height: int | None = None) -> float | None:
+        """Camera depth at which the ray through the mask's bottom-centre pixel meets the ground plane.
+        A cropped ``mask`` gives its ``origin`` (column, row) and the full ``image_height``."""
         ys, xs = np.nonzero(mask)
-        v = int(ys.max())
-        if v >= mask.shape[0] - 1:
+        bottom = int(ys.max())
+        v = bottom + origin[1]
+        if v >= (mask.shape[0] if image_height is None else image_height) - 1:
             return None  # cut off by the image: the bottom is not the ground contact
-        u = float(np.mean(xs[ys == v]))
+        u = float(np.mean(xs[ys == bottom] + origin[0]))
         direction = T_world_from_cam[:3, :3] @ np.array([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], 1.0])
         origin = T_world_from_cam[:3, 3]
         denominator = direction[2] - plane[0] * direction[0] - plane[1] * direction[1]
@@ -526,16 +541,19 @@ class SemanticMappingPipeline:
         return float(t)
 
     def _complete_mask(self, mask: np.ndarray, depth: np.ndarray, K: np.ndarray, z: float, budget: int,
-                       T_world_from_cam: np.ndarray, plane: np.ndarray | None) -> np.ndarray:
+                       T_world_from_cam: np.ndarray, plane: np.ndarray | None,
+                       origin: tuple[int, int] = (0, 0)) -> np.ndarray:
         """Camera-frame points at depth ``z`` for mask pixels without a reading in
         ``depth``: a ``mask_completion_stride_px`` grid plus the silhouette's
         extreme pixels, at most ``budget`` (extremes first). With a ground
         ``plane``, pixels that would complete below the ground (a mask bled
-        onto the ground in front) are left out first."""
+        onto the ground in front) are left out first. ``origin`` is the
+        (column, row) of ``mask[0, 0]`` in the image ``K`` describes."""
         if budget <= 0:
             return np.zeros((0, 3))
         empty = mask & ~(np.isfinite(depth) & (depth > 0))
         vs, us = np.nonzero(empty)
+        us, vs = us + origin[0], vs + origin[1]
         if plane is not None and vs.size:
             cam = np.stack(((us - K[0, 2]) * z / K[0, 0], (vs - K[1, 2]) * z / K[1, 1], np.full(us.size, z)), axis=1)
             world = transform_points(T_world_from_cam, cam)
@@ -554,18 +572,49 @@ class SemanticMappingPipeline:
         us, vs = us[chosen].astype(np.float64), vs[chosen].astype(np.float64)
         return np.stack(((us - K[0, 2]) * z / K[0, 0], (vs - K[1, 2]) * z / K[1, 1], np.full(us.size, z)), axis=1)
 
+    def _detection_region(self, detection: Detection2D, image_shape: tuple[int, int]) -> tuple[int, int, int, int]:
+        """Rows ``[y1, y2)`` and columns ``[x1, x2)`` of the detection's pixels (its
+        mask, or its box without one) grown by the margin the ground fit and
+        per-mask depth filling read around them, clipped to the image. Empty
+        (``y1 == y2``) when the detection covers no pixel."""
+        h, w = image_shape
+        if detection.mask is not None:
+            bounds = mask_bounds(detection.mask)
+            if bounds is None:
+                return 0, 0, 0, 0
+            y1, y2, x1, x2 = bounds
+        else:
+            x1, y1, x2, y2 = _box_pixels(detection.bbox, image_shape)
+            if x2 <= x1 or y2 <= y1:
+                return 0, 0, 0, 0
+        m = max(self.config.ground_context_px, self.config.depth_fill_radius_px)
+        return max(y1 - m, 0), min(y2 + m, h), max(x1 - m, 0), min(x2 + m, w)
+
     def _detection_points_world(
         self, detection: Detection2D, depth: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
+        region: tuple[int, int, int, int] | None = None,
     ) -> np.ndarray:
+        """World points of one detection, lifted through ``depth``.
+
+        Every step reads only the detection's pixels and a margin around them,
+        so it runs on that crop (``region``, default :meth:`_detection_region`)
+        instead of the whole image: per-detection cost follows the object, not
+        the camera resolution. Pixel coordinates are offset back to the full
+        image, so any crop that contains the region gives the same points.
+        """
+        y1, y2, x1, x2 = self._detection_region(detection, depth.shape) if region is None else region
+        if y2 <= y1 or x2 <= x1:
+            return np.zeros((0, 3))
         has_instance_mask = detection.mask is not None
         if has_instance_mask:
-            mask = detection.mask
+            mask = detection.mask[y1:y2, x1:x2]
         else:
-            mask = np.zeros(depth.shape, dtype=bool)
-            x1, y1, x2, y2 = detection.bbox.astype(int)
-            x1, y1 = max(x1, 0), max(y1, 0)
-            x2, y2 = min(x2, depth.shape[1]), min(y2, depth.shape[0])
-            mask[y1:y2, x1:x2] = True
+            bx1, by1, bx2, by2 = _box_pixels(detection.bbox, depth.shape)
+            mask = np.zeros((y2 - y1, x2 - x1), dtype=bool)
+            mask[max(by1 - y1, 0):max(by2 - y1, 0), max(bx1 - x1, 0):max(bx2 - x1, 0)] = True
+        image_height = depth.shape[0]
+        depth = depth[y1:y2, x1:x2]
+        origin = (x1, y1)
 
         cfg = self.config
         plane = None
@@ -576,13 +625,13 @@ class SemanticMappingPipeline:
         if remove or contact or exclude:
             depth, plane = self._remove_ground(
                 depth, mask, K, T_world_from_cam, remove=remove or exclude,
-                min_off_ground=cfg.ground_exclusion_min_returns if exclude else 0)
+                min_off_ground=cfg.ground_exclusion_min_returns if exclude else 0, origin=origin)
         if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
             # Count real returns, not pixels synthesized by sparse filling.
             pixels = min_span = None
             if cfg.foreground_depth_min_image_span > 0:
                 ys, xs = np.nonzero(mask)
-                pixels = np.column_stack((xs, ys))
+                pixels = np.column_stack((xs + origin[0], ys + origin[1]))
                 if len(pixels):
                     min_span = (np.ptp(pixels, axis=0) + 1) * cfg.foreground_depth_min_image_span
             selected = foreground_depth_mask(
@@ -604,7 +653,7 @@ class SemanticMappingPipeline:
                     completion_range = float(np.median(kept))
                     self.object_map.stats["mask_completions"] += 1
             elif contact and plane is not None:
-                completion_range = self._ground_contact_range(mask, K, T_world_from_cam, plane)
+                completion_range = self._ground_contact_range(mask, K, T_world_from_cam, plane, origin, image_height)
                 if completion_range is not None:
                     self.object_map.stats["ground_contact_completions"] += 1
         if self.config.depth_fill_radius_px > 0:
@@ -613,11 +662,12 @@ class SemanticMappingPipeline:
             K, depth, mask=mask, max_points=self.config.max_points_per_detection,
             depth_mad_factor=self.config.mask_depth_mad_factor if has_instance_mask else 3.0,
             depth_min_tolerance=self.config.mask_depth_min_tolerance_m if has_instance_mask else 0.05,
+            pixel_origin=origin,
         )
         if completion_range is not None:
             points_cam = np.concatenate((points_cam, self._complete_mask(
                 mask, depth, K, completion_range, cfg.max_points_per_detection - len(points_cam),
-                T_world_from_cam, plane)))
+                T_world_from_cam, plane, origin)))
         if (cfg.foreground_depth_max_extent_m > 0 and detection.label in cfg.foreground_depth_labels
                 and len(points_cam)):
             bounds = bbox3d_from_points(points_cam, cfg.bbox_trim_percentile)
@@ -696,6 +746,7 @@ class SemanticMappingPipeline:
         evidence_depth = depth
         if depth is not None and cfg.depth_fill_radius_px > 0:
             evidence_depth = fill_sparse_depth(depth, cfg.depth_fill_radius_px)
+        t_depth = time.perf_counter()
 
         live_objects = [
             obj for obj in self.object_map.objects.values() if obj.status != ObjectStatus.DISAPPEARED
@@ -923,7 +974,8 @@ class SemanticMappingPipeline:
             scene_graph=graph,
             detection_instance_ids=detection_instance_ids,
             timings={
-                "embed": t_embed - t_start,
+                "depth": t_depth - t_start,
+                "embed": t_embed - t_depth,
                 "predict": t_predict - t_embed,
                 "backproject": t_backproject - t_predict,
                 "associate": t_associate - t_backproject,

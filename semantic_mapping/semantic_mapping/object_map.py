@@ -15,7 +15,7 @@ from semantic_mapping.association import DEFAULT_LABEL_MIN_MASS, beliefs_compati
 from semantic_mapping import semantic_fusion as sf
 from semantic_mapping.appearance import cosine_similarity, update_running_embedding
 from semantic_mapping.geometry_utils import (
-    bbox3d_from_points, exceeds_size_limit, invert_se3, iou_3d, project_points,
+    bbox3d_from_points, exceeds_size_limit, invert_se3, iou_3d, pack_voxel_keys, project_points,
 )
 from semantic_mapping.tracking import TrackKalmanState, init_track
 from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus
@@ -28,29 +28,23 @@ _STATUS_RANK = {
 }
 
 
-_VOXEL_KEY_BITS = 21
-_VOXEL_KEY_OFFSET = 1 << (_VOXEL_KEY_BITS - 1)
-"""Voxel coordinates are packed three-per-int64 with 21 bits each, i.e. any
-map within +-2^20 voxels of the origin (+-52 km at 5 cm) takes the fast path."""
-
-
 def voxel_downsample_indices(points: np.ndarray, voxel_size: float) -> np.ndarray:
     """Indices (ascending) of one representative point per occupied voxel.
 
     Returning indices rather than points lets callers subset any per-point
     arrays (log-odds, membership) in lockstep, instead of relying on ordering
-    assumptions. The three voxel coordinates are packed into one int64 so the
-    de-duplication is a 1-D unique: row-wise ``np.unique(axis=0)`` was the
-    single largest cost of the whole pipeline (doc/audit-2026-09.md, P2) and
-    the packed key gives the same result about nine times faster. Coordinates
-    outside the packable range fall back to the row-wise form.
+    assumptions. The three voxel coordinates are packed into one int64
+    (``pack_voxel_keys``) so the de-duplication is a 1-D unique: row-wise
+    ``np.unique(axis=0)`` was the single largest cost of the whole pipeline
+    (doc/audit-2026-09.md, P2) and the packed key gives the same result about
+    nine times faster. Coordinates outside the packable range fall back to the
+    row-wise form.
     """
     if points.shape[0] == 0:
         return np.zeros(0, dtype=np.int64)
     keys = np.floor(points / voxel_size).astype(np.int64)
-    shifted = keys + _VOXEL_KEY_OFFSET
-    if np.all((shifted >= 0) & (shifted < (1 << _VOXEL_KEY_BITS))):
-        packed = (shifted[:, 0] << (2 * _VOXEL_KEY_BITS)) | (shifted[:, 1] << _VOXEL_KEY_BITS) | shifted[:, 2]
+    packed = pack_voxel_keys(keys)
+    if packed is not None:
         _unique_keys, first_indices = np.unique(packed, return_index=True)
     else:
         _unique_keys, first_indices = np.unique(keys, axis=0, return_index=True)

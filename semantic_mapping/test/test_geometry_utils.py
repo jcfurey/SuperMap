@@ -176,6 +176,55 @@ def test_fill_sparse_depth_fills_only_empty_pixels_with_neighbourhood_minimum():
     assert np.array_equal(fill_sparse_depth(dense, 2), dense)
 
 
+def test_fill_sparse_depth_equals_a_square_minimum_filter_over_valid_readings():
+    from scipy.ndimage import minimum_filter
+
+    from semantic_mapping.geometry_utils import fill_sparse_depth
+
+    rng = np.random.default_rng(3)
+    for shape in [(1, 1), (1, 9), (9, 1), (31, 17), (120, 160)]:
+        for density in (0.02, 0.3):
+            for radius in (1, 2, 5):
+                depth = np.where(rng.random(shape) < density, rng.uniform(0.1, 50.0, shape), 0.0)
+                special = rng.random(shape) < 0.05
+                depth[special] = rng.choice([np.nan, np.inf, -np.inf, -1.0], special.sum())
+                valid = np.isfinite(depth) & (depth > 0)
+                expected = minimum_filter(np.where(valid, depth, np.inf), size=2 * radius + 1, mode="nearest")
+                expected = np.where(valid, depth, expected)
+                expected[~np.isfinite(expected)] = 0.0
+                before = depth.copy()
+                actual = fill_sparse_depth(depth, radius)
+                assert actual.dtype == np.float64
+                np.testing.assert_array_equal(actual, expected)
+                np.testing.assert_array_equal(depth, before)  # the input is not modified
+    # No reading at all: nothing to fill from, every pixel stays invalid.
+    np.testing.assert_array_equal(fill_sparse_depth(np.full((4, 4), np.nan), 2), np.zeros((4, 4)))
+
+
+def test_mask_bounds():
+    from semantic_mapping.geometry_utils import mask_bounds
+
+    mask = np.zeros((6, 8), bool)
+    assert mask_bounds(mask) is None
+    mask[2, 3] = mask[4, 6] = True
+    assert mask_bounds(mask) == (2, 5, 3, 7)
+    mask[:] = True
+    assert mask_bounds(mask) == (0, 6, 0, 8)
+
+
+def test_back_projecting_a_crop_at_its_pixel_origin_matches_the_full_image():
+    rng = np.random.default_rng(5)
+    depth = rng.uniform(1.0, 4.0, (120, 160))
+    depth[rng.random(depth.shape) < .3] = 0.0
+    mask = np.zeros(depth.shape, bool)
+    mask[40:90, 30:110] = rng.random((50, 80)) > .2
+    K = np.array([[101.3, 0, 79.37], [0, 99.1, 61.83], [0, 0, 1.]])  # non-integer principal point
+    for kwargs in ({}, {"max_points": 500, "depth_mad_factor": 3.0}):
+        full = back_project_depth(K, depth, mask, **kwargs)
+        crop = back_project_depth(K, depth[35:95, 25:120], mask[35:95, 25:120], pixel_origin=(25, 35), **kwargs)
+        np.testing.assert_array_equal(crop, full)
+
+
 def test_rasterize_depth_keeps_the_nearest_point_per_pixel():
     from semantic_mapping.geometry_utils import rasterize_depth
 
@@ -195,3 +244,15 @@ def test_rasterize_depth_keeps_the_nearest_point_per_pixel():
             expected[v, u] = d
     assert np.array_equal(depth, expected)
     assert rasterize_depth(np.zeros((0, 3)), K, 16, 12).shape == (12, 16)
+
+
+def test_packed_voxel_keys_order_like_the_cells_and_refuse_out_of_range():
+    from semantic_mapping.geometry_utils import pack_voxel_keys
+
+    limit = 1 << 20
+    cells = np.array([[-limit, 5, 0], [-1, -1, -1], [0, 0, 0], [0, 0, 1], [0, 1, -limit], [limit - 1, limit - 1, limit - 1]])
+    keys = pack_voxel_keys(cells)
+    assert keys.dtype == np.int64 and np.all(np.diff(keys) > 0)  # rows above are in lexicographic order
+    assert pack_voxel_keys(np.array([[limit, 0, 0]])) is None
+    assert pack_voxel_keys(np.array([[0, -limit - 1, 0]])) is None
+    assert pack_voxel_keys(np.zeros((0, 3), np.int64)).shape == (0,)

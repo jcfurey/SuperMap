@@ -391,11 +391,11 @@ Every map update records per-stage timings (`FrameResult.timings`), the live nod
 
 | module | mean latency | sustainable rate | paper (onboard, Sec. V-H) |
 |---|---|---|---|
-| 3D mapping (embedding, tracklet prediction, back-projection, association, map update) | 40 ms | 25 Hz | 3 Hz |
-| 4D scene graph construction | 0.3 ms | > 3 kHz | 5 Hz |
+| 3D mapping (depth preparation, embedding, tracklet prediction, back-projection, association, map update) | 33 ms | 30 Hz | 3 Hz |
+| 4D scene graph construction | 0.5 ms | > 1 kHz | 5 Hz |
 | 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
 
-Back-projection (14 ms), the geometric-consistency update over all instance points (12 ms), and the appearance embeddings (11 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 94 MiB process. Latency scales with image resolution and map size, so measure your own sequence:
+Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 49 ms per frame, or 108 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage. Latency scales with image resolution and map size, so measure your own sequence:
 
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
