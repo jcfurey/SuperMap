@@ -48,7 +48,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from semantic_mapping.geometry_utils import rasterize_depth, rotation_matrix_to_quaternion, transform_points  # noqa: E402
+from semantic_mapping.geometry_utils import (  # noqa: E402
+    occlusion_grid_for, rasterize_depth, rotation_matrix_to_quaternion, transform_points,
+)
 from semantic_mapping.ros_msgs import (  # noqa: E402
     camera_info_has_distortion, camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy,
     pointcloud_to_xyz, stamp_to_seconds, transform_to_se3,
@@ -201,6 +203,12 @@ def main() -> None:
     parser.add_argument("--rectified", action="store_true",
                         help="The RGB topic is rectified (image_rect*): use CameraInfo P and ignore D.")
     parser.add_argument("--sync_slop", type=float, default=0.05, help="Max RGB / depth-source stamp gap in seconds.")
+    parser.add_argument("--splat_radius", type=float, default=0.05,
+                        help="Occlusion-aware cloud rasterization as in the live node "
+                             "(pointcloud_splat_radius_m); 0 keeps a one-pixel z-buffer.")
+    parser.add_argument("--splat_max_px", type=int, default=8, help="Cap on a point's occlusion footprint (px).")
+    parser.add_argument("--occlusion_gap", type=float, default=0.3, help="A footprint this far in front hides a point (m).")
+    parser.add_argument("--occlusion_grid_px", type=int, default=0, help="Occlusion cell size (px); 0 = auto.")
     parser.add_argument("--frame_skip", type=int, default=1, help="Keep every N-th RGB frame.")
     parser.add_argument("--max_frames", type=int, default=None)
     parser.add_argument("--start", type=float, default=None, help="Skip frames before this bag-relative time (s).")
@@ -281,7 +289,11 @@ def main() -> None:
                 T_cam_from_cloud = lookup_se3_full(buffer, args.camera_frame, rgb_stamp, source_frame,
                                                    source_stamp, args.world_frame)
                 points_cam = transform_points(T_cam_from_cloud, depth_source)
-                depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
+                depth = rasterize_depth(
+                    points_cam, intrinsics.K, intrinsics.width, intrinsics.height,
+                    splat_radius_m=args.splat_radius, splat_max_px=args.splat_max_px,
+                    occlusion_gap_m=args.occlusion_gap,
+                    occlusion_grid_px=args.occlusion_grid_px or occlusion_grid_for(intrinsics.width, intrinsics.height))
         except Exception as exc:  # tf2 lookup / extrapolation errors
             skipped["no_transform"] += 1
             if skipped["no_transform"] <= 3:

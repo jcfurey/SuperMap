@@ -115,7 +115,7 @@ def test_overlapping_classes_and_conflicting_labels_in_one_voxel_are_not_fused()
 
 def test_distinct_mask_pixels_with_conflicting_classes_in_one_voxel_remain_unknown():
     pipeline = make_pipeline()
-    pipeline.update(np.array([[0., 0., 2.], [.005, 0., 2.]]), 1.)
+    pipeline.update(np.array([[0., 0., 2.], [.004, 0., 2.]]), 1.)  # pixels 5 and 7, one voxel
     observation = camera()
     observation.intrinsics.fx = 1000.
     first, second = np.zeros((10, 10), bool), np.zeros((10, 10), bool)

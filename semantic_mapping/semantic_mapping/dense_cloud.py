@@ -14,6 +14,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
+from semantic_mapping.geometry_utils import GROUND_SURFACE_LABELS, fit_ground_plane, splat_depth_buffer
 from semantic_mapping.types import CameraIntrinsics, Detection2D
 
 UNKNOWN, DIRECT, PROPAGATED = 0, 1, 2
@@ -51,6 +52,19 @@ class DenseCloudConfig:
     mask_depth_gap: float = 1.0
     mask_depth_gap_ratio: float = 0.25
     mask_min_layer_points: int = 3
+    # A mask bleeds onto the ground at an object's base, and a spinning
+    # LiDAR's ground rings there are nearer than the object: without this the
+    # label lands on the ring in front of the object and slides along with the
+    # sensor. Visible points less than ground_clearance above the local ground
+    # (world z up, fitted around the mask) do not take a mask's label when at
+    # least mask_min_layer_points of its points stand above it. Masks of
+    # ground_surface_labels, masks with no fitted ground below the camera and
+    # masks lying flat on the ground keep their ground points.
+    ground_exclusion: bool = True
+    ground_clearance: float = 0.15
+    ground_max_slope: float = 0.25
+    ground_context_px: int = 20
+    ground_surface_labels: list = field(default_factory=lambda: list(GROUND_SURFACE_LABELS))
     # Bound on distinct semantic labels in one map (untrusted annotations, C28).
     max_labels: int = 1024
     # Re-segment only voxels near changed geometry (P2); falls back to a full
@@ -58,13 +72,13 @@ class DenseCloudConfig:
     incremental_segmentation: bool = True
 
     def __post_init__(self):
-        for name in ("allow_yoloe_labels", "incremental_segmentation"):
+        for name in ("allow_yoloe_labels", "incremental_segmentation", "ground_exclusion"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if self.input_mode not in {"snapshot", "scan"}:
             raise ValueError("input_mode must be snapshot or scan")
         for name in ("voxel_size", "neighbor_radius", "normal_radius", "plane_tolerance",
-                     "camera_depth_tolerance"):
+                     "camera_depth_tolerance", "ground_clearance", "ground_max_slope"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         for name in ("max_camera_time_delta", "label_propagation_radius", "label_ttl_sec",
@@ -77,6 +91,12 @@ class DenseCloudConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.ground_context_px, int) or isinstance(self.ground_context_px, bool) \
+                or self.ground_context_px < 0:
+            raise ValueError("ground_context_px must be a nonnegative integer")
+        if isinstance(self.ground_surface_labels, str) or not all(
+                isinstance(label, str) for label in self.ground_surface_labels):
+            raise ValueError("ground_surface_labels must be a list of strings")
         if self.max_neighbors < 3:
             raise ValueError("max_neighbors must be at least 3")
         if not math.isfinite(self.normal_angle_deg) or not 0 < self.normal_angle_deg < 90:
@@ -313,26 +333,6 @@ def segment_surfaces(points: np.ndarray, config: DenseCloudConfig) -> np.ndarray
     return _surface_components(n, graph.rows, graph.cols, config)
 
 
-def _splat_depth_buffer(u, v, z, focal, width, height, config):
-    """Per-pixel nearest depth where each point covers a disc of camera_splat_radius metres."""
-    buffer = np.full(width*height, np.inf)
-    if config.camera_splat_radius <= 0 or not len(z):
-        return buffer
-    radius = np.minimum(np.floor(focal*config.camera_splat_radius/z+0.5),
-                        config.camera_max_splat_pixels).astype(np.int64)
-    for r in range(int(radius.max())+1):
-        # Points whose footprint reaches Chebyshev ring r write that ring.
-        sel = np.flatnonzero(radius >= r)
-        if not len(sel):
-            break
-        offsets = [(dx, dy) for dx in range(-r, r+1) for dy in range(-r, r+1) if max(abs(dx), abs(dy)) == r]
-        for dx, dy in offsets:
-            uu, vv = u[sel]+dx, v[sel]+dy
-            inside = (uu >= 0) & (uu < width) & (vv >= 0) & (vv < height)
-            np.minimum.at(buffer, vv[inside]*width+uu[inside], z[sel][inside])
-    return buffer
-
-
 def foreground_layer(depths: np.ndarray, config: DenseCloudConfig) -> np.ndarray:
     """Mask of the nearest well-supported depth layer among one mask's points.
 
@@ -353,6 +353,30 @@ def foreground_layer(depths: np.ndarray, config: DenseCloudConfig) -> np.ndarray
     chosen = supported[0] if len(supported) else 0
     keep[order] = layer == chosen
     return keep
+
+
+def ground_points(world: np.ndarray, u: np.ndarray, v: np.ndarray, mask: np.ndarray, camera_center: np.ndarray,
+                  config: DenseCloudConfig) -> np.ndarray | None:
+    """Which of the points inside ``mask`` lie on the local ground, or None without one.
+
+    ``world``/``u``/``v`` are the camera-visible points and their pixels. The
+    ground is fitted (fit_ground_plane, world z up) to those in the mask's box
+    grown by ``ground_context_px``, i.e. including the ground in front of and
+    beside the object. A level fallback, or a "ground" that is not below the
+    camera (a world frame that is not z up), is not a ground: None.
+    """
+    rows, cols = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+    if not len(rows):
+        return None
+    m = config.ground_context_px
+    context = (u >= cols[0]-m) & (u <= cols[-1]+m) & (v >= rows[0]-m) & (v <= rows[-1]+m)
+    plane, fitted = fit_ground_plane(world[context], config.ground_clearance, config.ground_max_slope,
+                                     return_fitted=True)
+    if not fitted or camera_center[2] <= camera_center[:2] @ plane[:2] + plane[2] + config.ground_clearance:
+        return None
+    inside = mask[v, u]
+    height = world[inside, 2]-world[inside, :2] @ plane[:2]-plane[2]
+    return height < config.ground_clearance
 
 
 class DenseCloudPipeline:
@@ -481,18 +505,22 @@ class DenseCloudPipeline:
         valid, cam = valid[front], cam[front]
         intr = camera.intrinsics
         with np.errstate(over="ignore", invalid="ignore"):
-            u = intr.fx*cam[:, 0]/cam[:, 2]+intr.cx
-            v = intr.fy*cam[:, 1]/cam[:, 2]+intr.cy
+            u = np.round(intr.fx*cam[:, 0]/cam[:, 2]+intr.cx)
+            v = np.round(intr.fy*cam[:, 1]/cam[:, 2]+intr.cy)
+        # Pixel centres are integer coordinates (as for CameraInfo K/P and the
+        # object pipeline): round, not floor, which shifted every label half a
+        # pixel down and right, onto the ground below an object's base.
         inside = (u >= 0) & (u < intr.width) & (v >= 0) & (v < intr.height)
         valid, cam = valid[inside], cam[inside]
-        u, v = np.floor(u[inside]).astype(np.int64), np.floor(v[inside]).astype(np.int64)
+        u, v = u[inside].astype(np.int64), v[inside].astype(np.int64)
         pixel = v*intr.width+u
         depth_buffer = np.full(intr.width*intr.height, np.inf)
         np.minimum.at(depth_buffer, pixel, cam[:, 2])
         visible = cam[:, 2] <= depth_buffer[pixel]+self.config.camera_depth_tolerance
         # Sparse LiDAR leaves holes between foreground returns; a footprint
         # z-buffer keeps background points behind them from looking visible.
-        splat = _splat_depth_buffer(u, v, cam[:, 2], max(intr.fx, intr.fy), intr.width, intr.height, self.config)
+        splat = splat_depth_buffer(u, v, cam[:, 2], max(intr.fx, intr.fy), intr.width, intr.height,
+                                   self.config.camera_splat_radius, self.config.camera_max_splat_pixels)
         visible &= cam[:, 2] <= splat[pixel]+max(self.config.camera_depth_tolerance,
                                                  self.config.camera_splat_occlusion_gap)
         if camera.depth is not None:
@@ -519,6 +547,12 @@ class DenseCloudPipeline:
                 label_lookup[detection.label] = label
             selected = detection.mask[v, u]
             inside = np.flatnonzero(selected)
+            if len(inside) and self.config.ground_exclusion \
+                    and detection.label not in self.config.ground_surface_labels:
+                ground = ground_points(self._input[valid], u, v, detection.mask, transform[:3, 3], self.config)
+                if ground is not None and np.count_nonzero(~ground) >= self.config.mask_min_layer_points:
+                    selected[inside[ground]] = False
+                    inside = inside[~ground]
             if len(inside):
                 # Only the mask's foreground depth layer is the object.
                 selected[inside[~foreground_layer(depth[inside], self.config)]] = False

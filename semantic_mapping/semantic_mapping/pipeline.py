@@ -20,6 +20,7 @@ import numpy as np
 from semantic_mapping import association, persistence, scene_graph as sg, tracking
 from semantic_mapping.appearance import build_embedder
 from semantic_mapping.geometry_utils import (
+    GROUND_SURFACE_LABELS,
     back_project_depth,
     bbox3d_from_points,
     clip_bbox_to_image,
@@ -33,6 +34,10 @@ from semantic_mapping.geometry_utils import (
 from semantic_mapping.object_map import ObjectMap
 from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus, Observation
 
+
+GROUND_FIT_MAX_SAMPLES = 2048
+"""Readings a local ground fit uses at most (evenly strided), so dense depth
+images cost no more per detection than a sparse LiDAR raster."""
 
 LOADED_MAP_EPOCH_GAP_SEC = 1e-3
 """After a clock-epoch rebase, how long before the first new observation the
@@ -63,10 +68,22 @@ class PipelineConfig:
     """Of foreground_depth_labels, those that keep the supported layer with the
     most real returns instead of the nearest (which is often the ground strip
     in front of the object). Empty = nearest for all."""
+    ground_exclusion: bool = True
+    """Drop an instance mask's readings on the local ground before layer
+    selection and back-projection when at least ``ground_exclusion_min_returns``
+    of them stand above it, for every class but ``ground_surface_labels``.
+    A mask bleeds onto the ground at an object's base, and with a LiDAR the
+    ground rings there are nearer than the object: they were taken as its
+    depth, so boxes sat on the ring in front of the object and slid along
+    with the sensor. Masks with no ground fitted below the camera (e.g. a
+    world frame that is not z up) or lying flat on it keep every reading."""
+    ground_exclusion_min_returns: int = 3
+    ground_surface_labels: list[str] = field(default_factory=lambda: list(GROUND_SURFACE_LABELS))
     ground_removal_labels: list[str] = field(default_factory=list)
     """Drop masked depth samples on the local ground surface before layer
     selection and back-projection (world z up; geometry_utils.fit_ground_plane
-    over the real returns in and around the mask). Empty disables it."""
+    over the real returns in and around the mask), unconditionally (unlike
+    ``ground_exclusion``: even when nothing is left). Empty disables it."""
     ground_clearance_m: float = 0.15
     """Samples less than this above the fitted ground are dropped; the rest of an object on the ground is kept."""
     ground_context_px: int = 20
@@ -227,7 +244,7 @@ class PipelineConfig:
         if not np.isfinite(self.foreground_depth_max_extent_m) or self.foreground_depth_max_extent_m < 0:
             raise ValueError("foreground_depth_max_extent_m must be finite and nonnegative")
         for name in ('foreground_depth_largest_labels', 'ground_removal_labels', 'class_size_limits',
-                     'mask_completion_labels', 'ground_contact_depth_labels'):
+                     'mask_completion_labels', 'ground_contact_depth_labels', 'ground_surface_labels'):
             if isinstance(getattr(self, name), str) or not all(isinstance(v, str) for v in getattr(self, name)):
                 raise ValueError(f"{name} must be a list of strings")
         for name in ('ground_clearance_m', 'ground_max_slope'):
@@ -251,7 +268,7 @@ class PipelineConfig:
         # accepted and crash mid-frame after the map had already changed.
         for name in ('min_points_for_3d_association', 'max_points_per_object', 'max_points_per_detection',
                      'min_hits_to_confirm', 'prune_min_contradictions', 'max_retired_instances', 'bbox_min_support',
-                     'mask_completion_min_returns', 'mask_completion_stride_px'):
+                     'mask_completion_min_returns', 'mask_completion_stride_px', 'ground_exclusion_min_returns'):
             value = getattr(self, name)
             if int(value) != value or value < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
@@ -408,7 +425,7 @@ class SemanticMappingPipeline:
 
     def _remove_ground(
         self, depth: np.ndarray, mask: np.ndarray, K: np.ndarray, T_world_from_cam: np.ndarray,
-        remove: bool = True,
+        remove: bool = True, min_off_ground: int = 0,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """``depth`` without the masked readings that lie on the local ground,
         and the ground plane if it was fitted (None for the level fallback).
@@ -417,7 +434,9 @@ class SemanticMappingPipeline:
         mask's box grown by ``ground_context_px``, i.e. including the ground
         in front of and beside the object; readings inside the mask less than
         ``ground_clearance_m`` above it (or below it) become invalid, unless
-        ``remove`` is False (plane only).
+        ``remove`` is False (plane only). ``min_off_ground > 0`` removes them
+        only from a fitted ground below the camera, and only when at least
+        that many masked readings stand above it (ground_exclusion).
         """
         cfg = self.config
         ys, xs = np.nonzero(mask)
@@ -432,12 +451,25 @@ class SemanticMappingPipeline:
         vs, us = np.nonzero(valid)
         if vs.size == 0:
             return depth, None
-        z = crop[vs, us].astype(np.float64)
-        cam = np.stack(((us + x1 - K[0, 2]) * z / K[0, 0], (vs + y1 - K[1, 2]) * z / K[1, 1], z), axis=1)
-        world = transform_points(T_world_from_cam, cam)
-        plane, fitted = fit_ground_plane(world, cfg.ground_clearance_m, cfg.ground_max_slope, return_fitted=True)
+
+        def world_of(rows, cols):
+            z = crop[rows, cols].astype(np.float64)
+            cam = np.stack(((cols + x1 - K[0, 2]) * z / K[0, 0], (rows + y1 - K[1, 2]) * z / K[1, 1], z), axis=1)
+            return transform_points(T_world_from_cam, cam)
+
+        sample = slice(None)
+        if vs.size > GROUND_FIT_MAX_SAMPLES:
+            sample = np.linspace(0, vs.size - 1, GROUND_FIT_MAX_SAMPLES).astype(np.int64)
+        plane, fitted = fit_ground_plane(world_of(vs[sample], us[sample]), cfg.ground_clearance_m,
+                                         cfg.ground_max_slope, return_fitted=True)
+        masked = mask[vs + y1, us + x1]
+        vs, us = vs[masked], us[masked]
+        world = world_of(vs, us)
         ground = world[:, 2] - world[:, :2] @ plane[:2] - plane[2] < cfg.ground_clearance_m
-        ground &= mask[vs + y1, us + x1]
+        if min_off_ground > 0:
+            center = T_world_from_cam[:3, 3]
+            below_camera = fitted and center[2] > center[:2] @ plane[:2] + plane[2] + cfg.ground_clearance_m
+            remove = remove and below_camera and np.count_nonzero(~ground) >= min_off_ground
         if not remove or not ground.any():
             return depth, plane if fitted else None
         filtered = np.array(depth, dtype=np.float64, copy=True)
@@ -509,8 +541,12 @@ class SemanticMappingPipeline:
         plane = None
         remove = detection.label in cfg.ground_removal_labels
         contact = has_instance_mask and detection.label in cfg.ground_contact_depth_labels
-        if remove or contact:
-            depth, plane = self._remove_ground(depth, mask, K, T_world_from_cam, remove=remove)
+        exclude = (cfg.ground_exclusion and has_instance_mask and not remove
+                   and detection.label not in cfg.ground_surface_labels)
+        if remove or contact or exclude:
+            depth, plane = self._remove_ground(
+                depth, mask, K, T_world_from_cam, remove=remove or exclude,
+                min_off_ground=cfg.ground_exclusion_min_returns if exclude else 0)
         if cfg.foreground_depth_gap_m > 0 and detection.label in cfg.foreground_depth_labels:
             # Count real returns, not pixels synthesized by sparse filling.
             pixels = min_span = None

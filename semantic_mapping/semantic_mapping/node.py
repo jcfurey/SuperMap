@@ -71,7 +71,7 @@ from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithP
 from visualization_msgs.msg import Marker, MarkerArray
 
 from semantic_mapping.detectors import build_detector
-from semantic_mapping.geometry_utils import invert_se3, rasterize_depth, transform_points
+from semantic_mapping.geometry_utils import invert_se3, occlusion_grid_for, rasterize_depth, transform_points
 from semantic_mapping.pipeline import FrameResult, PipelineConfig, SemanticMappingPipeline
 from semantic_mapping.ros_msgs import (
     camera_info_has_distortion, camera_info_to_intrinsics, depth_image_to_meters, image_to_numpy, numpy_to_image,
@@ -383,6 +383,16 @@ class SemanticMappingNode(AutostartLifecycleNode):
         d("depth_scale", 1000.0, "Units per metre of 16-bit depth images.")
         d("pointcloud_accumulate_scans", 1, "Rasterize the last N scans (via TF) for sparse LiDAR.",
           range=(1, 100))
+        d("pointcloud_splat_radius_m", 0.05,
+          "Occlusion-aware point-cloud depth: each point hides the points behind it within a disc of this "
+          "radius (m). A one-pixel z-buffer lets background show through a sparse foreground. 0 disables.",
+          range=(0.0, 10.0))
+        d("pointcloud_splat_max_px", 8, "Cap on a point's occlusion footprint radius (px).", range=(1, 64))
+        d("pointcloud_occlusion_gap_m", 0.3, "A footprint this far in front of a point hides it (m).",
+          range=(0.0, 100.0))
+        d("pointcloud_occlusion_grid_px", 0,
+          "Decide occlusion on cells of this many pixels (bounds the cost at high resolution); "
+          "0 = auto (the longer image side / 640).", range=(0, 64))
         d("rgb_compressed", False, "rgb_topic carries sensor_msgs/CompressedImage.")
         d("sensor_qos", "best_effort", "best_effort | reliable | sensor_data.")
         d("sensor_qos_depth", 10, "History depth of sensor subscriptions.", range=(1, 1000))
@@ -601,6 +611,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self._scan_history = _ScanRing(int(self._param("pointcloud_accumulate_scans")))
+        self._splat_radius_m = float(self._param("pointcloud_splat_radius_m"))
+        self._splat_max_px = int(self._param("pointcloud_splat_max_px"))
+        self._occlusion_gap_m = float(self._param("pointcloud_occlusion_gap_m"))
+        self._occlusion_grid_px = int(self._param("pointcloud_occlusion_grid_px"))
         self._next_frame_id = 0
         self._pending_frames: deque[_PendingFrame] = deque()
         self._pending_by_id: dict[int, _PendingFrame] = {}
@@ -1454,7 +1468,11 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 points_cam = transform_points(T_cam_from_world, self._scan_history.points())
             else:
                 points_cam = transform_points(T_cam_from_world @ T_world_from_cloud, points_cloud_frame)
-            depth = rasterize_depth(points_cam, intrinsics.K, intrinsics.width, intrinsics.height)
+            depth = rasterize_depth(
+                points_cam, intrinsics.K, intrinsics.width, intrinsics.height,
+                splat_radius_m=self._splat_radius_m, splat_max_px=self._splat_max_px,
+                occlusion_gap_m=self._occlusion_gap_m,
+                occlusion_grid_px=self._occlusion_grid_px or occlusion_grid_for(intrinsics.width, intrinsics.height))
 
         observation = Observation(
             stamp=stamp,
