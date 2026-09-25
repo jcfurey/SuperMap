@@ -102,16 +102,18 @@ def test_ground_removal_keeps_the_object_not_the_ground_strip_in_front(slope):
     hi[2] += slope * 10.0
     depth, hit = _render([(lo, hi)], slope=slope)
     detection = _bag_detection(hit)
-    # The nearest supported layer is a ground ring in front of the bag: a flat slab.
-    slab = _lift(PipelineConfig(**FOREGROUND), detection, depth)
+    # Without ground handling the nearest supported layer is a ground ring in front of the bag: a flat slab.
+    slab = _lift(PipelineConfig(**FOREGROUND, ground_exclusion=False), detection, depth)
     assert len(slab) and np.ptp(slab[:, 2]) < 0.2 and slab[:, 0].max() < 10.0
-    points = _lift(PipelineConfig(**FOREGROUND, ground_removal_labels=['bulk bag']), detection, depth)
-    assert len(points)
-    assert points[:, 0].min() >= 10.0 - 1e-6 and points[:, 0].max() <= 11.0 + 1e-6
-    assert points[:, 2].min() >= lo[2] + 0.1 and points[:, 2].max() > hi[2] - 0.35  # rings every ~0.4 m
-    # Scoped by label; other classes are untouched.
-    other = _lift(PipelineConfig(ground_removal_labels=['person']), detection, depth)
-    np.testing.assert_array_equal(other, _lift(PipelineConfig(), detection, depth))
+    for config in (PipelineConfig(**FOREGROUND, ground_exclusion=False, ground_removal_labels=['bulk bag']),
+                   PipelineConfig(**FOREGROUND)):  # the default ground exclusion
+        points = _lift(config, detection, depth)
+        assert len(points)
+        assert points[:, 0].min() >= 10.0 - 1e-6 and points[:, 0].max() <= 11.0 + 1e-6
+        assert points[:, 2].min() >= lo[2] + 0.1 and points[:, 2].max() > hi[2] - 0.35  # rings every ~0.4 m
+    # Unconditional removal is scoped by label; other classes are untouched.
+    other = _lift(PipelineConfig(ground_exclusion=False, ground_removal_labels=['person']), detection, depth)
+    np.testing.assert_array_equal(other, _lift(PipelineConfig(ground_exclusion=False), detection, depth))
 
 
 def test_ground_removal_does_not_modify_the_frame_depth():

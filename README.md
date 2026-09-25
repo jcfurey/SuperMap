@@ -293,11 +293,38 @@ A LiDAR scan rasterized into the camera covers a few percent of the pixels, and 
 | 5% sparse, no fill | 0.96 | 0.96 | 1 / 2 | 17 / 11 | 0.73 |
 | 5% sparse, `depth_fill_radius_px: 2` | 0.96 | 0.96 | 2 / 2 | 13 / 11 | 0.89 |
 
+Two defaults keep a mask's depth on the object when the depth comes from a LiDAR
+mounted apart from the camera ([analysis](doc/lidar-camera-range-2026-09-25.md)):
+
+- **Occlusion-aware rasterization** (`pointcloud_splat_radius_m: 0.05`). A
+  one-pixel z-buffer let the background show between sparse foreground returns,
+  and let the camera "see" surfaces only the offset LiDAR reaches. Each point now
+  hides the points more than `pointcloud_occlusion_gap_m` behind it within a disc
+  of that radius, as the dense labeller already did. Hidden points carry no reading,
+  so they are neither lifted into a mask nor taken as free space in front of a
+  mapped object. Densely sampled surfaces (a depth camera's cloud) are exempt,
+  since the one-pixel z-buffer is already exact there. `pointcloud_occlusion_grid_px` (0 = auto) bounds the cost at high
+  resolution: 15–22 ms added per frame from VGA to 5 MP in the analysis rig. A coarse LiDAR at long range may need a
+  larger radius; 0 restores the one-pixel z-buffer.
+- **Ground exclusion** (`ground_exclusion: true`). A mask bleeds a few pixels
+  onto the ground at an object's base, and a spinning LiDAR's ground rings there
+  are nearer than the object. Taken as its depth, the ring put the box on the
+  ground in front of the object, at the start of the gap between rings, and
+  since rings sit at fixed ranges from the sensor the box slid along with the
+  vehicle. Masked readings less than `ground_clearance_m` above the local ground
+  (fitted in world z around the mask) are now dropped when at least
+  `ground_exclusion_min_returns` readings stand above it. `ground_surface_labels`
+  (floor, road, rug, ...), objects lying flat on the ground, and masks with no
+  ground fitted below the camera (a world frame that is not z up) keep every
+  reading. It costs about 1 ms per masked detection on dense depth. Objects lose
+  their lowest `ground_clearance_m`: on the synthetic scene mIoU (without
+  background) is 0.987 instead of 1.000, while final-map F1 rises from 0.89 to 0.94.
+
 ### Outdoor objects on sparse LiDAR
 
-With a LiDAR projected into a camera, instance masks of compact outdoor objects (barriers, bulk bags, containers) contain the ground strip in front of the object and background behind it, and most mask pixels never get a return, so the evidence-based pruning rarely removes either. Six opt-in settings (all off by default) keep such boxes object-sized:
+With a LiDAR projected into a camera, instance masks of compact outdoor objects (barriers, bulk bags, containers) contain the ground strip in front of the object and background behind it, and most mask pixels never get a return, so the evidence-based pruning rarely removes either. Occlusion-aware rasterization and ground exclusion (above, on by default) remove most of both. Six opt-in settings (all off by default) keep such boxes object-sized:
 
-- `ground_removal_labels`: for these classes, the local ground is fitted as a plane in the world frame (z up; the lowest return per 0.5 m cell in and `ground_context_px` around the mask, anchored low and limited to `ground_max_slope`), and masked returns less than `ground_clearance_m` above it are dropped before layer selection. An object standing on the ground loses only that thin band.
+- `ground_removal_labels`: for these classes, the local ground is fitted as a plane in the world frame (z up; the lowest return per 0.5 m cell in and `ground_context_px` around the mask, anchored low and limited to `ground_max_slope`), and masked returns less than `ground_clearance_m` above it are dropped before layer selection, even when nothing is left (unlike `ground_exclusion`), so `ground_contact_depth_labels` can take over. An object standing on the ground loses only that thin band.
 - `foreground_depth_largest_labels`: of `foreground_depth_labels`, the classes that keep the supported depth layer with the most real returns rather than the nearest one (the nearest is often a ground ring). `person` tuning keeps the nearest layer.
 - `bbox_min_support` > 1: each mapped point counts the frames whose lifted detection points came within `bbox_support_radius_m` of it (shared voxels keep the better count on merges); once a static instance has that many hits, its reported box (published and used for association and merging) spans only points with that support, so an early outlier drops out of the box when later frames do not re-observe it. The points themselves are kept.
 - `bbox_support_miss` > 0 makes that support two-sided, so boxes trim as well as grow. A matched frame that looked at a mapped point (it projects inside the image, in front of the camera, with no nearer depth reading on its pixel) and did not re-hit it takes `bbox_support_miss` off its support; points that fall to `bbox_support_cull_at` are removed. Occluded points and points outside a truncated view keep their support. New regions join the box once re-hit `bbox_min_support` times, and `bbox_support_max` caps support so a long-established wrong region can still decay.

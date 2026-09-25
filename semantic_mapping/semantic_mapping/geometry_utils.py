@@ -178,12 +178,98 @@ def back_project_depth(
     return np.stack([x, y, z], axis=1)
 
 
-def rasterize_depth(points_cam: Array, K: Array, width: int, height: int) -> Array:
+def splat_depth_buffer(us: Array, vs: Array, z: Array, focal: float, width: int, height: int,
+                       radius_m: float, max_px: int) -> Array:
+    """Flat per-pixel nearest depth where each point covers a square footprint.
+
+    A point at depth ``z`` covers the pixels within ``round(focal * radius_m / z)``
+    (at most ``max_px``) of its own, i.e. a disc of ``radius_m`` metres on its
+    surface. ``us``/``vs`` are integer pixel indices inside the image. Unset
+    pixels hold +inf; ``radius_m <= 0`` returns all +inf.
+    """
+    buffer = np.full(width * height, np.inf)
+    if radius_m <= 0 or not len(z):
+        return buffer
+    radius = np.minimum(np.floor(focal * radius_m / z + 0.5), max_px).astype(np.int64)
+    for r in range(int(radius.max()) + 1):
+        # Points whose footprint reaches Chebyshev ring r write that ring.
+        sel = np.flatnonzero(radius >= r)
+        if not len(sel):
+            break
+        offsets = [(dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1) if max(abs(dx), abs(dy)) == r]
+        for dx, dy in offsets:
+            uu, vv = us[sel] + dx, vs[sel] + dy
+            inside = (uu >= 0) & (uu < width) & (vv >= 0) & (vv < height)
+            np.minimum.at(buffer, vv[inside] * width + uu[inside], z[sel][inside])
+    return buffer
+
+
+def occlusion_visible(us: Array, vs: Array, z: Array, focal: float, width: int, height: int, *,
+                      radius_m: float, max_px: int = 8, gap_m: float = 0.3, grid_px: int = 1,
+                      keep_dense_surfaces: bool = False) -> Array:
+    """Which projected points no nearer point's footprint hides from the camera.
+
+    A sparse cloud leaves holes between the returns of a foreground surface,
+    and a one-pixel z-buffer lets the background behind it show through them
+    (from a LiDAR mounted apart from the camera, also returns the camera
+    cannot see at all). A point is hidden when the footprint of another point
+    (:func:`splat_depth_buffer`) covers its pixel more than ``gap_m`` in front
+    of it. ``grid_px > 1`` decides this on cells of that many pixels, which
+    bounds the cost for high-resolution cameras; a LiDAR's angular spacing is
+    coarser than such cells anyway. ``radius_m <= 0`` keeps every point.
+
+    ``keep_dense_surfaces`` keeps a point whose own surface is sampled densely
+    around it: a reading within ``gap_m`` of its depth on an adjacent pixel
+    both vertically and horizontally. There the one-pixel z-buffer is already
+    exact, and footprints would only hide genuine background beside a nearer
+    silhouette (a dense depth-camera cloud lost about a tenth of its readings).
+    A spinning LiDAR's rings lie several pixels apart, so its returns never
+    qualify. Accumulated clouds can: do not use it for map snapshots.
+    """
+    visible = np.ones(len(z), dtype=bool)
+    if radius_m <= 0 or not len(z):
+        return visible
+    dense = np.zeros(len(z), dtype=bool)
+    if keep_dense_surfaces:
+        nearest = np.full(width * height, np.inf)
+        np.minimum.at(nearest, vs * width + us, z)
+
+        def neighbour(du: int, dv: int) -> Array:
+            uu, vv = us + du, vs + dv
+            inside = (uu >= 0) & (uu < width) & (vv >= 0) & (vv < height)
+            found = np.zeros(len(z), dtype=bool)
+            found[inside] = np.abs(nearest[vv[inside] * width + uu[inside]] - z[inside]) <= gap_m
+            return found
+
+        dense = (neighbour(-1, 0) | neighbour(1, 0)) & (neighbour(0, -1) | neighbour(0, 1))
+    grid = max(int(grid_px), 1)
+    if grid > 1:
+        us, vs = us // grid, vs // grid
+        width, height = -(-width // grid), -(-height // grid)
+        focal, max_px = focal / grid, max(-(-int(max_px) // grid), 1)
+    buffer = splat_depth_buffer(us, vs, z, focal, width, height, radius_m, max_px)
+    return dense | (z <= buffer[vs * width + us] + gap_m)
+
+
+def occlusion_grid_for(width: int, height: int, cells_long_side: int = 640) -> int:
+    """Occlusion grid (px) for :func:`occlusion_visible` that keeps about
+    ``cells_long_side`` cells along the longer image side: exact up to VGA,
+    and 15-22 ms added per frame from VGA to 5 MP. The cells stay finer than a
+    LiDAR's angular spacing; coarser cells only hide more of a grazing
+    surface's farther returns (e.g. ground rings), never a nearer surface."""
+    return max(1, int(np.ceil(max(width, height) / cells_long_side)))
+
+
+def rasterize_depth(points_cam: Array, K: Array, width: int, height: int, *, splat_radius_m: float = 0.0,
+                    splat_max_px: int = 8, occlusion_gap_m: float = 0.3, occlusion_grid_px: int = 1) -> Array:
     """Z-buffer rasterization of camera-frame points into a dense depth image.
 
     Used in live mode to turn the synchronized LiDAR point cloud into the
     per-pixel raw sensor depth D(u) needed by the geometric-consistency
-    update (Eq. 7-9).
+    update (Eq. 7-9). With ``splat_radius_m > 0``, points hidden behind a
+    nearer point's footprint are dropped first (:func:`occlusion_visible`,
+    keeping densely sampled surfaces); the image still holds only real
+    readings, one per pixel.
     """
     depth = np.zeros((height, width), dtype=np.float64)
     if points_cam.shape[0] == 0:
@@ -202,6 +288,11 @@ def rasterize_depth(points_cam: Array, K: Array, width: int, height: int) -> Arr
     vs = np.round(pixels[:, 1]).astype(np.int64)
     in_frame = (us >= 0) & (us < width) & (vs >= 0) & (vs < height)
     us, vs, z = us[in_frame], vs[in_frame], z[in_frame]
+    if splat_radius_m > 0:
+        visible = occlusion_visible(us, vs, z, max(K[0, 0], K[1, 1]), width, height, radius_m=splat_radius_m,
+                                    max_px=splat_max_px, gap_m=occlusion_gap_m, grid_px=occlusion_grid_px,
+                                    keep_dense_surfaces=True)
+        us, vs, z = us[visible], vs[visible], z[visible]
 
     # Per-pixel minimum through an unbuffered scatter: no sort, so a LiDAR
     # scan of a few hundred thousand points rasterizes in half the time of a
@@ -306,6 +397,10 @@ def foreground_depth_mask(
     return keep
 
 
+GROUND_SURFACE_LABELS = ("floor", "ground", "road", "sidewalk", "pavement", "grass", "terrain", "carpet", "rug", "mat")
+"""Classes that are the ground: their masks keep the returns on it."""
+
+
 def fit_ground_plane(
     points: Array, tolerance_m: float = 0.15, max_slope: float = 0.25, cell_m: float = 0.5,
     iterations: int = 3, return_fitted: bool = False,
@@ -329,8 +424,11 @@ def fit_ground_plane(
     points = points[np.all(np.isfinite(points), axis=1)]
     if points.shape[0] == 0:
         return (None, False) if return_fitted else None
-    _, cell = np.unique(np.floor(points[:, :2] / cell_m).astype(np.int64), axis=0, return_inverse=True)
-    cell = cell.ravel()
+    # One int64 key per XY cell, ordered like the (x, y) cells themselves: a
+    # row-wise np.unique here cost more than the rest of a detection's lifting.
+    cells = np.floor(points[:, :2] / cell_m).astype(np.int64)
+    cells -= cells.min(axis=0)
+    cell = cells[:, 0] * (int(cells[:, 1].max()) + 1) + cells[:, 1]
     order = np.lexsort((points[:, 2], cell))
     first = np.ones(order.size, dtype=bool)
     first[1:] = cell[order][1:] != cell[order][:-1]
