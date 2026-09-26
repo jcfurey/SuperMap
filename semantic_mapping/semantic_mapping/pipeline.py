@@ -201,6 +201,17 @@ class PipelineConfig:
     min_points_for_3d_association: int = 5
     merge_iou_threshold: float = 0.3
     merge_distance_m: float = 0.25
+    merge_alternating_min_overlap: float = 0.5
+    """Merge two instances, whatever their labels, when this fraction of the
+    smaller 3D box lies inside the other and they take turns being detected:
+    both matched since the younger appeared, never in the same frame. One
+    object under a flickering label that association could not keep together
+    (a sliver at the image border, a detection without depth) looks like
+    this; two objects in one place are detected together
+    (ObjectMap.merge_duplicates). 0 disables."""
+    merge_alternating_min_frames: int = 3
+    """Frames with a detection of either instance, since the younger appeared,
+    before the alternation counts."""
     disappeared_prune_grace_frames: int = 60
     """Frames after which a disappeared instance's points are released; its
     identity stays in the map for re-identification (ObjectMap.compact_disappeared)."""
@@ -215,7 +226,9 @@ class PipelineConfig:
     clip_pretrained: str = "openai"
     reid_enabled: bool = True
     reid_min_similarity: float = 0.85
-    """Appearance similarity below which a retired instance is not the same object."""
+    """Appearance similarity below which a retired instance is not the same
+    object, and below which a detection without depth, under a label an
+    instance has not taken, is not that instance (association.associate_unlifted)."""
 
     reid_max_age_sec: float = 0.0
     """How long after it was last seen a retired instance may be re-identified (0 = unlimited)."""
@@ -301,7 +314,8 @@ class PipelineConfig:
         # accepted and crash mid-frame after the map had already changed.
         for name in ('min_points_for_3d_association', 'max_points_per_object', 'max_points_per_detection',
                      'min_hits_to_confirm', 'prune_min_contradictions', 'max_retired_instances', 'bbox_min_support',
-                     'mask_completion_min_returns', 'mask_completion_stride_px', 'ground_exclusion_min_returns'):
+                     'mask_completion_min_returns', 'mask_completion_stride_px', 'ground_exclusion_min_returns',
+                     'merge_alternating_min_frames'):
             value = getattr(self, name)
             if int(value) != value or value < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
@@ -313,7 +327,7 @@ class PipelineConfig:
         for name in ('voxel_size', 'tau_eps'):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
-        for name in ('label_compatibility_min_mass', 'relabel_min_overlap'):
+        for name in ('label_compatibility_min_mass', 'relabel_min_overlap', 'merge_alternating_min_overlap'):
             if not 0 <= getattr(self, name) <= 1:
                 raise ValueError(f"{name} must be in [0, 1]")
         if not np.isfinite(self.match_max_gap_m) or self.match_max_gap_m < 0:
@@ -847,31 +861,54 @@ class SemanticMappingPipeline:
         self._refuse_oversized(stage3, live_objects, detections, det_points)
         # Every in-view live instance receives this frame's evidence below
         # (matched, re-activated or unmatched); classify all their points at
-        # once. Association does not change them, and relabelling reads the
-        # classification to see where each candidate is visible.
+        # once. Association does not change them, and the last two stages
+        # read the classification to see where each candidate is visible.
         self.object_map.prepare_evidence(
             [obj for obj, flag in zip(live_objects, in_view) if flag], K, T_world_from_cam, evidence_depth)
+        visible_bboxes: list[np.ndarray | None] = [None] * len(live_objects)
+        measured: set[int] = set()
+
+        def visible_parts(track_indices: list[int]) -> list[np.ndarray | None]:
+            for track_idx in track_indices:
+                if track_idx not in measured:
+                    measured.add(track_idx)
+                    visible_bboxes[track_idx] = self.object_map.visible_bbox(
+                        live_objects[track_idx], K, T_world_from_cam, evidence_depth)
+            return visible_bboxes
+
         # Stage 4, relabelling: the same object under a label it has not taken yet (Eq. 10 decides).
         relabel_overlap = cfg.relabel_min_overlap if cfg.use_2d_tracker else 0.0
-        visible_bboxes = None
-        if relabel_overlap > 0 and evidence_depth is not None and stage3.unmatched_detections:
-            visible_bboxes = [None] * len(live_objects)
-            for track_idx in stage3.unmatched_tracks:
-                visible_bboxes[track_idx] = self.object_map.visible_bbox(
-                    live_objects[track_idx], K, T_world_from_cam, evidence_depth)
         relabel = association.associate_relabel(
             predicted_tracks, predicted_bboxes, detection_bboxes, det_boxes3d, live_objects,
             iou_threshold=cfg.association_iou_threshold, min_overlap=relabel_overlap,
             pad=cfg.voxel_size / 2, candidate_tracks=stage3.unmatched_tracks,
-            candidate_detections=stage3.unmatched_detections, visible_bboxes=visible_bboxes,
+            candidate_detections=stage3.unmatched_detections,
+            visible_bboxes=(visible_parts(stage3.unmatched_tracks)
+                            if relabel_overlap > 0 and evidence_depth is not None and stage3.unmatched_detections
+                            else None),
         )
         self._refuse_oversized(relabel, live_objects, detections, det_points)
         self.object_map.stats["relabel_matches"] += len(relabel.matches)
+        # Stage 5: detections without depth on the object, by the part of
+        # each instance the depth does not rule out (label-gated, 2D).
+        unlifted = association.AssociationResult(
+            unmatched_tracks=relabel.unmatched_tracks, unmatched_detections=relabel.unmatched_detections)
+        if cfg.use_2d_tracker and evidence_depth is not None \
+                and any(det_boxes3d[j] is None for j in relabel.unmatched_detections):
+            unlifted = association.associate_unlifted(
+                visible_parts(relabel.unmatched_tracks), detection_bboxes, det_boxes3d, detection_labels,
+                live_objects, iou_threshold=cfg.association_iou_threshold,
+                candidate_tracks=relabel.unmatched_tracks, candidate_detections=relabel.unmatched_detections,
+                label_min_mass=cfg.label_compatibility_min_mass,
+                detection_embeddings=[d.embedding for d in detections],
+                relabel_min_similarity=cfg.reid_min_similarity if cfg.relabel_min_overlap > 0 else 0.0,
+            )
+            self.object_map.stats["unlifted_matches"] += len(unlifted.matches)
 
         t_associate = time.perf_counter()
 
         detection_instance_ids = [-1] * len(detections)
-        for track_idx, det_idx in stage1.matches + stage2.matches + relabel.matches:
+        for track_idx, det_idx in stage1.matches + stage2.matches + relabel.matches + unlifted.matches:
             detection = detections[det_idx]
             updated_track = tracking.update(predicted_tracks[track_idx], detection.bbox)
             # Matched instances are all in view: pass the batched verdict on
@@ -892,7 +929,7 @@ class SemanticMappingPipeline:
         # the prediction loop above). Without depth, update_unmatched applies
         # no evidence but still counts detector misses, so tentative tracks
         # expire; out-of-view instances are never charged a miss.
-        for track_idx in relabel.unmatched_tracks:
+        for track_idx in unlifted.unmatched_tracks:
             self.object_map.update_unmatched(
                 live_objects[track_idx], K, T_world_from_cam, evidence_depth, in_view=bool(in_view[track_idx]),
                 detections_evaluated=observation.detections_evaluated)
@@ -902,9 +939,9 @@ class SemanticMappingPipeline:
                 detections_evaluated=observation.detections_evaluated)
         self.object_map.discard_prepared_evidence()
 
-        # Stage 5: re-identification against retired instances, so an object
+        # Stage 6: re-identification against retired instances, so an object
         # that was removed and comes back -- in place or elsewhere -- keeps its ID.
-        unmatched_detections = relabel.unmatched_detections
+        unmatched_detections = unlifted.unmatched_detections
         if cfg.reid_enabled and unmatched_detections:
             retired = [o for o in self.object_map.objects.values() if o.status == ObjectStatus.DISAPPEARED]
             if retired:
@@ -938,7 +975,10 @@ class SemanticMappingPipeline:
             self.object_map.confirm_tentative(obj, cfg.min_hits_to_confirm)
         merged = dict(
             (dropped, kept)
-            for kept, dropped in self.object_map.merge_duplicates(cfg.merge_iou_threshold, cfg.merge_distance_m)
+            for kept, dropped in self.object_map.merge_duplicates(
+                cfg.merge_iou_threshold, cfg.merge_distance_m,
+                alternating_min_overlap=cfg.merge_alternating_min_overlap,
+                alternating_min_frames=cfg.merge_alternating_min_frames)
         )
         detection_instance_ids = [merged.get(i, i) for i in detection_instance_ids]
         for obj in self.object_map.objects.values():

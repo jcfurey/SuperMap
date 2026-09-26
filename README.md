@@ -139,10 +139,12 @@ The synthetic suite checks the following:
 
   | configuration | F1 |
   |---|---|
-  | All | 0.79 |
-  | W/o 2D Tracker | 0.48 |
-  | W/o Semantic Fusion | 0.59 |
-  | W/o Geometric Consistency Update | 0.66 |
+  | All | 0.94 |
+  | W/o 2D Tracker | 0.58 |
+  | W/o Semantic Fusion | 0.72 |
+  | W/o Geometric Consistency Update | 0.80 |
+
+  The full system's final map on the stress scene matches the plain scene's (precision 0.89, recall 1.0): no flipped label or missing depth leaves a duplicate or a wrong label behind.
 
 - **Sec. V-H rates.** The 3 Hz mapping and 5 Hz scene-graph rates are floors.
 
@@ -405,7 +407,7 @@ With a LiDAR projected into a camera, instance masks of compact outdoor objects 
 
 ### Identities across relocation and return
 
-The paper's instance IDs are meant to be stable "even across relocations", which geometry alone cannot deliver. Every detection therefore carries an appearance descriptor (`appearance_embedder`: by default a shading-invariant chromaticity histogram, with neutral pixels binned by intensity so black, grey and white objects differ, which needs no model; or CLIP via `open_clip_torch`), each instance keeps a running mean of the descriptors it was built from, and a disappeared instance stays in the map as a retired identity with its points released after `disappeared_prune_grace_frames`. A detection that no live instance claims is then matched against the retired pool (association stage 5): back in the old place with a compatible label it re-attaches by geometry, anywhere else it re-attaches when the appearance similarity clears `reid_min_similarity` and the move is plausible (within `reconcile_max_distance_m` and `reconcile_max_gap_sec`; a lookalike turning up far away or much later is a new object), and a similarity below that vetoes even a same-place match so a different object put in the old spot gets a new ID. An object moved before its old spot is confirmed empty holds a provisional ID until the old instance retires, at which point the two records are reconciled under the original ID with the new geometry. The trajectory records the move, and the VLM prompt reports it ("disappeared at t=2.30s and reappeared at t=3.60s, moved from [...] to [...]"). `evaluate.py` scores this as identity consistency: the fraction of moved or returned objects served by a single instance ID across all their phases.
+The paper's instance IDs are meant to be stable "even across relocations", which geometry alone cannot deliver. Every detection therefore carries an appearance descriptor (`appearance_embedder`: by default a shading-invariant chromaticity histogram, with neutral pixels binned by intensity so black, grey and white objects differ, which needs no model; or CLIP via `open_clip_torch`), each instance keeps a running mean of the descriptors it was built from, and a disappeared instance stays in the map as a retired identity with its points released after `disappeared_prune_grace_frames`. A detection that no live instance claims is then matched against the retired pool (association stage 6): back in the old place with a compatible label it re-attaches by geometry, anywhere else it re-attaches when the appearance similarity clears `reid_min_similarity` and the move is plausible (within `reconcile_max_distance_m` and `reconcile_max_gap_sec`; a lookalike turning up far away or much later is a new object), and a similarity below that vetoes even a same-place match so a different object put in the old spot gets a new ID. An object moved before its old spot is confirmed empty holds a provisional ID until the old instance retires, at which point the two records are reconciled under the original ID with the new geometry. The trajectory records the move, and the VLM prompt reports it ("disappeared at t=2.30s and reappeared at t=3.60s, moved from [...] to [...]"). `evaluate.py` scores this as identity consistency: the fraction of moved or returned objects served by a single instance ID across all their phases.
 
 ### Real captures: rosbag2 to sequence
 

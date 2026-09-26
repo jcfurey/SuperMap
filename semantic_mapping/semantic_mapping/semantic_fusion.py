@@ -19,6 +19,15 @@ LabelBelief = dict[str, float]
 
 P_SELF = 0.85
 P_SELF_CORROBORATED = 0.95
+NEW_LABEL_PRIOR = 1e-4
+"""Mass a label enters an instance's belief with the first time it is observed
+there, and below which a label is dropped again. With a detection at score
+0.9 moving the odds about 15:1, a label the instance has not taken overturns
+its belief on the fourth consistent observation: often enough for a genuine
+change of label, rarely enough that a detector flickering between two labels
+one time in five (a run of four flips) relabels a well-established object.
+At 1e-3 three flips did, a run the stress scene's 20% flicker produces for
+about one object in four over 60 frames."""
 """Detector hit probability for an observation whose detection geometrically
 confirmed the instance's existing points (ObjectMap.update_matched): stronger
 evidence is a sharper likelihood in the one Eq. (10) update per frame, not a
@@ -44,7 +53,7 @@ def bayesian_label_update(
     observed_score: float,
     p_self: float = P_SELF,
     p_other: float = 0.05,
-    new_label_prior: float = 1e-3,
+    new_label_prior: float = NEW_LABEL_PRIOR,
 ) -> LabelBelief:
     """Fuse one detector observation z_t into the instance's label posterior.
 
@@ -78,7 +87,7 @@ def bayesian_label_update(
     return {label: value / total for label, value in unnormalized.items()}
 
 
-def prune_low_confidence_labels(belief: LabelBelief, min_prob: float = 1e-3) -> LabelBelief:
+def prune_low_confidence_labels(belief: LabelBelief, min_prob: float = NEW_LABEL_PRIOR) -> LabelBelief:
     """Drop negligible-probability label candidates and renormalize."""
     kept = {label: prob for label, prob in belief.items() if prob >= min_prob}
     if not kept:

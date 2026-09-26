@@ -37,6 +37,17 @@ def test_repeated_conflicting_detections_can_flip_the_label():
     assert label == "stool"
 
 
+def test_an_unseen_label_takes_four_consistent_detections_to_overturn_an_established_one():
+    # Three flips in a row are common under a flickering detector; they must
+    # dent the belief, not relabel the object (NEW_LABEL_PRIOR).
+    belief = sf.new_belief("bucket", 0.9)
+    for _ in range(20):
+        belief = sf.bayesian_label_update(belief, "bucket", 0.9)
+    for flips in range(1, 5):
+        belief = sf.prune_low_confidence_labels(sf.bayesian_label_update(belief, "trash can", 0.9))
+        assert sf.best_label(belief)[0] == ("trash can" if flips == 4 else "bucket"), flips
+
+
 def test_prune_low_confidence_labels_renormalizes():
     belief = {"chair": 0.98, "stool": 0.019, "table": 0.001}
     pruned = sf.prune_low_confidence_labels(belief, min_prob=0.01)

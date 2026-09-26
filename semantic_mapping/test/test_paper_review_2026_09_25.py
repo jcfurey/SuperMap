@@ -99,6 +99,53 @@ def test_d1_a_new_label_on_the_visible_part_of_a_partly_hidden_object_is_a_relab
         assert len(pipeline.object_map.objects) == (1 if fused else 2)
 
 
+def test_d1_a_detection_without_depth_joins_by_the_visible_part_and_a_new_label_needs_the_same_look():
+    obj = make_object(1, "chair", [-0.2, -0.2, 1.9, 0.2, 0.2, 2.1])
+    obj.points_world = np.zeros((10, 3))
+    look, other = np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+    obj.embedding = look
+    quarter = np.array([60.0, 40.0, 70.0, 80.0])
+
+    def match(label, embedding=look, visible=quarter, min_similarity=0.85, box3d=None):
+        return association.associate_unlifted(
+            [visible], [quarter], [box3d], [label], [obj], detection_embeddings=[embedding],
+            relabel_min_similarity=min_similarity).matches
+
+    assert match("chair") == [(0, 0)]
+    assert match("chair", visible=BOX) == [] and match("chair", visible=None) == []
+    assert match("armchair") == [(0, 0)]                # the same pixels under another label
+    assert match("armchair", embedding=other) == []     # e.g. a person without depth in front of the chair
+    assert match("armchair", min_similarity=0.0) == []
+    assert match("chair", box3d=np.zeros(6)) == []      # lifted detections are for the 3D stages
+    result = association.associate_unlifted(
+        [quarter], [quarter] * 3, [np.zeros(6), None, np.zeros(6)], ["chair"] * 3, [obj])
+    assert result.matches == [(0, 1)] and result.unmatched_detections == [0, 2]
+
+
+def test_d1_a_detection_without_depth_on_the_visible_part_of_a_hidden_object_keeps_its_instance():
+    # The chair's own depth drops out and one detection boxes its left
+    # quarter. With the rest of the chair hidden behind something nearer,
+    # that quarter is where the chair can be seen; with the chair unhidden,
+    # a quarter of it is something else.
+    def without_depth(stamp, detections, hidden):
+        depth = _depth(2.0)
+        depth[40:80, 60:100] = 0.0
+        if hidden:
+            depth[40:80, 70:100] = 1.0
+        return Observation(stamp=stamp, pose=StampedPose(stamp=stamp, T_world_from_frame=np.eye(4)),
+                           intrinsics=INTRINSICS, depth=depth, detections=list(detections))
+
+    for hidden in (True, False):
+        pipeline = SemanticMappingPipeline()
+        for i in range(3):
+            pipeline.process_frame(_obs(i * 0.1, [_det()]))
+        (chair_id,) = pipeline.object_map.objects
+        result = pipeline.process_frame(without_depth(0.3, [_det(bbox=[60.0, 40.0, 70.0, 80.0])], hidden))
+        assert (result.detection_instance_ids == [chair_id]) == hidden
+        assert len(pipeline.object_map.objects) == (1 if hidden else 2)
+        assert pipeline.object_map.stats["unlifted_matches"] == int(hidden)
+
+
 # ------------------------------------------------------------------ D3
 def test_d3_a_replacement_behind_the_same_image_box_is_a_disappearance_and_an_appearance():
     pipeline = SemanticMappingPipeline()

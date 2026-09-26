@@ -81,6 +81,7 @@ def instance_to_record(obj: ObjectInstance) -> dict:
         "trajectory": [[float(stamp), _floats(center), str(status)] for stamp, center, status in obj.trajectory],
         "embedding": _floats(obj.embedding) if obj.embedding is not None else None,
         "embedding_count": int(obj.embedding_count),
+        "match_stamps": _floats(obj.match_stamps),
     }
 
 
@@ -114,6 +115,7 @@ def instance_from_record(
         trajectory=[(float(s), np.asarray(c, dtype=np.float64), str(st)) for s, c, st in record.get("trajectory", [])],
         embedding=(np.asarray(record["embedding"], dtype=np.float32) if record.get("embedding") is not None else None),
         embedding_count=int(record.get("embedding_count", 0)),
+        match_stamps=[float(s) for s in record.get("match_stamps", [])],
     )
 
 

@@ -411,3 +411,56 @@ def test_visible_bbox_is_where_the_depth_confirms_the_instance():
 
     gone = np.full((120, 160), 8.0)  # seen through: nothing confirms it
     assert m.visible_bbox(obj, K, T, gone) is None and m.visible_bbox(obj, K, T, None) is None
+
+
+def test_visible_bbox_keeps_points_without_a_reading_unless_something_nearer_hides_them():
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    us, vs = np.meshgrid(np.arange(60, 100, 2), np.arange(40, 80, 2))
+    points = np.column_stack(((us.ravel() - 80) * 0.02, (vs.ravel() - 60) * 0.02, np.full(us.size, 2.0)))
+    m = ObjectMap(voxel_size=0.01)
+    obj = m.spawn(np.array([60.0, 40.0, 100.0, 80.0]), points, "chair", 0.9, stamp=0.0)
+    dropout = np.full((120, 160), 8.0)
+    dropout[40:80, 60:100] = 0.0  # the chair's own depth is missing
+    np.testing.assert_array_equal(m.visible_bbox(obj, K, np.eye(4), dropout), [60.0, 40.0, 99.0, 79.0])
+    dropout[40:80, 70:100] = 1.0  # and something nearer covers its right three quarters
+    np.testing.assert_array_equal(m.visible_bbox(obj, K, np.eye(4), dropout), [60.0, 40.0, 69.0, 79.0])
+
+
+def _co_located(m, label, stamps, points=None):
+    points = np.array([[0.0, 0.0, 2.0], [0.4, 0.4, 2.4]]) if points is None else points
+    obj = m.spawn(np.array([60.0, 40.0, 100.0, 80.0]), points, label, 0.9, stamp=stamps[0])
+    obj.match_stamps, obj.hits, obj.latest_stamp = list(stamps), len(stamps), stamps[-1]
+    return obj
+
+
+def test_instances_that_take_turns_being_detected_merge_whatever_their_labels():
+    m = ObjectMap(voxel_size=0.05)
+    sofa = _co_located(m, "sofa", [0.0, 0.1, 0.3, 0.4, 0.6])
+    chair = _co_located(m, "chair", [0.2, 0.5])  # the sofa's flipped detections
+    assert m.merge_duplicates() == []  # label-compatible duplicates only, by default
+    assert m.merge_duplicates(alternating_min_overlap=0.5) == [(sofa.instance_id, chair.instance_id)]
+    assert set(m.objects) == {sofa.instance_id} and m.stats["alternating_merges"] == 1
+    assert sofa.label == "sofa" and sofa.label_belief["chair"] > 0.1  # later flips now reach the sofa
+    assert sofa.match_stamps == [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6] and sofa.hits == 7
+
+
+def test_instances_detected_together_or_handed_over_do_not_take_turns():
+    def pair(sofa_stamps, cushion_stamps, points=None):
+        m = ObjectMap(voxel_size=0.05)
+        _co_located(m, "sofa", sofa_stamps)
+        _co_located(m, "cushion", cushion_stamps, points)
+        return m.merge_duplicates(alternating_min_overlap=0.5)
+
+    assert not pair([0.0, 0.1, 0.3, 0.4], [0.2, 0.3])        # a cushion on the sofa: detected together at 0.3
+    assert not pair([0.0, 0.1], [0.2, 0.3, 0.4])            # the sofa not seen since: a handover, not a flicker
+    assert not pair([0.0, 0.1, 0.3], [0.2])                 # 2 frames since the cushion appeared: too little
+    far = np.array([[3.0, 0.0, 2.0], [3.4, 0.4, 2.4]])
+    assert not pair([0.0, 0.1, 0.3, 0.4], [0.2, 0.5], far)  # alternating, but elsewhere
+    assert pair([0.0, 0.1, 0.3, 0.4], [0.2, 0.5])           # the same pair in place does merge
+
+
+def test_shift_stamps_moves_match_stamps_too():
+    m = ObjectMap()
+    obj = _co_located(m, "chair", [1.0, 2.0])
+    m.shift_stamps(-0.5)
+    assert obj.match_stamps == [0.5, 1.5] and obj.first_seen_stamp == 0.5 and obj.latest_stamp == 1.5
