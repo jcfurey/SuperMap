@@ -180,25 +180,46 @@ def test_vectorised_relations_match_the_scalar_predicates():
             assert sg.build_spatial_edges(objects, **kwargs) == _scalar_edges(objects, **kwargs)
 
 
-def test_beside_distance_ties_are_decided_like_the_scalar_norm():
+def test_beside_distance_ties_are_decided_like_the_scalar_norm(monkeypatch):
     # np.linalg.norm of a 2-vector is a BLAS dot product and can round one
-    # unit in the last place away from sqrt(x*x + y*y); a limit set to the
-    # scalar distance must keep deciding exactly as the scalar test did.
-    rng = np.random.default_rng(3)
-    checked = 0
-    while checked < 5:
+    # unit in the last place away from sqrt(x*x + y*y), depending on the
+    # CPU and BLAS build; a limit at the scalar distance must keep deciding
+    # exactly as the scalar test did. The real norm is checked as it is,
+    # then replaced by one that is always one unit off in either direction,
+    # so the disagreement is exercised on every platform.
+    def pair(corner):
         a = make_object(1, "chair", [0.0, 0.0, 0.0, 0.2, 0.2, 1.0])
-        corner = rng.uniform(0.3, 0.8, size=2)
         b = make_object(2, "chair", [corner[0], corner[1], 0.0, corner[0] + 0.2, corner[1] + 0.2, 1.0])
         difference = a.center[:2] - b.center[:2]
-        scalar = float(np.linalg.norm(difference))
-        if np.sqrt(difference[0] * difference[0] + difference[1] * difference[1]) == scalar:
-            continue
+        return [a, b], float(np.sqrt(difference[0] * difference[0] + difference[1] * difference[1]))
+
+    corners = np.random.default_rng(3).uniform(0.3, 0.8, size=(200, 2))
+    for corner in corners:
+        objects, _ = pair(corner)
+        scalar = float(np.linalg.norm(objects[0].center[:2] - objects[1].center[:2]))
         for limit in (scalar, np.nextafter(scalar, 0.0)):
-            expected = _scalar_edges([a, b], beside_max_distance=limit)
-            assert sg.build_spatial_edges([a, b], beside_max_distance=limit) == expected
-        assert _scalar_edges([a, b], beside_max_distance=scalar)
-        checked += 1
+            assert sg.build_spatial_edges(objects, beside_max_distance=limit) == \
+                _scalar_edges(objects, beside_max_distance=limit)
+
+    real_norm = np.linalg.norm
+    direction = [np.inf]
+
+    def one_unit_off(x, *args, **kwargs):
+        if args or kwargs or np.shape(x) != (2,):
+            return real_norm(x, *args, **kwargs)
+        return np.nextafter(np.sqrt(x[0] * x[0] + x[1] * x[1]), direction[0])
+
+    monkeypatch.setattr(np.linalg, "norm", one_unit_off)
+    decided_by_the_norm = 0
+    for k, corner in enumerate(corners[:40]):
+        direction[0] = np.inf if k % 2 else 0.0
+        objects, elementwise = pair(corner)
+        norm = float(np.linalg.norm(objects[0].center[:2] - objects[1].center[:2]))
+        for limit in {elementwise, norm, np.nextafter(elementwise, 0.0), np.nextafter(norm, np.inf)}:
+            expected = _scalar_edges(objects, beside_max_distance=limit)
+            assert sg.build_spatial_edges(objects, beside_max_distance=limit) == expected
+            decided_by_the_norm += bool(expected) != (elementwise <= limit)
+    assert decided_by_the_norm == 40  # one limit per pair where the elementwise distance alone decides wrongly
 
 
 def test_boxes_in_view_batches_the_single_box_test():
