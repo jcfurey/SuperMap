@@ -4,15 +4,15 @@ Each test names the review ID it pins down.
 """
 import numpy as np
 
-from semantic_mapping import association
+from semantic_mapping import association, tracking
 from semantic_mapping import evaluation as ev
 from semantic_mapping import scene_graph as sg
-from semantic_mapping.geometry_utils import bbox3d_gap, overlap_3d
+from semantic_mapping.geometry_utils import bbox3d_gap, iou_xyxy, overlap_3d
 from semantic_mapping.pipeline import PipelineConfig, SemanticMappingPipeline
-from semantic_mapping.types import ObjectStatus
+from semantic_mapping.types import Observation, ObjectStatus, StampedPose
 from test.helpers import make_object
 from semantic_mapping.vln import serialize_prompt as vp
-from test.test_review_2026_09_24 import INTRINSICS, _det, _obs
+from test.test_review_2026_09_24 import BOX, INTRINSICS, _depth, _det, _obs
 
 
 # ------------------------------------------------------------------ D1
@@ -50,6 +50,53 @@ def test_d1_relabelling_needs_3d_agreement_and_can_be_disabled():
     disabled = association.associate_relabel([track], [bbox2d], [bbox2d], [inside], [obj], min_overlap=0.0)
     assert disabled.matches == []
     assert overlap_3d(inside, obj.bbox3d) == 1.0 and overlap_3d(in_front, obj.bbox3d) == 0.0
+
+
+def test_d1_relabelling_can_agree_with_the_visible_part_which_needs_no_motion_gate():
+    obj = make_object(1, "chair", [-0.2, -0.2, 1.9, 0.2, 0.2, 2.1])
+    obj.points_world = np.zeros((10, 3))
+    track = tracking.init_track(BOX)
+    inside = np.array([-0.1, -0.1, 1.95, 0.1, 0.1, 2.05])
+    shifted = BOX + np.array([20.0, 0.0, 20.0, 0.0])  # IoU 1/3 with the prediction, outside the motion gate
+    assert iou_xyxy(BOX, shifted) >= 0.3 and not tracking.mahalanobis_gate(track, shifted)
+
+    def relabel(detection_box, visible):
+        return association.associate_relabel([track], [BOX], [detection_box], [inside], [obj],
+                                             visible_bboxes=visible).matches
+
+    assert relabel(shifted, None) == []              # the prediction path keeps its motion gate
+    assert relabel(shifted, [shifted]) == [(0, 0)]   # where the instance is seen now needs none
+    quarter = np.array([60.0, 40.0, 70.0, 80.0])     # a detection covering a quarter of the box
+    assert relabel(quarter, None) == [] and relabel(quarter, [BOX]) == []
+    assert relabel(quarter, [quarter]) == [(0, 0)]
+
+
+def _hidden_right_side(stamp, detections):
+    """The chair at 2 m, its right three quarters behind something 1 m from the camera."""
+    depth = _depth(2.0)
+    depth[40:80, 70:100] = 1.0
+    return Observation(stamp=stamp, pose=StampedPose(stamp=stamp, T_world_from_frame=np.eye(4)),
+                       intrinsics=INTRINSICS, depth=depth, detections=list(detections))
+
+
+def test_d1_a_new_label_on_the_visible_part_of_a_partly_hidden_object_is_a_relabelling():
+    # One detection, under a label the chair has not taken, boxes only the
+    # chair's left quarter (IoU 0.25 with the chair's box). With the rest of
+    # the chair hidden, that quarter is all of it the camera sees: the same
+    # object, for Eq. 10 to weigh. With the chair in full view, a box a
+    # quarter its size is a smaller object on it (a book on a shelf) and
+    # starts its own instance.
+    quarter = [60.0, 40.0, 70.0, 80.0]
+    for hidden, fused in ((True, True), (False, False)):
+        pipeline = SemanticMappingPipeline()
+        for i in range(3):
+            pipeline.process_frame(_obs(i * 0.1, [_det()]))
+        (chair_id,) = pipeline.object_map.objects
+        detection = [_det("armchair", bbox=quarter)]
+        result = pipeline.process_frame(_hidden_right_side(0.3, detection) if hidden else _obs(0.3, detection))
+        assert (result.detection_instance_ids == [chair_id]) == fused
+        assert ("armchair" in pipeline.object_map.objects[chair_id].label_belief) == fused
+        assert len(pipeline.object_map.objects) == (1 if fused else 2)
 
 
 # ------------------------------------------------------------------ D3

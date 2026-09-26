@@ -139,10 +139,10 @@ The synthetic suite checks the following:
 
   | configuration | F1 |
   |---|---|
-  | All | 0.70 |
+  | All | 0.79 |
   | W/o 2D Tracker | 0.48 |
-  | W/o Semantic Fusion | 0.60 |
-  | W/o Geometric Consistency Update | 0.57 |
+  | W/o Semantic Fusion | 0.59 |
+  | W/o Geometric Consistency Update | 0.66 |
 
 - **Sec. V-H rates.** The 3 Hz mapping and 5 Hz scene-graph rates are floors.
 
@@ -344,7 +344,7 @@ The model backend is provider-agnostic (`semantic_mapping/vln/clients.py`): `ope
 
 ### Scaling to long deployments
 
-A two-hour run accumulates far more instances than the camera sees at any moment, so the per-frame cost has to follow the view rather than the map. One batched frustum test on every instance's 3D box decides which instances can be seen at all; the rest skip tracklet prediction, association, and the per-point evidence update for that frame (`cull_out_of_view`, on by default and equivalent in outcome, since an out-of-view point carries no evidence). Duplicate merging and scene-graph construction draw their candidate pairs from a KD-tree. The graph checks every pair within `scene_graph_cluster_radius`, caches each pair's edges, and re-evaluates them when either member or a predicate parameter changes. Historical timing of the map update on the 640x480 synthetic scene with the room's instances cloned far outside the view (this 4-core CPU sandbox):
+A two-hour run accumulates far more instances than the camera sees at any moment, so the per-frame cost has to follow the view rather than the map. One batched frustum test on every instance's 3D box decides which instances can be seen at all; the rest skip tracklet prediction, association, and the per-point evidence update for that frame (`cull_out_of_view`, on by default and equivalent in outcome, since an out-of-view point carries no evidence). Duplicate merging and scene-graph construction draw their candidate pairs from a KD-tree. The graph evaluates every pair within `scene_graph_cluster_radius` in one vectorised pass. Historical timing of the map update on the 640x480 synthetic scene with the room's instances cloned far outside the view (this 4-core CPU sandbox):
 
 | instances | points | map update, culled | map update, exhaustive | full frame, culled |
 |---|---|---|---|---|

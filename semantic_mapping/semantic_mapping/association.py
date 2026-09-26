@@ -259,6 +259,7 @@ def associate_relabel(
     pad: float = 0.025,
     candidate_tracks: list[int] | None = None,
     candidate_detections: list[int] | None = None,
+    visible_bboxes: list[np.ndarray | None] | None = None,
 ) -> AssociationResult:
     """Match detections to instances regardless of label, when image and 3D geometry agree.
 
@@ -266,11 +267,17 @@ def associate_relabel(
     (review 2026-09-24, C2), but they also kept a label the instance had never
     taken from ever reaching Eq. (10), so a flickering detector label split one
     object into co-located instances (paper review 2026-09-25, D1). Here a pair
-    is admissible when the 2D boxes overlap by at least ``iou_threshold``, the
-    motion gate accepts it, and at least ``min_overlap`` of the smaller 3D box
-    (each grown by ``pad``) lies inside the other: a person standing in front
-    of the chair lifts to a box in front of it and stays out. Both sides need
-    3D extent; ``min_overlap <= 0`` disables the stage.
+    is admissible when at least ``min_overlap`` of the smaller 3D box (each
+    grown by ``pad``) lies inside the other, so a person standing in front of
+    the chair lifts to a box in front of it and stays out, and the image
+    boxes agree by at least ``iou_threshold`` IoU with either
+    - the track's predicted box, with the motion gate accepting the pair, or
+    - ``visible_bboxes[i]``, the box of the instance's points the current
+      depth confirms (ObjectMap.visible_bbox). A detection of a partly
+      occluded or cut-off object boxes only its visible part, which the
+      prediction (the track's last box size) and the whole object's
+      projection both overstate; measured this frame, it needs no motion gate.
+    Both sides need 3D extent; ``min_overlap <= 0`` disables the stage.
     """
     rows = list(range(len(objects))) if candidate_tracks is None else list(candidate_tracks)
     cols = list(range(len(detection_bboxes))) if candidate_detections is None else list(candidate_detections)
@@ -279,13 +286,22 @@ def associate_relabel(
         for r, i in enumerate(rows):
             if objects[i].points_world.shape[0] == 0:
                 continue
+            visible = visible_bboxes[i] if visible_bboxes is not None else None
             for c, j in enumerate(cols):
-                if detection_bboxes3d[j] is None:
+                if detection_bboxes3d[j] is None \
+                        or overlap_3d(detection_bboxes3d[j], objects[i].bbox3d, pad) < min_overlap:
                     continue
+                agreement = []
                 iou = iou_xyxy(predicted_bboxes[i], detection_bboxes[j])
-                if iou >= iou_threshold and overlap_3d(detection_bboxes3d[j], objects[i].bbox3d, pad) >= min_overlap:
-                    cost[r, c] = 1.0 - iou
-    return _solve(cost, rows, cols, lambda i, j: mahalanobis_gate(tracks[i], detection_bboxes[j]))
+                if iou >= iou_threshold and mahalanobis_gate(tracks[i], detection_bboxes[j]):
+                    agreement.append(iou)
+                if visible is not None:
+                    iou = iou_xyxy(visible, detection_bboxes[j])
+                    if iou >= iou_threshold:
+                        agreement.append(iou)
+                if agreement:
+                    cost[r, c] = 1.0 - max(agreement)
+    return _solve(cost, rows, cols, lambda i, j: True)
 
 
 def reidentify(
