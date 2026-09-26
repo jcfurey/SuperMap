@@ -28,7 +28,6 @@ from semantic_mapping.geometry_utils import (
     fill_sparse_depth,
     fit_ground_plane,
     foreground_depth_mask,
-    mask_bounds,
     parse_size_limits,
     transform_points,
 )
@@ -233,7 +232,7 @@ class PipelineConfig:
     scene_graph_on_min_footprint_fraction: float = 0.5
     """``on`` also holds when this fraction of the upper object's footprint lies
     over the support, so a small object on a large table qualifies despite a tiny
-    IoU_xy (scene_graph._on_predicate). 0 keeps the paper's IoU test alone."""
+    IoU_xy (scene_graph._pair_relations). 0 keeps the paper's IoU test alone."""
     scene_graph_support_classes: list[str] = field(default_factory=lambda: list(sg.DEFAULT_SUPPORT_CLASSES))
     max_points_per_detection: int = 4000
     size_prior_weight: float = 0.0
@@ -394,7 +393,6 @@ class SemanticMappingPipeline:
         self._frame_index = 0
         self._last_stamp: float | None = None
         self._rebase_loaded_stamps = False
-        self._edge_cache = sg.SpatialEdgeCache()
         self.embedder = build_embedder(
             self.config.appearance_embedder, device=self.config.embedder_device,
             model_name=self.config.clip_model, pretrained=self.config.clip_pretrained,
@@ -427,7 +425,6 @@ class SemanticMappingPipeline:
         header = persistence.load_map(path, self.object_map, resume=resume)
         self._frame_index = int(header.get("metadata", {}).get("frame_index", 0))
         self.begin_new_epoch()
-        self._edge_cache = sg.SpatialEdgeCache()
         return header
 
     def begin_new_epoch(self) -> None:
@@ -579,7 +576,7 @@ class SemanticMappingPipeline:
         (``y1 == y2``) when the detection covers no pixel."""
         h, w = image_shape
         if detection.mask is not None:
-            bounds = mask_bounds(detection.mask)
+            bounds = detection.mask_bounds()
             if bounds is None:
                 return 0, 0, 0, 0
             y1, y2, x1, x2 = bounds
@@ -860,6 +857,10 @@ class SemanticMappingPipeline:
 
         t_associate = time.perf_counter()
 
+        # Every in-view live instance receives this frame's evidence below
+        # (matched, re-activated or unmatched); classify all their points at once.
+        self.object_map.prepare_evidence(
+            [obj for obj, flag in zip(live_objects, in_view) if flag], K, T_world_from_cam, evidence_depth)
         detection_instance_ids = [-1] * len(detections)
         for track_idx, det_idx in stage1.matches + stage2.matches + relabel.matches:
             detection = detections[det_idx]
@@ -890,6 +891,7 @@ class SemanticMappingPipeline:
             self.object_map.update_unmatched(
                 live_objects[track_idx], K, T_world_from_cam, evidence_depth, in_view=False,
                 detections_evaluated=observation.detections_evaluated)
+        self.object_map.discard_prepared_evidence()
 
         # Stage 5: re-identification against retired instances, so an object
         # that was removed and comes back -- in place or elsewhere -- keeps its ID.
@@ -962,7 +964,6 @@ class SemanticMappingPipeline:
             xy_iou_threshold=self.config.scene_graph_xy_iou_threshold,
             beside_max_distance=self.config.scene_graph_beside_max_distance,
             support_classes=self.config.scene_graph_support_classes,
-            cache=self._edge_cache,
             on_min_footprint_fraction=self.config.scene_graph_on_min_footprint_fraction,
         )
 

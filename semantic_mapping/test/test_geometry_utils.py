@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from semantic_mapping.geometry_utils import (
     back_project_depth,
@@ -256,3 +257,61 @@ def test_packed_voxel_keys_order_like_the_cells_and_refuse_out_of_range():
     assert pack_voxel_keys(np.array([[limit, 0, 0]])) is None
     assert pack_voxel_keys(np.array([[0, -limit - 1, 0]])) is None
     assert pack_voxel_keys(np.zeros((0, 3), np.int64)).shape == (0,)
+
+
+def test_detection_mask_bounds_are_remembered_per_mask_array():
+    import dataclasses
+
+    from semantic_mapping.geometry_utils import mask_bounds
+    from semantic_mapping.types import Detection2D
+
+    mask = np.zeros((30, 40), dtype=bool)
+    mask[5:9, 10:25] = True
+    detection = Detection2D(np.array([10.0, 5.0, 25.0, 9.0]), "box", 0.9, mask=mask)
+    assert detection.mask_bounds() == mask_bounds(mask) == (5, 9, 10, 25)
+    assert detection.mask_bounds() == (5, 9, 10, 25)          # served from the cache
+    moved = np.zeros_like(mask)
+    moved[20:22, 1:3] = True
+    detection.mask = moved                                      # a new array is measured again
+    assert detection.mask_bounds() == (20, 22, 1, 3)
+    copy = dataclasses.replace(detection, mask=mask)
+    assert copy.mask_bounds() == (5, 9, 10, 25) and detection.mask_bounds() == (20, 22, 1, 3)
+    detection.mask = np.zeros_like(mask)
+    assert detection.mask_bounds() is None
+    assert copy == dataclasses.replace(copy)                    # the cache is not a field
+
+
+@pytest.mark.filterwarnings("ignore:overflow encountered:RuntimeWarning")  # uint8 boxes wrap, on both sides
+def test_iou_xyxy_matrix_matches_iou_xyxy_for_any_box_type():
+    from semantic_mapping.geometry_utils import iou_xyxy, iou_xyxy_matrix
+
+    rng = np.random.default_rng(0)
+
+    def boxes(k):
+        out = []
+        for _ in range(k):
+            x1, y1 = rng.integers(0, 40, size=2) * rng.choice([0.5, rng.uniform(0.3, 1.7)])
+            w, h = rng.integers(-2, 20, size=2) * 0.5
+            box = np.array([x1, y1, x1 + w, y1 + h])
+            kind = rng.integers(7)
+            if kind == 0:
+                box[rng.integers(4)] = np.nan
+            elif kind == 1:
+                box = box.astype(np.float32)          # rounds in float32 in iou_xyxy
+            elif kind == 2:
+                box = box.tolist()                    # Python floats: weak against float32
+            elif kind == 3:
+                box = [np.float32(v) for v in box]
+            elif kind == 4:
+                box = [float(box[0]), np.float32(box[1]), float(box[2]), np.float32(box[3])]
+            elif kind == 5 and np.isfinite(box).all():
+                box = np.clip(np.round(box), 0, 255).astype(np.uint8)  # wraps on subtraction
+            out.append(box)
+        return out
+
+    for _ in range(300):
+        a, b = boxes(int(rng.integers(0, 10))), boxes(int(rng.integers(0, 10)))
+        matrix = iou_xyxy_matrix(a, b)
+        assert matrix.shape == (len(a), len(b))
+        expected = np.array([[iou_xyxy(x, y) for y in b] for x in a]).reshape(len(a), len(b))
+        assert np.array_equal(matrix, expected, equal_nan=True)

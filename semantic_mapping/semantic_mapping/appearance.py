@@ -15,7 +15,6 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
-from semantic_mapping.geometry_utils import mask_bounds
 from semantic_mapping.types import Detection2D
 
 
@@ -34,7 +33,7 @@ def _detection_pixels(rgb: np.ndarray, detection: Detection2D, max_pixels: int |
     if detection.mask is not None and detection.mask.shape == rgb.shape[:2]:
         # The mask's bounding crop lists the same pixels in the same (row-major)
         # order as the whole image, at a fraction of the cost.
-        bounds = mask_bounds(detection.mask)
+        bounds = detection.mask_bounds()
         if bounds is None:
             return np.zeros((0,) + rgb.shape[2:], dtype=rgb.dtype)
         y1, y2, x1, x2 = bounds
@@ -145,19 +144,100 @@ class ColorHistogramEmbedder(Embedder):
         np.add.at(hist, low + 1, upper)
         return hist
 
+    def _chroma_histograms(self, pixel_sets: list[np.ndarray | None]) -> list[np.ndarray | None]:
+        """:meth:`_histogram` of every pixel set at once (chromaticity space, integer pixels).
+
+        All sets' pixels are classified and binned together and each set's
+        counts gathered with one ``bincount``: the per-detection
+        ``histogram2d`` call cost more than the pixels it binned. Bins are
+        found as ``histogram2d`` finds them, and the soft intensity weights
+        are summed in the same order as :meth:`_intensity_histogram`, so the
+        histograms are identical.
+        """
+        out: list[np.ndarray | None] = [None] * len(pixel_sets)
+        by_channels: dict[int, list[int]] = {}
+        for k, pixels in enumerate(pixel_sets):
+            if pixels is not None:  # masks keep every image channel, boxes the first three
+                by_channels.setdefault(pixels.shape[1], []).append(k)
+        for index in by_channels.values():
+            self._chroma_group(pixel_sets, index, out)
+        return out
+
+    def _chroma_group(self, pixel_sets: list[np.ndarray | None], index: list[int],
+                      out: list[np.ndarray | None]) -> None:
+        """Fill ``out[k]`` for the sets ``index`` (all with the same channel count)."""
+        count, cells = len(index), self.bins * self.bins
+        pixels = np.concatenate([pixel_sets[k] for k in index]).astype(np.float64)
+        segment = np.repeat(np.arange(count), [pixel_sets[k].shape[0] for k in index])
+        # Channel by channel (every channel, as _histogram reduces over all of
+        # them): NumPy reduces a short last axis one row at a time. Integer
+        # channel values make every sum, max and min exact.
+        channels = [pixels[:, c] for c in range(pixels.shape[1])]
+        total = sum(channels[1:], channels[0].copy())
+        lit = (total > 0) & (total >= 3.0 * self.min_intensity)
+        lit_count = np.bincount(segment[lit], minlength=count)
+        pixels, total, segment = pixels[lit], total[lit], segment[lit]
+        neutral = np.zeros(len(pixels), dtype=bool)
+        if self.achromatic_bins:
+            channels = [pixels[:, c] for c in range(pixels.shape[1])]
+            brightest, darkest = channels[0].copy(), channels[0].copy()
+            for channel in channels[1:]:
+                np.maximum(brightest, channel, out=brightest)
+                np.minimum(darkest, channel, out=darkest)
+            neutral = (brightest - darkest) < np.maximum(self.achromatic_spread,
+                                                         self.achromatic_saturation * brightest)
+        chroma = pixels[~neutral, :2] / total[~neutral, None]
+        edges = np.linspace(0.0, 1.0 + 1e-9, self.bins + 1)
+        # histogramdd's binning; chromaticity never reaches the last edge (1 + 1e-9),
+        # so its right-edge correction never applies.
+        column = [np.searchsorted(edges, chroma[:, axis], side="right") for axis in (0, 1)]
+        inside = np.all([(c >= 1) & (c <= self.bins) for c in column], axis=0)
+        cell = (column[0][inside] - 1) * self.bins + (column[1][inside] - 1)
+        chroma_counts = np.bincount(segment[~neutral][inside] * cells + cell, minlength=count * cells)
+        chroma_counts = chroma_counts.reshape(count, cells).astype(np.float64)
+        if self.achromatic_bins:
+            intensity = self._intensity_histograms(total[neutral] / 3.0, segment[neutral], count)
+        for row, k in enumerate(index):
+            if lit_count[row] >= self.min_pixels:
+                out[k] = (np.concatenate([chroma_counts[row], intensity[row]]) if self.achromatic_bins
+                          else chroma_counts[row].copy())
+
+    def _intensity_histograms(self, intensity: np.ndarray, segment: np.ndarray, count: int) -> np.ndarray:
+        """:meth:`_intensity_histogram` of each segment's intensities, as a (count, bins) array."""
+        n = self.achromatic_bins
+        if n == 1 or not len(intensity):
+            hist = np.zeros((count, n))
+            hist[:, 0] = np.bincount(segment, minlength=count)
+            return hist
+        position = (np.log(np.clip(intensity, self.min_intensity, 255.0)) - np.log(self.min_intensity)) \
+            / (np.log(255.0) - np.log(self.min_intensity)) * (n - 1)
+        low = np.minimum(np.floor(position).astype(np.int64), n - 2)
+        upper = position - low
+        # Every lower-bin weight, then every upper-bin weight: bincount adds in
+        # order, so each bin sums its weights as the two np.add.at calls did.
+        bins = np.concatenate((segment * n + low, segment * n + low + 1))
+        weights = np.concatenate((1.0 - upper, upper))
+        return np.bincount(bins, weights=weights, minlength=count * n).reshape(count, n)
+
     def embed(self, rgb: np.ndarray, detections: list[Detection2D]) -> list[np.ndarray | None]:
-        out: list[np.ndarray | None] = []
+        pixel_sets: list[np.ndarray | None] = []
         for detection in detections:
             # Subsample mask locations before copying RGB, rather than copying
             # every foreground pixel and immediately discarding almost all.
             sample_limit = self.max_pixels if self.max_pixels >= 2 * self.min_pixels else None
             pixels = _detection_pixels(rgb, detection, sample_limit)
             if pixels.shape[0] < self.min_pixels:
-                out.append(None)
+                pixel_sets.append(None)
                 continue
             if pixels.shape[0] > self.max_pixels:
                 pixels = pixels[:: int(np.ceil(pixels.shape[0] / self.max_pixels))]
-            hist = self._histogram(pixels)
+            pixel_sets.append(pixels)
+        if self.space == "chromaticity" and np.issubdtype(rgb.dtype, np.integer):
+            histograms = self._chroma_histograms(pixel_sets)
+        else:
+            histograms = [None if pixels is None else self._histogram(pixels) for pixels in pixel_sets]
+        out: list[np.ndarray | None] = []
+        for hist in histograms:
             if hist is None:
                 out.append(None)
                 continue

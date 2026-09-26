@@ -397,7 +397,7 @@ Every map update records per-stage timings (`FrameResult.timings`), the live nod
 | 4D scene graph construction | 0.5 ms | > 1 kHz | 5 Hz |
 | 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
 
-Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 53 ms per frame, or 95 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage (both with the [compiled kernels](#compiled-kernels)). Latency scales with image resolution and map size, so measure your own sequence:
+Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 53 ms per frame, or 95 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage (both with the [compiled kernels](#compiled-kernels)). Work that grows with the number of objects runs as array operations over all of them: the scene graph evaluates its predicates for every neighbouring pair at once, association builds its cost matrix in one pass, the colour histograms of all detections are binned together, and the points of every instance in view are projected and classified in a single call. With about 140 instances in view at 640x480 a frame takes 270 ms, where evaluating them one at a time took 480 ms; the results are identical. Latency scales with image resolution and map size, so measure your own sequence:
 
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
@@ -433,7 +433,7 @@ On a 4-core Xeon, with the kernels and without:
 | occlusion-aware rasterization of a 131k-point LiDAR scan, 640x480 / 1920x1200 / 5 MP | 4 / 8 / 20 ms | 26 / 32 / 53 ms |
 | sparse-depth filling (radius 2), 1920x1200 / 5 MP | 3 / 9 ms | 20 / 57 ms |
 | ground-plane fit, 300 / 2000 points (once per detection) | 8 / 32 us | 420 / 810 us |
-| map update, about 140 objects in view at 640x480 | 300 ms | 380 ms |
+| map update, about 140 objects in view at 640x480 | 260 ms | 390 ms |
 
 ### Persist the map (living memory across sessions)
 
