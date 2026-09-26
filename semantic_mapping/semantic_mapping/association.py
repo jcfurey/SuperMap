@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
+from semantic_mapping.appearance import cosine_similarity
 from semantic_mapping.geometry_utils import (
     bbox3d_gap, centroid, iou_3d, iou_3d_matrix, iou_xyxy, iou_xyxy_matrix, overlap_3d,
 )
@@ -302,6 +303,59 @@ def associate_relabel(
                 if agreement:
                     cost[r, c] = 1.0 - max(agreement)
     return _solve(cost, rows, cols, lambda i, j: True)
+
+
+def associate_unlifted(
+    visible_bboxes: list[np.ndarray | None],
+    detection_bboxes: list[np.ndarray],
+    detection_bboxes3d: list[np.ndarray | None],
+    detection_labels: list[str],
+    objects: list[ObjectInstance],
+    iou_threshold: float = 0.3,
+    candidate_tracks: list[int] | None = None,
+    candidate_detections: list[int] | None = None,
+    label_min_mass: float = DEFAULT_LABEL_MIN_MASS,
+    detection_embeddings: list[np.ndarray | None] | None = None,
+    relabel_min_similarity: float = 0.0,
+) -> AssociationResult:
+    """Match detections that lifted to no 3D box by where each instance can be seen.
+
+    Without depth on the object (a dark or absorbing surface, too few
+    returns), a detection can join an instance only in 2D, and against the
+    track's prediction that fails whenever the detection boxes a partly
+    hidden object: the prediction keeps the whole object's size. Here a
+    pair is admissible when the detection box overlaps ``visible_bboxes[i]``
+    (ObjectMap.visible_bbox: the part of the instance the depth image does
+    not rule out) by at least ``iou_threshold`` and either
+    - the labels are compatible, as in the other label-gated stages; or
+    - the detection looks like the instance: appearance similarity at least
+      ``relabel_min_similarity`` (0 = never). Without depth there is no 3D
+      test to keep a person standing in front of a chair out of the chair
+      (associate_relabel); a detection under a label the instance has not
+      taken joins it only when it is the same pixels, as a flickering
+      label on the same object is. Eq. (10) then weighs the label.
+    Detections with a 3D box are left to the 3D stages.
+    """
+    rows = list(range(len(objects))) if candidate_tracks is None else list(candidate_tracks)
+    all_cols = list(range(len(detection_bboxes))) if candidate_detections is None else list(candidate_detections)
+    cols = [j for j in all_cols if detection_bboxes3d[j] is None]
+    cost = np.full((len(rows), len(cols)), INVALID_COST, dtype=np.float64)
+    for r, i in enumerate(rows):
+        if visible_bboxes[i] is None:
+            continue
+        for c, j in enumerate(cols):
+            iou = iou_xyxy(visible_bboxes[i], detection_bboxes[j])
+            if iou < iou_threshold:
+                continue
+            if labels_compatible(detection_labels[j], objects[i].label_belief, label_min_mass) or (
+                    relabel_min_similarity > 0 and detection_embeddings is not None
+                    and detection_embeddings[j] is not None and objects[i].embedding is not None
+                    and cosine_similarity(detection_embeddings[j], objects[i].embedding) >= relabel_min_similarity):
+                cost[r, c] = 1.0 - iou
+    result = _solve(cost, rows, cols, lambda i, j: True)
+    matched = {j for _, j in result.matches}
+    result.unmatched_detections = [j for j in all_cols if j not in matched]  # lifted ones included, in order
+    return result
 
 
 def reidentify(

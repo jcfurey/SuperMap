@@ -15,7 +15,7 @@ from semantic_mapping.association import DEFAULT_LABEL_MIN_MASS, beliefs_compati
 from semantic_mapping import semantic_fusion as sf
 from semantic_mapping.appearance import cosine_similarity, update_running_embedding
 from semantic_mapping.geometry_utils import (
-    bbox3d_from_points, exceeds_size_limit, invert_se3, iou_3d, pack_voxel_keys, project_points,
+    bbox3d_from_points, exceeds_size_limit, invert_se3, iou_3d, overlap_3d, pack_voxel_keys, project_points,
 )
 from semantic_mapping.tracking import TrackKalmanState, init_track
 from semantic_mapping.types import Detection2D, ObjectInstance, ObjectStatus
@@ -26,6 +26,23 @@ _STATUS_RANK = {
     ObjectStatus.OCCLUDED: 2,
     ObjectStatus.ACTIVE: 3,
 }
+
+MATCH_HISTORY = 64
+"""Match stamps an instance keeps (ObjectInstance.match_stamps)."""
+
+
+def _recent_matches(stamps) -> list[float]:
+    return sorted(set(stamps))[-MATCH_HISTORY:]
+
+
+def _take_turns(older: ObjectInstance, younger: ObjectInstance, min_frames: int) -> bool:
+    """Whether both were detected since ``younger`` appeared, never in the same frame, over ``min_frames`` frames."""
+    since = younger.first_seen_stamp
+    if older.latest_stamp == younger.latest_stamp or older.latest_stamp < since:
+        return False  # detected together last time, or the older one not since (the common cases, checked first)
+    a = {s for s in older.match_stamps if s >= since}
+    b = {s for s in younger.match_stamps if s >= since}
+    return bool(a) and bool(b) and not (a & b) and len(a) + len(b) >= min_frames
 
 
 def voxel_downsample_indices(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -163,7 +180,8 @@ class ObjectMap:
         self.stats = {"size_rejected_observations": 0, "size_refused_associations": 0, "size_refused_merges": 0,
                       "mask_completions": 0, "ground_contact_completions": 0,
                       "support_culled_points": 0, "existence_culled": 0,
-                      "depth_split_matches": 0, "relabel_matches": 0}
+                      "depth_split_matches": 0, "relabel_matches": 0, "unlifted_matches": 0,
+                      "alternating_merges": 0}
         """Cumulative counts of size-limit, mask-completion and association decisions (the pipeline counts all
         but merges)."""
 
@@ -461,14 +479,18 @@ class ObjectMap:
 
     def visible_bbox(self, instance: ObjectInstance, K: np.ndarray, T_world_from_cam: np.ndarray,
                      depth_image: np.ndarray | None, min_points: int = 3) -> np.ndarray | None:
-        """Image box ``[x1, y1, x2, y2]`` of the instance's points the depth image confirms.
+        """Image box ``[x1, y1, x2, y2]`` of the instance's points the depth image does not rule out.
 
-        Where the object is seen in this frame, as opposed to where its track
-        predicts it or its whole 3D box projects: occlusion and the image
-        border leave only part of an object visible, and its detection boxes
-        only that part. Uses the classification :meth:`prepare_evidence`
-        computed for this frame when there is one. None without depth or
-        with fewer than ``min_points`` confirmed points.
+        Where the object can be seen in this frame, as opposed to where its
+        track predicts it or its whole 3D box projects: occlusion and the
+        image border leave only part of an object visible, and its detection
+        boxes only that part. A point counts when it projects into the image
+        and the depth there neither lies in front of it (hidden) nor behind it
+        (seen through): confirmed points, and points on pixels without a
+        reading, so an object whose own depth is missing still has the part
+        nothing nearer covers. Uses the classification
+        :meth:`prepare_evidence` computed for this frame when there is one.
+        None without depth or with fewer than ``min_points`` such points.
         """
         if depth_image is None or instance.points_world.shape[0] == 0:
             return None
@@ -478,7 +500,8 @@ class ObjectMap:
                 K, T_world_from_cam, depth_image, instance.points_world, self.tau_eps, self.contradiction_window_px)
         else:
             states, pixels = prepared
-        seen = pixels[states == gc.GeometricState.OBSERVABLE]
+        unread = (states == gc.GeometricState.OUT_OF_VIEW) & (pixels[:, 0] >= 0)  # in the image, no reading
+        seen = pixels[(states == gc.GeometricState.OBSERVABLE) | unread]
         if len(seen) < min_points:
             return None
         return np.array([seen[:, 0].min(), seen[:, 1].min(), seen[:, 0].max() + 1, seen[:, 1].max() + 1],
@@ -534,6 +557,7 @@ class ObjectMap:
             frames_since_seen=0,
             hits=1,
             geometry_stamp=stamp if n else None,
+            match_stamps=[float(stamp)],
         )
         if embedding is not None:
             instance.embedding, instance.embedding_count = update_running_embedding(None, 0, embedding)
@@ -570,6 +594,7 @@ class ObjectMap:
         instance.frames_since_seen = 0
         instance.missed_detection_frames = 0
         instance.hits += 1
+        instance.match_stamps = _recent_matches(instance.match_stamps + [float(stamp)])
         self._raise_existence(instance, detection.score)
         # Newly matched tentative tracks still need the configured hit check.
         # Retired tracks also pass through it: a retired identity may have
@@ -798,6 +823,7 @@ class ObjectMap:
                 keep.embedding_count = total
 
         keep.hits = total_hits
+        keep.match_stamps = _recent_matches(keep.match_stamps + drop.match_stamps)
         keep.existence_log_odds = max(keep.existence_log_odds, drop.existence_log_odds)
         keep.missed_detection_frames = min(keep.missed_detection_frames, drop.missed_detection_frames)
         keep.frames_since_seen = min(keep.frames_since_seen, drop.frames_since_seen)
@@ -809,14 +835,29 @@ class ObjectMap:
             keep.status = drop.status
         del self.objects[drop.instance_id]
 
-    def merge_duplicates(self, iou_threshold: float = 0.3, distance_threshold: float = 0.25) -> list[tuple[int, int]]:
-        """Merge label-compatible live instances that occupy the same space.
+    def merge_duplicates(self, iou_threshold: float = 0.3, distance_threshold: float = 0.25,
+                         alternating_min_overlap: float = 0.0,
+                         alternating_min_frames: int = 3) -> list[tuple[int, int]]:
+        """Merge live instances that are one physical object.
 
         Duplicates arise when a detection failed to associate for a frame or
-        two and spawned a second instance for the same physical object. The
-        older instance ID always survives, preserving the identity that the
-        scene graph's temporal edges already reference. Returns (kept, dropped)
-        ID pairs.
+        two and spawned a second instance for the same physical object. Two
+        instances merge when either
+        - their labels are compatible and their boxes overlap by more than
+          ``iou_threshold`` IoU or their centres lie within
+          ``distance_threshold``; or
+        - they take turns being detected: at least ``alternating_min_overlap``
+          of the smaller box lies inside the other, both were matched since
+          the younger appeared, over at least ``alternating_min_frames`` frames
+          between them, and never in the same frame. That is one object whose
+          detector label flickers (the flipped detections founded and fed the
+          second instance), whatever the labels; two objects in one place,
+          such as a cushion on a sofa, are detected together. An older
+          instance no longer detected since the younger appeared (a handover,
+          e.g. a replacement) does not qualify. 0 disables this rule.
+        The older instance ID always survives, preserving the identity that
+        the scene graph's temporal edges already reference. Returns (kept,
+        dropped) ID pairs.
         """
         merged: list[tuple[int, int]] = []
         live = sorted(
@@ -853,19 +894,23 @@ class ObjectMap:
                 drop = live[j]
                 if drop.instance_id not in self.objects:
                     continue
-                if not beliefs_compatible(keep.label_belief, drop.label_belief, self.label_min_mass):
+                duplicate = beliefs_compatible(keep.label_belief, drop.label_belief, self.label_min_mass) and (
+                    iou_3d(keep.bbox3d, drop.bbox3d) > iou_threshold
+                    or float(np.linalg.norm(keep.center - drop.center)) < distance_threshold)
+                alternating = not duplicate and alternating_min_overlap > 0 \
+                    and _take_turns(keep, drop, alternating_min_frames) \
+                    and overlap_3d(keep.bbox3d, drop.bbox3d, self.voxel_size / 2.0) >= alternating_min_overlap
+                if not (duplicate or alternating):
                     continue
-                overlapping = iou_3d(keep.bbox3d, drop.bbox3d) > iou_threshold
-                close = float(np.linalg.norm(keep.center - drop.center)) < distance_threshold
-                if (overlapping or close) and self.size_limits:
+                if self.size_limits:
                     pad = self.voxel_size / 2.0
                     unpadded = drop.bbox3d + np.array([pad, pad, pad, -pad, -pad, -pad])
                     if self.growth_exceeds_limit(keep, unpadded, (drop.label,)):
                         self.stats["size_refused_merges"] += 1
                         continue
-                if overlapping or close:
-                    self._merge_into(keep, drop)
-                    merged.append((keep.instance_id, drop.instance_id))
+                self._merge_into(keep, drop)
+                merged.append((keep.instance_id, drop.instance_id))
+                self.stats["alternating_merges"] += int(alternating)
         return merged
 
     def reconcile_retired(
@@ -978,8 +1023,8 @@ class ObjectMap:
 
     def shift_stamps(self, offset: float) -> None:
         """Add ``offset`` seconds to every stored timestamp (clock-epoch rebase, see
-        SemanticMappingPipeline.load): latest/first-seen/geometry stamps and the
-        trajectory, so ages and orderings between instances are preserved."""
+        SemanticMappingPipeline.load): latest/first-seen/geometry/match stamps and
+        the trajectory, so ages and orderings between instances are preserved."""
         if offset == 0:
             return
         for obj in self.objects.values():
@@ -987,6 +1032,7 @@ class ObjectMap:
             obj.latest_stamp += offset
             if obj.geometry_stamp is not None:
                 obj.geometry_stamp += offset
+            obj.match_stamps = [stamp + offset for stamp in obj.match_stamps]
             obj.trajectory = [(stamp + offset, center, status) for stamp, center, status in obj.trajectory]
 
     def newest_stamp(self) -> float | None:

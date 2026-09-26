@@ -186,6 +186,11 @@ class ObjectInstance:
     """Log-odds that this instance is a real object (ObjectMap existence_*): raised
     by score-weighted detections, lowered by frames in which the detector could
     have seen it and did not. Only maintained when existence_hit_gain > 0."""
+    match_stamps: list[float] = field(default_factory=list)
+    """Stamps of the most recent frames whose detection was fused into this
+    instance (object_map.MATCH_HISTORY of them): two co-located instances that
+    take turns being detected and are never detected in the same frame are one
+    object under a flickering label (ObjectMap.merge_duplicates)."""
 
     @property
     def label(self) -> str:

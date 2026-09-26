@@ -198,7 +198,8 @@
     use_semantic_fusion: true              # false: latest detection's label, no Eq. (10), no membership pruning
     use_geometric_consistency: true        # false: no Eq. (7)-(9); points never pruned, objects never retired
     # Staged association (Sec. IV-B): 2D high-confidence -> 2D low-confidence
-    # (ByteTrack) -> 3D-aware re-activation -> relabelling -> re-identification -> spawn.
+    # (ByteTrack) -> 3D-aware re-activation -> relabelling -> detections without
+    # depth, by the visible part -> re-identification -> spawn.
     association_iou_threshold: 0.3
     high_score_threshold: 0.5              # detections below this only match existing tracks, never spawn
     low_score_iou_threshold: 0.2
@@ -214,6 +215,10 @@
     min_points_for_3d_association: 5
     merge_iou_threshold: 0.3               # duplicate instances (same label) merged when their 3D boxes overlap this much
     merge_distance_m: 0.25                 #   ... or their centroids are this close; the older ID survives
+    merge_alternating_min_overlap: 0.5     # also merged, whatever the labels, when this much of the smaller 3D box lies
+                                           # in the other and they take turns being detected (never in the same
+                                           # frame): one object under a flickering label; 0 = off
+    merge_alternating_min_frames: 3        #   ... over at least this many frames since the younger appeared
     disappeared_prune_grace_frames: 60      # release a disappeared instance's points after N frames; its identity stays
     max_retired_instances: 1000             # retired identities kept for re-identification (least recently seen evicted)
     # Re-identification: an unmatched detection re-attaches to a retired
@@ -225,7 +230,8 @@
     clip_model: ViT-B-32
     clip_pretrained: openai
     reid_enabled: true
-    reid_min_similarity: 0.85               # cosine similarity floor; ~0.85 for histograms, ~0.9 for CLIP
+    reid_min_similarity: 0.85               # cosine similarity floor; ~0.85 for histograms, ~0.9 for CLIP; also what a
+                                            # detection without depth under a new label needs to join an instance
     reid_max_age_sec: 0.0                   # 0 = re-identify no matter how long ago it was last seen
     # A relocation (a provisional instance folded into a just-retired one, or a retired instance
     # re-identified elsewhere by appearance) is only accepted this close to where it was ...
