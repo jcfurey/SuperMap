@@ -397,7 +397,7 @@ Every map update records per-stage timings (`FrameResult.timings`), the live nod
 | 4D scene graph construction | 0.5 ms | > 1 kHz | 5 Hz |
 | 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
 
-Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 49 ms per frame, or 108 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage. Latency scales with image resolution and map size, so measure your own sequence:
+Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 53 ms per frame, or 95 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage (both with the [compiled kernels](#compiled-kernels)). Latency scales with image resolution and map size, so measure your own sequence:
 
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
@@ -405,25 +405,35 @@ python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runti
 
 ### Compiled kernels
 
-`supermap_kernels` reimplements the hottest NumPy/SciPy loops in C++ (pybind11,
-OpenMP when available): the dense-cloud surface graph (normals, edges,
-connected components, incremental updates) and the footprint z-buffer that
-occlusion-aware LiDAR rasterization and dense camera labelling share. colcon
-builds it with the workspace; offline, `pip install ./supermap_kernels` (from the
-repository root). Without it everything runs on the NumPy/SciPy code, which
-stays the reference: the tests compare every kernel with it, and CI runs the
-suite on both. The z-buffer is bit-identical; the surface graph gives the same
-regions and labels except where equally distant neighbours tie for a voxel's
-k-th neighbour (SciPy breaks such ties by its tree layout, the kernels by point
-index). `SUPERMAP_NATIVE_KERNELS=0` or the dense node's `native_kernels: false`
-selects the fallback, and the dense result reports the backend in
+`supermap_kernels` reimplements the loops that stay slow in NumPy/SciPy in C++
+(pybind11, OpenMP when available): the dense-cloud surface graph (normals and
+edges from one neighbour search, connected components, incremental updates),
+the image kernels (occlusion-aware LiDAR rasterization, the footprint z-buffer
+of dense camera labelling, sparse-depth filling), and the local ground-plane
+fit run for every detection. colcon builds it with the workspace; offline,
+`pip install ./supermap_kernels` (from the repository root). Without it
+everything runs on the NumPy/SciPy code, which stays the reference: the tests
+compare every kernel with it, and CI runs the suite on both. The image kernels
+are bit-identical. The ground-plane fit agrees to rounding (its least squares
+is not LAPACK's), which left every map in the tests unchanged. The surface
+graph gives the same regions and labels except where equally distant
+neighbours tie for a voxel's k-th neighbour (SciPy breaks such ties by its tree
+layout, the kernels by point index). Small inputs run on one thread, where a
+thread team would cost more than it saves and compete with NumPy's BLAS threads.
+`SUPERMAP_NATIVE_KERNELS=0` or the dense node's `native_kernels: false` selects
+the fallback, and the dense result reports the backend in
 `stats["segmentation_backend"]`.
 
-On a 4-core Xeon, a 1M-point dense snapshot (630k voxels) segments in about
-1.7 s with the kernels and 7.9 s without, and an update after a local change
-takes 1.6 s instead of 2.6 s. Occlusion-aware rasterization of a 131k-point
-LiDAR scan takes 10 ms instead of 27 ms at 640x480 (17 instead of 25 ms at
-1920x1200, where it already splats on a coarser grid).
+On a 4-core Xeon, with the kernels and without:
+
+| workload | kernels | NumPy/SciPy |
+|---|---|---|
+| dense snapshot, 1M points (630k voxels) | 1.1 s | 7.9 s |
+| dense update after a local change, same map | 0.9 s | 2.6 s |
+| occlusion-aware rasterization of a 131k-point LiDAR scan, 640x480 / 1920x1200 / 5 MP | 4 / 8 / 20 ms | 26 / 32 / 53 ms |
+| sparse-depth filling (radius 2), 1920x1200 / 5 MP | 3 / 9 ms | 20 / 57 ms |
+| ground-plane fit, 300 / 2000 points (once per detection) | 8 / 32 us | 420 / 810 us |
+| map update, about 140 objects in view at 640x480 | 300 ms | 380 ms |
 
 ### Persist the map (living memory across sessions)
 

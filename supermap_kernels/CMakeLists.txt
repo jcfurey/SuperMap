@@ -21,7 +21,9 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(_native PRIVATE OpenMP::OpenMP_CXX)
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(_native PRIVATE -Wall -Wextra)
+  # No fused multiply-add contraction: arithmetic rounds step by step, as
+  # NumPy's separate ufuncs do, on every target (FMA is baseline on aarch64).
+  target_compile_options(_native PRIVATE -Wall -Wextra -ffp-contract=off)
 endif()
 
 if(SKBUILD)

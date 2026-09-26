@@ -268,6 +268,9 @@ def occlusion_visible(us: Array, vs: Array, z: Array, focal: float, width: int, 
     visible = np.ones(len(z), dtype=bool)
     if radius_m <= 0 or not len(z):
         return visible
+    if native.kernels is not None:  # the same test without full-image temporaries
+        return native.kernels.occlusion_visible(us, vs, z, focal, width, height, radius_m, max_px, gap_m, int(grid_px),
+                                                keep_dense_surfaces)
     dense = np.zeros(len(z), dtype=bool)
     if keep_dense_surfaces:
         nearest = np.full(width * height, np.inf)
@@ -333,6 +336,8 @@ def rasterize_depth(points_cam: Array, K: Array, width: int, height: int, *, spl
                                     keep_dense_surfaces=True)
         us, vs, z = us[visible], vs[visible], z[visible]
 
+    if native.kernels is not None:
+        return native.kernels.depth_image(us, vs, z, width, height)
     # Per-pixel minimum through an unbuffered scatter: no sort, so a LiDAR
     # scan of a few hundred thousand points rasterizes in half the time of a
     # far-to-near z-buffer and the cost stays linear in the point count.
@@ -357,6 +362,8 @@ def fill_sparse_depth(depth: Array, radius_px: int) -> Array:
     depth = np.asarray(depth, dtype=np.float64)
     if radius_px <= 0:
         return depth
+    if native.kernels is not None:  # one separable pass, no full-image temporaries
+        return native.kernels.fill_sparse_depth(depth, int(radius_px))
     import cv2
 
     valid = np.isfinite(depth)
@@ -465,6 +472,11 @@ def fit_ground_plane(
     level fallback (and None plane).
     """
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if native.kernels is not None:
+        # Same steps in one call (it runs once per detection); the plane agrees to rounding.
+        result = native.kernels.fit_ground_plane(points, tolerance_m, max_slope, cell_m, iterations)
+        if result is not None:
+            return result if return_fitted else result[0]
     points = points[np.all(np.isfinite(points), axis=1)]
     if points.shape[0] == 0:
         return (None, False) if return_fitted else None

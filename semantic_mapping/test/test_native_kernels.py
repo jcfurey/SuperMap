@@ -111,9 +111,11 @@ def test_edge_remap_matches_the_numpy_expression():
     r, c = old_to_new[rows], old_to_new[cols]
     keep = (r >= 0) & (c >= 0)
     keep &= ~dirty[r]
-    actual = K.remap_edges(rows, cols, old_to_new, dirty)
-    np.testing.assert_array_equal(actual[0], r[keep])
-    np.testing.assert_array_equal(actual[1], c[keep])
+    fresh = rng.integers(0, new_n, (2, 300)).astype(np.int32)
+    for workers in (1, -1):
+        actual = K.remap_edges(rows, cols, old_to_new, dirty, fresh[0], fresh[1], workers)
+        np.testing.assert_array_equal(actual[0], np.concatenate([r[keep], fresh[0]]))
+        np.testing.assert_array_equal(actual[1], np.concatenate([c[keep], fresh[1]]))
 
 
 def test_splat_is_bit_identical(monkeypatch):
@@ -149,7 +151,8 @@ def test_kernels_validate_their_inputs():
     with pytest.raises(IndexError):
         K.connected_components(3, np.array([0, 3], np.int32), np.array([1, 1], np.int32))
     with pytest.raises(IndexError):
-        K.remap_edges(np.array([5], np.int32), np.array([0], np.int32), np.zeros(3, np.int32), np.zeros(3, bool))
+        K.remap_edges(np.array([5], np.int32), np.array([0], np.int32), np.zeros(3, np.int32), np.zeros(3, bool),
+                      np.zeros(0, np.int32), np.zeros(0, np.int32))
 
 
 def _camera(stamp):
@@ -187,3 +190,98 @@ def test_dense_pipeline_gives_the_same_map_with_either_backend(mode):
         for field in ("region_ids", "semantic_ids", "confidence", "label_source", "camera_visible", "map_points_world",
                       "map_region_ids", "map_semantic_ids", "map_confidence", "map_label_source"):
             np.testing.assert_array_equal(getattr(compiled, field), getattr(python, field), err_msg=field)
+
+
+def _reference_fit(points, *args, monkeypatch=None):
+    monkeypatch.setattr(native, "kernels", None)
+    try:
+        return geometry_utils.fit_ground_plane(points, *args, return_fitted=True)
+    finally:
+        monkeypatch.undo()
+
+
+def test_ground_plane_fit_matches_the_reference(monkeypatch):
+    rng = np.random.default_rng(10)
+    for trial in range(400):
+        m = int(rng.integers(0, 1500))
+        spread = (3, 3, 400)[trial % 3]  # the last one takes the hashed-cell path
+        xy = rng.uniform(-spread, spread, (m, 2)) + rng.uniform(-50, 50, 2)
+        z = xy @ rng.uniform(-.3, .3, 2) + rng.normal(0, .02, m) + rng.uniform(-2, 2)
+        clutter = rng.random(m) < rng.uniform(0, .6)
+        z[clutter] += rng.uniform(.2, 1.5, clutter.sum())
+        points = np.column_stack([xy, z])
+        if trial % 5 == 0:
+            points[:, 1] = points[:1, 1] + rng.normal(0, 1e-3, m)  # nearly collinear: level fallback
+        if trial % 7 == 0 and m > 10:
+            points[:, 2] = np.round(points[:, 2], 1)  # equal heights: the tie-breaking decides seeds and anchor
+        if trial % 11 == 0 and m:
+            points[rng.integers(0, m, 3)] = np.nan
+        args = (rng.uniform(.05, .3), rng.uniform(.05, .4))
+        expected = _reference_fit(points, *args, monkeypatch=monkeypatch)
+        plane, fitted = geometry_utils.fit_ground_plane(points, *args, return_fitted=True)
+        assert fitted == expected[1] and (plane is None) == (expected[0] is None)
+        if plane is not None:
+            if fitted:  # least squares: to rounding
+                np.testing.assert_allclose(plane, expected[0], rtol=0, atol=1e-9)
+            else:  # the level fallback is computed exactly
+                np.testing.assert_array_equal(plane, expected[0])
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # the NumPy reference overflows on 1e300, as intended
+def test_ground_plane_fit_falls_back_for_coordinates_beyond_integer_cells(monkeypatch):
+    points = np.array([[1e300, 0., 0.], [0., 1., 0.], [1., 0., 0.], [1., 1., 0.]])
+    assert K.fit_ground_plane(points, .15, .25, .5, 3) is None
+    expected = _reference_fit(points, .15, .25, monkeypatch=monkeypatch)
+    actual = geometry_utils.fit_ground_plane(points, .15, .25, return_fitted=True)
+    assert actual[1] == expected[1]
+    np.testing.assert_array_equal(actual[0], expected[0])
+    assert K.fit_ground_plane(np.zeros((0, 3)), .15, .25, .5, 3) == (None, False)
+
+
+def _with_and_without_kernels(monkeypatch, fn, *args, **kwargs):
+    compiled = fn(*args, **kwargs)
+    monkeypatch.setattr(native, "kernels", None)
+    try:
+        return compiled, fn(*args, **kwargs)
+    finally:
+        monkeypatch.undo()
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # NaN readings in the NumPy reference, as intended
+def test_sparse_depth_fill_is_bit_identical(monkeypatch):
+    rng = np.random.default_rng(11)
+    for shape in [(1, 1), (1, 9), (9, 1), (61, 97), (140, 70)]:  # 140 rows: more than one band of rows
+        for density in (0.0, 0.03, 0.5, 1.0):
+            for radius in (1, 2, 5, 200):  # a window wider than the image
+                depth = np.where(rng.random(shape) < density, rng.uniform(.1, 50, shape), 0.0)
+                special = rng.random(shape) < .03
+                depth[special] = rng.choice([np.nan, np.inf, -np.inf, -1.0], special.sum())
+                compiled, reference = _with_and_without_kernels(monkeypatch, geometry_utils.fill_sparse_depth, depth, radius)
+                assert compiled.dtype == reference.dtype and compiled.shape == reference.shape
+                np.testing.assert_array_equal(compiled, reference)
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_rasterization_and_occlusion_are_bit_identical(monkeypatch):
+    rng = np.random.default_rng(12)
+    for w, h, f in ((97, 61, 80.0), (320, 240, 250.0)):
+        points = np.column_stack([rng.uniform(-20, 20, 8000), rng.uniform(-5, 5, 8000), rng.uniform(-2, 30, 8000)])
+        points[:300] = points[300:600] * [1, 1, 1.001]  # densely sampled surfaces for keep_dense_surfaces
+        points[rng.integers(0, 8000, 20)] = np.nan
+        camera = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]])
+        us, vs, z = rng.integers(0, w, 3000), rng.integers(0, h, 3000), rng.uniform(.3, 30, 3000)
+        z[:3] = [np.nan, np.inf, 1e-9]
+        us[3:8], vs[3:8] = us[8], vs[8]  # several points on one pixel
+        for grid in (1, 3):
+            for radius in (0.0, .05, .3):
+                compiled, reference = _with_and_without_kernels(
+                    monkeypatch, geometry_utils.rasterize_depth, points, camera, w, h, splat_radius_m=radius, occlusion_grid_px=grid)
+                assert compiled.dtype == reference.dtype and compiled.shape == reference.shape
+                np.testing.assert_array_equal(compiled, reference)
+                for keep in (False, True):
+                    compiled, reference = _with_and_without_kernels(
+                        monkeypatch, geometry_utils.occlusion_visible, us, vs, z, f, w, h, radius_m=radius, max_px=8,
+                        gap_m=.3, grid_px=grid, keep_dense_surfaces=keep)
+                    np.testing.assert_array_equal(compiled, reference)
+    with pytest.raises(IndexError):
+        K.depth_image(np.array([5]), np.array([0]), np.array([1.0]), 5, 5)

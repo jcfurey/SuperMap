@@ -311,12 +311,25 @@ class SurfaceGraph:
                    np.empty(0, np.int32), np.empty(0, np.int32))
 
 
+def _native_surface_graph(kernels, points, normal_index, edge_index, normals, reliable, config):
+    """_surface_normals for ``normal_index`` then _surface_edges for ``edge_index``
+    from one compiled neighbour search; ``normals``/``reliable`` hold every other
+    point's values. Same results as the two calls."""
+    return kernels.surface_graph(points, normal_index, edge_index, config.normal_radius, config.neighbor_radius,
+                                 config.max_neighbors, math.cos(math.radians(config.normal_angle_deg)),
+                                 config.plane_tolerance, normals, reliable, config.workers)
+
+
 def build_surface_graph(points: np.ndarray, config: DenseCloudConfig) -> SurfaceGraph:
     n = len(points)
     if not n:
         return SurfaceGraph.empty()
-    tree = cKDTree(points) if _kernels(config) is None else None
     index = np.arange(n)
+    kernels = _kernels(config)
+    if kernels is not None:
+        return SurfaceGraph(points, *_native_surface_graph(kernels, points, index, index, np.zeros((n, 3)),
+                                                           np.zeros(n, bool), config))
+    tree = cKDTree(points)
     normals, reliable = _surface_normals(points, tree, index, config)
     rows, cols = _surface_edges(points, tree, normals, reliable, index, config)
     return SurfaceGraph(points, normals, reliable, rows, cols)
@@ -365,24 +378,29 @@ def update_surface_graph(previous: SurfaceGraph, old_index: np.ndarray, new_inde
     if edge_dirty.mean() > max_dirty_fraction:
         graph = build_surface_graph(points, config)
         return graph, {"incremental": False, "dirty_voxels": n}
-    tree = cKDTree(points) if kernels is None else None
     normals = np.zeros((n, 3))
     reliable = np.zeros(n, bool)
     normals[kept_new], reliable[kept_new] = previous.normals[kept_old], previous.reliable[kept_old]
     dirty = np.flatnonzero(normal_dirty)
-    if len(dirty):
-        normals[dirty], reliable[dirty] = _surface_normals(points, tree, dirty, config)
-    # Surviving edges, renumbered, except those of dirty voxels (rebuilt below).
     if kernels is not None:
-        rows, cols = kernels.remap_edges(previous.rows, previous.cols, old_to_new, edge_dirty)
+        normals, reliable, fresh_rows, fresh_cols = _native_surface_graph(
+            kernels, points, dirty, np.flatnonzero(edge_dirty), normals, reliable, config)
+    else:
+        tree = cKDTree(points)
+        if len(dirty):
+            normals[dirty], reliable[dirty] = _surface_normals(points, tree, dirty, config)
+        fresh_rows, fresh_cols = _surface_edges(points, tree, normals, reliable, np.flatnonzero(edge_dirty), config)
+    # Surviving edges, renumbered, except those of dirty voxels (rebuilt above), then the rebuilt ones.
+    if kernels is not None:
+        rows, cols = kernels.remap_edges(previous.rows, previous.cols, old_to_new, edge_dirty, fresh_rows, fresh_cols,
+                                         config.workers)
     else:
         rows = old_to_new[previous.rows]
         cols = old_to_new[previous.cols]
         keep = (rows >= 0) & (cols >= 0)
         keep &= ~edge_dirty[rows]  # a removed row (-1) reads the last voxel, but keep already dropped it
-        rows, cols = rows[keep], cols[keep]
-    fresh_rows, fresh_cols = _surface_edges(points, tree, normals, reliable, np.flatnonzero(edge_dirty), config)
-    graph = SurfaceGraph(points, normals, reliable, np.concatenate([rows, fresh_rows]), np.concatenate([cols, fresh_cols]))
+        rows, cols = np.concatenate([rows[keep], fresh_rows]), np.concatenate([cols[keep], fresh_cols])
+    graph = SurfaceGraph(points, normals, reliable, rows, cols)
     return graph, {"incremental": True, "dirty_voxels": int(edge_dirty.sum())}
 
 
