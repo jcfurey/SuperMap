@@ -57,6 +57,23 @@ class Detection2D:
     embedding: np.ndarray | None = None
     """Optional open-vocabulary embedding (e.g. CLIP) for label-free matching."""
 
+    def mask_bounds(self) -> tuple[int, int, int, int] | None:
+        """Rows ``[y1, y2)`` and columns ``[x1, x2)`` holding the mask's pixels (None for
+        an empty mask; the mask must be set), computed once per mask array.
+
+        Several stages crop to the mask, and each whole-image scan costs as
+        much as the stage's own work on a small object. Masks are treated as
+        read-only once attached: assigning a new array recomputes the bounds,
+        writing into the attached one would not.
+        """
+        from semantic_mapping.geometry_utils import mask_bounds
+
+        cached = self.__dict__.get("_mask_bounds")
+        if cached is None or cached[0] is not self.mask:
+            cached = (self.mask, mask_bounds(self.mask))
+            self.__dict__["_mask_bounds"] = cached
+        return cached[1]
+
     def validate_mask(self, image_shape: tuple[int, int]) -> None:
         """Masks must address pixels in the original image, not a resized model input."""
         if self.mask is not None:

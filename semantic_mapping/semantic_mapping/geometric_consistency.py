@@ -136,6 +136,31 @@ def project_and_classify(
     return states, delta_d, pixels_int
 
 
+def project_and_classify_many(
+    K: np.ndarray,
+    T_world_from_cam: np.ndarray,
+    depth_image: np.ndarray,
+    point_sets: list[np.ndarray],
+    tau_eps: float,
+    contradiction_window_px: int = 0,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """:func:`project_and_classify` for several point sets in one pass.
+
+    Every step classifies each point on its own (the camera transform is a
+    4x4 product per point), so projecting the concatenation and splitting
+    the result gives each set exactly what its own call gives, for one
+    call's overhead instead of one per object.
+    """
+    sizes = [points.shape[0] for points in point_sets]
+    if not sizes:
+        return []
+    points = np.concatenate([np.asarray(p, dtype=np.float64).reshape(-1, 3) for p in point_sets])
+    states, delta_d, pixels = project_and_classify(
+        K, T_world_from_cam, depth_image, points, tau_eps, contradiction_window_px)
+    bounds = np.cumsum([0] + sizes)
+    return [(states[a:b], delta_d[a:b], pixels[a:b]) for a, b in zip(bounds[:-1], bounds[1:])]
+
+
 def classify_points(
     K: np.ndarray,
     T_world_from_cam: np.ndarray,
@@ -180,15 +205,21 @@ def update_object_points(
     p_miss: float = 0.1,
     p_unknown: float = 0.5,
     contradiction_window_px: int = 0,
+    classification: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """One fused geometric-consistency step for all points of an object.
 
     Returns the updated per-point log-odds, the raw classification (so callers
     can restrict semantic updates to points classified
     :attr:`GeometricState.OBSERVABLE`), and each point's projected pixel.
+    ``classification`` passes the (states, pixels) of these points computed
+    in advance (:func:`project_and_classify_many`) instead of projecting here.
     """
-    states, _delta_d, pixels = project_and_classify(
-        K, T_world_from_cam, depth_image, points_world, tau_eps, contradiction_window_px)
+    if classification is None:
+        states, _delta_d, pixels = project_and_classify(
+            K, T_world_from_cam, depth_image, points_world, tau_eps, contradiction_window_px)
+    else:
+        states, pixels = classification
     probabilities = inverse_sensor_model(states, p_hit=p_hit, p_miss=p_miss, p_unknown=p_unknown)
     new_log_odds = update_log_odds(prior_log_odds, probabilities)
     return new_log_odds, states, pixels

@@ -114,6 +114,40 @@ Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--confi
 
 `evaluate.py --ablation` re-runs the sequence with each module of the Sec. V-E ablation switched off (`use_2d_tracker`, `use_semantic_fusion`, `use_geometric_consistency`) and prints the final-map precision / recall / F1 of each, as in Table V. On the synthetic scene only the geometric-consistency update changes the final map (precision 0.89 → 0.67, because removed objects are never retired): its labels never flicker and its motion is gentle enough for 3D association alone, so the tracker and fusion ablations need a real capture to separate.
 
+### Check against the paper
+
+`examples/paper_harness.py` checks the package against every quantitative result in the paper's Sec. V. The numbers are transcribed in `config/paper_results.yaml`, with the baselines' rows, so claims such as "outperforms ConceptGraphs" can be tested too. The paper's ScanNet scene list is not published and its robot captures are private, so each check says what kind of comparison it is:
+
+- **reproduction**: on the paper's own data, the value must fall within a tolerance.
+- **floor**: on easier data, the value must not fall below the paper's.
+- **claim**: a statement the paper draws from its tables must hold.
+- **not run**: the data is missing; the report says why.
+
+```bash
+python examples/paper_harness.py                                  # synthetic suite (CI runs this)
+python examples/paper_harness.py --scannet scans/scene0011_00 scans/scene0050_00 \
+    --detector groundingdino --cache_detections                   # Tables II-III, pooled over the scenes
+python examples/paper_harness.py --scannet scans/scene0011_00 --detector offline   # rerun from the cache
+python examples/paper_harness.py --capture data/my_capture         # Tables IV-V on a capture with ground truth
+```
+
+The synthetic suite checks the following:
+
+- **Table IV floors.** The change scene has Table IV's six objects (bucket, cart and safety sign introduced; plant, trash can and chair removed). Their detection and change recall must reach the paper's real-world values.
+- **Identity claims (Sec. V-C, Fig. 3).** Removed objects keep one ID, introduced objects get new ones, objects that stay put keep theirs, and moved or returned objects keep theirs.
+- **Table V claim.** The full system must beat every ablation. The plain scene cannot separate the modules, so this runs on a stress version over 5 seeds: one detection in five reports a confusable prompted label (bucket for trash can, bag for backpack), and four dark objects lose their depth in half the frames. On the stress scene, the full system has the highest F1 against every ablation on 5 of 5 seeds.
+
+  | configuration | F1 |
+  |---|---|
+  | All | 0.70 |
+  | W/o 2D Tracker | 0.48 |
+  | W/o Semantic Fusion | 0.60 |
+  | W/o Geometric Consistency Update | 0.57 |
+
+- **Sec. V-H rates.** The 3 Hz mapping and 5 Hz scene-graph rates are floors.
+
+Each failed floor or claim fails the run, unless `config/paper_deviations.yaml` lists it with an explanation. One is listed today. The removed chair's change recall is 0.935 against the paper's 1.000: the log-odds filter of Eq. 8 needs four observations of the empty spot to retire a well-established object. That costs 3 of the 13 frames the synthetic scene sees the spot empty, a lag the paper's 10-minute run would hide.
+
 ## Run (live ROS2)
 
 ```bash
@@ -397,7 +431,7 @@ Every map update records per-stage timings (`FrameResult.timings`), the live nod
 | 4D scene graph construction | 0.5 ms | > 1 kHz | 5 Hz |
 | 2D detector | model-bound (YOLOE / Grounding DINO + SAM2 on GPU) | | 1 Hz |
 
-Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 53 ms per frame, or 95 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage (both with the [compiled kernels](#compiled-kernels)). Latency scales with image resolution and map size, so measure your own sequence:
+Back-projection (17 ms), the geometric-consistency update over all instance points (7.5 ms), and the appearance embeddings (6.4 ms) share the cost; memory is 0.5 MiB of point arrays for 11 instances and a 106 MiB process. Each detection is lifted from the crop around its mask (plus the ground-fit and depth-fill margins), so its cost follows the object's size rather than the camera's resolution: the same scene at 1920x1200 takes 53 ms per frame, or 95 ms with `depth_fill_radius_px: 2`, whose whole-frame fill of the evidence depth is timed as the `depth` stage (both with the [compiled kernels](#compiled-kernels)). Work that grows with the number of objects runs as array operations over all of them: the scene graph evaluates its predicates for every neighbouring pair at once, association builds its cost matrix in one pass, the colour histograms of all detections are binned together, and the points of every instance in view are projected and classified in a single call. With about 140 instances in view at 640x480 a frame takes 270 ms, where evaluating them one at a time took 480 ms; the results are identical. Latency scales with image resolution and map size, so measure your own sequence:
 
 ```bash
 python examples/benchmark.py --data_dir <sequence> --detector yoloe --json runtime.json
@@ -433,7 +467,7 @@ On a 4-core Xeon, with the kernels and without:
 | occlusion-aware rasterization of a 131k-point LiDAR scan, 640x480 / 1920x1200 / 5 MP | 4 / 8 / 20 ms | 26 / 32 / 53 ms |
 | sparse-depth filling (radius 2), 1920x1200 / 5 MP | 3 / 9 ms | 20 / 57 ms |
 | ground-plane fit, 300 / 2000 points (once per detection) | 8 / 32 us | 420 / 810 us |
-| map update, about 140 objects in view at 640x480 | 300 ms | 380 ms |
+| map update, about 140 objects in view at 640x480 | 260 ms | 400 ms |
 
 ### Persist the map (living memory across sessions)
 

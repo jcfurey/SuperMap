@@ -67,6 +67,9 @@ jobs:
               print(("PASS " if ok else "FAIL ") + name)
           assert all(checks.values()), "metric regression"
           EOF
+      - name: Paper harness (Sec. V results; synthetic suite, report in the job summary)
+        if: matrix.python-version == '3.12'
+        run: python examples/paper_harness.py --markdown paper_report.md --append_summary "$GITHUB_STEP_SUMMARY"
 
   docker-lite:
     name: docker image (ROS 2 Jazzy, no detector stack) + colcon test

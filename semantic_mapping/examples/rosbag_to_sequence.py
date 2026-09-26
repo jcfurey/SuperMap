@@ -48,6 +48,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from semantic_mapping.detectors.offline import write_detections  # noqa: E402
 from semantic_mapping.geometry_utils import (  # noqa: E402
     occlusion_grid_for, rasterize_depth, rotation_matrix_to_quaternion, transform_points,
 )
@@ -169,19 +170,6 @@ def pair_nearest(rgb_stamps: list[float], depth_stamps: list[float], slop: float
         if abs(best - stamp) <= slop:
             pairs[stamp] = float(best)
     return pairs
-
-
-def write_detections(detections_dir: Path, frame_id: int, detections) -> None:
-    detections_dir.mkdir(parents=True, exist_ok=True)
-    records = []
-    for i, det in enumerate(detections):
-        record = {"bbox": [float(v) for v in det.bbox], "label": det.label, "score": float(det.score)}
-        if det.mask is not None:
-            mask_name = f"{frame_id:06d}_{i}.npy"
-            np.save(detections_dir / mask_name, det.mask.astype(bool))
-            record["mask"] = mask_name
-        records.append(record)
-    (detections_dir / f"{frame_id:06d}.json").write_text(json.dumps({"detections": records}))
 
 
 def main() -> None:
