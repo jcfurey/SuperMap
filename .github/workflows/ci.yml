@@ -32,9 +32,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install numpy scipy PyYAML opencv-python-headless "pytest>=7.4,<8"
+      - name: Build the compiled kernels (supermap_kernels)
+        run: python -m pip install ../supermap_kernels
       - name: Generate the synthetic scene
         run: python examples/prepare_example_dataset.py
       - name: Unit tests (no ROS; test/ros and the ament linters are skipped without it)
+        run: python -m pytest test -q --ignore=test/ros --ignore=test/test_flake8.py --ignore=test/test_pep257.py --ignore=test/test_copyright.py
+      - name: Unit tests on the NumPy/SciPy fallback (kernels disabled)
+        env:
+          SUPERMAP_NATIVE_KERNELS: "0"
         run: python -m pytest test -q --ignore=test/ros --ignore=test/test_flake8.py --ignore=test/test_pep257.py --ignore=test/test_copyright.py
       - name: Offline pipeline, evaluation, query, benchmark
         run: |
@@ -75,7 +81,7 @@ jobs:
             set -e
             python3 examples/prepare_example_dataset.py
             cd /workspace
-            colcon build --symlink-install --packages-select supermap_msgs semantic_mapping
+            colcon build --symlink-install --packages-select supermap_msgs supermap_kernels semantic_mapping
             source install/setup.bash
             ROS_DOMAIN_ID=42 colcon test --packages-select supermap_msgs semantic_mapping \
               --event-handlers console_direct+ --return-code-on-test-failure

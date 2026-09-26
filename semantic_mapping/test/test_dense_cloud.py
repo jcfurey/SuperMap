@@ -302,3 +302,60 @@ def test_snapshot_with_unchanged_geometry_reuses_the_whole_graph():
     second = pipeline.update(scene, 2.)
     assert pipeline.last_segmentation == {"incremental": True, "dirty_voxels": 0}
     np.testing.assert_array_equal(first.region_ids, second.region_ids)
+
+
+def test_packed_cell_keys_give_row_wise_unique_and_match_results():
+    from semantic_mapping.dense_cloud import _cell_keys, _cell_match, _unique_cells
+
+    rng = np.random.default_rng(4)
+    limit = 1 << 20
+    for low, high in [(-3, 3), (-limit, limit), (-limit - 5, 5), (0, limit + 5)]:  # last two: fallback
+        cells = rng.integers(low, high, (500, 3))
+        cells[250:] = cells[:250]  # duplicates
+        expected = np.unique(cells, axis=0, return_index=True, return_inverse=True)
+        actual = _unique_cells(cells, return_index=True, return_inverse=True)
+        for a, b in zip(actual, expected):
+            np.testing.assert_array_equal(a, b.reshape(a.shape))
+        np.testing.assert_array_equal(_unique_cells(cells), expected[0])
+        old, new = expected[0], np.unique(np.concatenate([expected[0][::2], rng.integers(low, high, (50, 3))]), axis=0)
+        index = np.searchsorted(_cell_keys(old), _cell_keys(new))
+        found = np.flatnonzero(index < len(old))
+        found = found[_cell_keys(old)[index[found]] == _cell_keys(new)[found]]
+        matched = _cell_match(old, new)
+        np.testing.assert_array_equal(matched[0], index[found])
+        np.testing.assert_array_equal(matched[1], found)
+    empty = _unique_cells(np.zeros((0, 3), np.int64), return_index=True, return_inverse=True)
+    assert [a.shape for a in empty] == [(0, 3), (0,), (0,)]
+
+
+def test_packed_pairs_give_row_wise_unique_rows_and_counts():
+    from semantic_mapping.dense_cloud import _unique_pairs
+
+    rng = np.random.default_rng(9)
+    for high in (3, 1000, 2 ** 31 - 1):
+        first = rng.integers(0, 500_000, 2000)
+        second = rng.integers(0, high, 2000).astype(np.int32)
+        first[1000:], second[1000:] = first[:1000], second[:1000]
+        rows, counts = np.unique(np.column_stack([first, second]), axis=0, return_counts=True)
+        actual_rows, actual_counts = _unique_pairs(first, second, return_counts=True)
+        np.testing.assert_array_equal(actual_rows, rows)
+        np.testing.assert_array_equal(actual_counts, counts)
+        np.testing.assert_array_equal(_unique_pairs(first, second), rows)
+    assert _unique_pairs(np.zeros(0, np.int64), np.zeros(0, np.int32)).shape == (0, 2)
+
+
+def test_workers_is_validated_and_does_not_change_results():
+    for bad in (0, -2, True, 1.5):
+        with pytest.raises(ValueError, match="workers"):
+            DenseCloudConfig(workers=bad)
+    rng = np.random.default_rng(2)
+    cloud = np.column_stack([rng.uniform(0, 4, 3000), rng.uniform(0, 4, 3000), rng.normal(0, .005, 3000)])
+    cloud[:1000, 2] = rng.uniform(0, 1, 1000)
+    results = []
+    for workers in (1, 2, -1):
+        pipeline = make_pipeline(workers=workers, label_propagation_radius=.2)
+        pipeline.update(cloud, 1.)
+        results.append(pipeline.update(cloud + [[.01, 0, 0]], 2.))
+    for other in results[1:]:
+        np.testing.assert_array_equal(other.region_ids, results[0].region_ids)
+        np.testing.assert_array_equal(other.map_region_ids, results[0].map_region_ids)

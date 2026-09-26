@@ -14,7 +14,8 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
-from semantic_mapping.geometry_utils import GROUND_SURFACE_LABELS, fit_ground_plane, splat_depth_buffer
+from semantic_mapping import native
+from semantic_mapping.geometry_utils import GROUND_SURFACE_LABELS, fit_ground_plane, pack_voxel_keys, splat_depth_buffer
 from semantic_mapping.types import CameraIntrinsics, Detection2D
 
 UNKNOWN, DIRECT, PROPAGATED = 0, 1, 2
@@ -32,6 +33,14 @@ class DenseCloudConfig:
     min_region_voxels: int = 4
     max_map_voxels: int = 500_000
     chunk_size: int = 4096
+    # Threads for neighbour searches and the surface graph, the bulk of
+    # segmentation time; -1 uses every core. Results do not depend on it.
+    # Lower it to leave cores for other processes on the robot.
+    workers: int = -1
+    # Build the surface graph with the compiled supermap_kernels package when
+    # it is installed (semantic_mapping.native); NumPy/SciPy otherwise. The
+    # two agree except where equally distant neighbours tie for the k-th place.
+    native_kernels: bool = True
     camera_depth_tolerance: float = 0.05
     max_camera_time_delta: float = 0.20
     min_camera_score: float = 0.5
@@ -72,7 +81,7 @@ class DenseCloudConfig:
     incremental_segmentation: bool = True
 
     def __post_init__(self):
-        for name in ("allow_yoloe_labels", "incremental_segmentation", "ground_exclusion"):
+        for name in ("allow_yoloe_labels", "incremental_segmentation", "ground_exclusion", "native_kernels"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if self.input_mode not in {"snapshot", "scan"}:
@@ -91,6 +100,9 @@ class DenseCloudConfig:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.workers, int) or isinstance(self.workers, bool) \
+                or not (self.workers == -1 or self.workers >= 1):
+            raise ValueError("workers must be -1 (all cores) or a positive integer")
         if not isinstance(self.ground_context_px, int) or isinstance(self.ground_context_px, bool) \
                 or self.ground_context_px < 0:
             raise ValueError("ground_context_px must be a nonnegative integer")
@@ -174,19 +186,53 @@ def _cell_keys(cells):
         np.dtype([("x", "<i8"), ("y", "<i8"), ("z", "<i8")])).reshape(-1)
 
 
+def _unique_cells(cells, return_index=False, return_inverse=False):
+    """``np.unique(cells, axis=0, ...)`` for (N, 3) integer cells: the same sorted
+    rows, first-occurrence indices and inverse, through one packed int64 key
+    per cell when the cells fit (several times faster on a large cloud)."""
+    keys = pack_voxel_keys(cells)
+    if keys is None:
+        return np.unique(cells, axis=0, return_index=return_index, return_inverse=return_inverse)
+    _, index, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    unique = np.asarray(cells, dtype=np.int64).reshape(-1, 3)[index]
+    extra = ((index,) if return_index else ()) + ((inverse.reshape(-1),) if return_inverse else ())
+    return (unique, *extra) if extra else unique
+
+
+def _unique_pairs(first, second, return_counts=False):
+    """``np.unique(np.column_stack([first, second]), axis=0)`` for non-negative
+    integer columns (voxel/component/region/label indices), as one 1-D unique of
+    ``first * (max(second) + 1) + second`` keys: same rows, order and counts."""
+    first, second = np.asarray(first, dtype=np.int64), np.asarray(second, dtype=np.int64)
+    base = int(second.max()) + 1 if second.size else 1
+    keys = np.unique(first * base + second, return_counts=return_counts)
+    pairs = np.column_stack(np.divmod(keys[0] if return_counts else keys, base))
+    return (pairs, keys[1]) if return_counts else pairs
+
+
 def _cell_match(old, new):
     """Indices of identical cells in two lexicographically sorted unique arrays."""
     if not len(old) or not len(new):
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
-    old_keys, new_keys = _cell_keys(old), _cell_keys(new)
+    old_keys, new_keys = pack_voxel_keys(old), pack_voxel_keys(new)
+    if old_keys is None or new_keys is None:
+        old_keys, new_keys = _cell_keys(old), _cell_keys(new)
     index = np.searchsorted(old_keys, new_keys)
     current = np.flatnonzero(index < len(old_keys))
     current = current[old_keys[index[current]] == new_keys[current]]
     return index[current], current
 
 
+def _kernels(config):
+    """The compiled kernels when installed and enabled, else None (NumPy/SciPy)."""
+    return native.kernels if config.native_kernels else None
+
+
 def _surface_normals(points, tree, index, config):
     """PCA normals and a planarity flag for ``points[index]``."""
+    kernels = _kernels(config)
+    if kernels is not None:
+        return kernels.surface_normals(points, index, config.normal_radius, config.max_neighbors, config.workers)
     n = len(points)
     normals = np.zeros((len(index), 3), dtype=np.float64)
     reliable = np.zeros(len(index), dtype=bool)
@@ -194,7 +240,7 @@ def _surface_normals(points, tree, index, config):
     for start in range(0, len(index), config.chunk_size):
         stop = min(start+config.chunk_size, len(index))
         distances, indices = tree.query(points[index[start:stop]], k=list(range(1, k+1)),
-                                        distance_upper_bound=config.normal_radius, workers=1)
+                                        distance_upper_bound=config.normal_radius, workers=config.workers)
         good = np.isfinite(distances)
         count = good.sum(axis=1)
         neighbors = points[np.minimum(indices, n-1)]
@@ -210,15 +256,19 @@ def _surface_normals(points, tree, index, config):
 
 def _surface_edges(points, tree, normals, reliable, index, config):
     """Kept smooth-surface graph edges whose first endpoint is in ``index``."""
+    cosine = math.cos(math.radians(config.normal_angle_deg))
+    kernels = _kernels(config)
+    if kernels is not None:
+        return kernels.surface_edges(points, normals, reliable, index, config.neighbor_radius, config.max_neighbors,
+                                     cosine, config.plane_tolerance, config.workers)
     n = len(points)
     k = min(n, config.max_neighbors)
     rows, cols = [np.zeros(0, np.int32)], [np.zeros(0, np.int32)]
-    cosine = math.cos(math.radians(config.normal_angle_deg))
     for start in range(0, len(index), config.chunk_size):
         stop = min(start+config.chunk_size, len(index))
         chunk = index[start:stop]
         distance, neighbor = tree.query(points[chunk], k=list(range(1, k+1)),
-                                        distance_upper_bound=config.neighbor_radius, workers=1)
+                                        distance_upper_bound=config.neighbor_radius, workers=config.workers)
         row = np.broadcast_to(chunk[:, None], neighbor.shape)
         valid = np.isfinite(distance) & (neighbor != row)
         a, b = row[valid], neighbor[valid]
@@ -233,8 +283,12 @@ def _surface_edges(points, tree, normals, reliable, index, config):
 
 
 def _surface_components(n, rows, cols, config):
-    graph = coo_matrix((np.ones(len(rows), dtype=np.uint8), (rows, cols)), shape=(n, n)).tocsr()
-    _, component = connected_components(graph, directed=False)
+    kernels = _kernels(config)
+    if kernels is not None:
+        component = kernels.connected_components(n, rows, cols)
+    else:
+        graph = coo_matrix((np.ones(len(rows), dtype=np.uint8), (rows, cols)), shape=(n, n)).tocsr()
+        _, component = connected_components(graph, directed=False)
     sizes = np.bincount(component)
     keep = np.flatnonzero(sizes >= config.min_region_voxels)
     mapping = np.full(len(sizes), -1, dtype=np.int32)
@@ -257,22 +311,37 @@ class SurfaceGraph:
                    np.empty(0, np.int32), np.empty(0, np.int32))
 
 
+def _native_surface_graph(kernels, points, normal_index, edge_index, normals, reliable, config):
+    """_surface_normals for ``normal_index`` then _surface_edges for ``edge_index``
+    from one compiled neighbour search; ``normals``/``reliable`` hold every other
+    point's values. Same results as the two calls."""
+    return kernels.surface_graph(points, normal_index, edge_index, config.normal_radius, config.neighbor_radius,
+                                 config.max_neighbors, math.cos(math.radians(config.normal_angle_deg)),
+                                 config.plane_tolerance, normals, reliable, config.workers)
+
+
 def build_surface_graph(points: np.ndarray, config: DenseCloudConfig) -> SurfaceGraph:
     n = len(points)
     if not n:
         return SurfaceGraph.empty()
-    tree = cKDTree(points)
     index = np.arange(n)
+    kernels = _kernels(config)
+    if kernels is not None:
+        return SurfaceGraph(points, *_native_surface_graph(kernels, points, index, index, np.zeros((n, 3)),
+                                                           np.zeros(n, bool), config))
+    tree = cKDTree(points)
     normals, reliable = _surface_normals(points, tree, index, config)
     rows, cols = _surface_edges(points, tree, normals, reliable, index, config)
     return SurfaceGraph(points, normals, reliable, rows, cols)
 
 
-def _within(points, seeds, radius):
+def _within(points, seeds, radius, workers=1, kernels=None):
     """Mask of ``points`` within ``radius`` of any seed position."""
     if not len(seeds) or not len(points):
         return np.zeros(len(points), bool)
-    distance, _ = cKDTree(seeds).query(points, k=1, distance_upper_bound=radius, workers=1)
+    if kernels is not None:
+        return kernels.within(points, seeds, radius, workers)
+    distance, _ = cKDTree(seeds).query(points, k=1, distance_upper_bound=radius, workers=workers)
     return np.isfinite(distance)
 
 
@@ -296,31 +365,42 @@ def update_surface_graph(previous: SurfaceGraph, old_index: np.ndarray, new_inde
     kept_old, kept_new = old_index[~moved], new_index[~moved]
     changed = np.ones(n, bool)
     changed[kept_new] = False
-    old_to_new = np.full(len(previous.points), -1, np.int64)
+    # int32 like the stored edges (max_map_voxels < 2^31): remapping millions
+    # of edges is memory-bound, so half-width indices halve its cost.
+    old_to_new = np.full(len(previous.points), -1, np.int32)
     old_to_new[kept_old] = kept_new
     vanished = old_to_new < 0  # removed voxels plus the old position of moved ones
     seeds = np.concatenate([points[changed], previous.points[vanished]])
-    normal_dirty = changed | _within(points, seeds, config.normal_radius)
+    kernels = _kernels(config)
+    normal_dirty = changed | _within(points, seeds, config.normal_radius, config.workers, kernels)
     edge_dirty = normal_dirty | _within(points, np.concatenate([seeds, points[normal_dirty]]),
-                                        config.neighbor_radius)
+                                        config.neighbor_radius, config.workers, kernels)
     if edge_dirty.mean() > max_dirty_fraction:
         graph = build_surface_graph(points, config)
         return graph, {"incremental": False, "dirty_voxels": n}
-    tree = cKDTree(points)
     normals = np.zeros((n, 3))
     reliable = np.zeros(n, bool)
     normals[kept_new], reliable[kept_new] = previous.normals[kept_old], previous.reliable[kept_old]
     dirty = np.flatnonzero(normal_dirty)
-    if len(dirty):
-        normals[dirty], reliable[dirty] = _surface_normals(points, tree, dirty, config)
-    rows = old_to_new[previous.rows]
-    cols = old_to_new[previous.cols]
-    keep = (rows >= 0) & (cols >= 0)
-    keep[keep] &= ~edge_dirty[rows[keep]]
-    fresh_rows, fresh_cols = _surface_edges(points, tree, normals, reliable, np.flatnonzero(edge_dirty), config)
-    graph = SurfaceGraph(points, normals, reliable,
-                         np.concatenate([rows[keep].astype(np.int32), fresh_rows]),
-                         np.concatenate([cols[keep].astype(np.int32), fresh_cols]))
+    if kernels is not None:
+        normals, reliable, fresh_rows, fresh_cols = _native_surface_graph(
+            kernels, points, dirty, np.flatnonzero(edge_dirty), normals, reliable, config)
+    else:
+        tree = cKDTree(points)
+        if len(dirty):
+            normals[dirty], reliable[dirty] = _surface_normals(points, tree, dirty, config)
+        fresh_rows, fresh_cols = _surface_edges(points, tree, normals, reliable, np.flatnonzero(edge_dirty), config)
+    # Surviving edges, renumbered, except those of dirty voxels (rebuilt above), then the rebuilt ones.
+    if kernels is not None:
+        rows, cols = kernels.remap_edges(previous.rows, previous.cols, old_to_new, edge_dirty, fresh_rows, fresh_cols,
+                                         config.workers)
+    else:
+        rows = old_to_new[previous.rows]
+        cols = old_to_new[previous.cols]
+        keep = (rows >= 0) & (cols >= 0)
+        keep &= ~edge_dirty[rows]  # a removed row (-1) reads the last voxel, but keep already dropped it
+        rows, cols = np.concatenate([rows[keep], fresh_rows]), np.concatenate([cols[keep], fresh_cols])
+    graph = SurfaceGraph(points, normals, reliable, rows, cols)
     return graph, {"incremental": True, "dirty_voxels": int(edge_dirty.sum())}
 
 
@@ -410,8 +490,7 @@ class DenseCloudPipeline:
     def _stable_regions(self, components, old_region):
         result = np.full(len(components), -1, dtype=np.int32)
         pairs_valid = (components >= 0) & (old_region >= 0)
-        pairs, counts = np.unique(np.column_stack([components[pairs_valid], old_region[pairs_valid]]),
-                                  axis=0, return_counts=True)
+        pairs, counts = _unique_pairs(components[pairs_valid], old_region[pairs_valid], return_counts=True)
         assigned, used = {}, set()
         for index in np.argsort(-counts, kind="stable"):
             component, previous = map(int, pairs[index])
@@ -447,11 +526,10 @@ class DenseCloudPipeline:
         scaled = np.floor(points[finite]/self.config.voxel_size)
         if scaled.size and np.max(np.abs(scaled)) >= 2**62:
             raise ValueError("cloud coordinates exceed voxel index range")
-        cells, representative, inverse = np.unique(scaled.astype(np.int64), axis=0,
-                                                    return_index=True, return_inverse=True)
+        cells, representative, inverse = _unique_cells(scaled.astype(np.int64), return_index=True, return_inverse=True)
         current_points = points[finite][representative]
         if self.config.input_mode == "scan":
-            all_cells = np.unique(np.concatenate([self.cells, cells]), axis=0)
+            all_cells = _unique_cells(np.concatenate([self.cells, cells]))
         else:
             all_cells = cells
         if len(all_cells) > self.config.max_map_voxels:
@@ -565,8 +643,7 @@ class DenseCloudPipeline:
         selected = point_label > 0
         map_index = self._input_map[valid[selected]]
         # A voxel containing conflicting labels remains unresolved this frame.
-        pairs = np.column_stack([map_index, point_label[selected]])
-        unique = np.unique(pairs, axis=0)
+        unique = _unique_pairs(map_index, point_label[selected])
         voxel, count = np.unique(unique[:, 0], return_counts=True)
         ambiguous = voxel[count > 1]
         accepted = ~np.isin(map_index, ambiguous)
@@ -593,7 +670,8 @@ class DenseCloudPipeline:
             seeds = np.flatnonzero((semantic > 0) & (self.regions >= 0))
             target = np.flatnonzero((semantic == 0) & (self.regions >= 0))
             if len(seeds) and len(target):
-                distance, nearest = cKDTree(self.points[seeds]).query(self.points[target], workers=1)
+                distance, nearest = cKDTree(self.points[seeds]).query(self.points[target],
+                                                                      workers=self.config.workers)
                 seed = seeds[nearest]
                 keep = (distance <= radius) & (self.regions[seed] == self.regions[target])
                 target, seed, distance = target[keep], seed[keep], distance[keep]
@@ -617,6 +695,7 @@ class DenseCloudPipeline:
                  "direct_labeled_voxels": int((self.semantic > 0).sum()),
                  "propagated_voxels": int((source == PROPAGATED).sum()),
                  "pretrained_models": [], "annotation_sources": sorted(self._annotation_sources),
+                 "segmentation_backend": "python" if _kernels(self.config) is None else "native",
                  "geometry_is_semantic_instances": False}
         return CloudResult(self.stamp, self._input.copy(), valid.copy(), regions_out,
                            semantics_out, confidence_out, source_out, self._visible.copy(),

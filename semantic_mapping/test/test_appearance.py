@@ -106,3 +106,19 @@ def test_mask_pixel_sampling_matches_the_original_pixel_order_for_strided_rgb():
     full = rgb[mask]
     expected = full[::int(np.ceil(len(full) / 100))]
     np.testing.assert_array_equal(appearance._detection_pixels(rgb, det, 100), expected)
+
+
+def test_mask_pixels_read_from_the_mask_crop_match_the_whole_image():
+    rng = np.random.default_rng(7)
+    rgb = rng.integers(0, 256, (60, 80, 3), dtype=np.uint8)
+    masks = [np.zeros((60, 80), bool) for _ in range(4)]
+    masks[0][10:30, 20:50] = rng.random((20, 30)) > .4  # interior, ragged
+    masks[1][:, 75:] = True                              # touches three borders
+    masks[2][59, 0] = True                               # one corner pixel
+    for mask in masks:
+        det = Detection2D(bbox=np.array([0.0, 0.0, 1.0, 1.0]), label="box", score=.9, mask=mask)
+        full = rgb[mask]
+        np.testing.assert_array_equal(appearance._detection_pixels(rgb, det), full)
+        for limit in (1, 7, 100):
+            np.testing.assert_array_equal(appearance._detection_pixels(rgb, det, limit),
+                                          full[::max(1, int(np.ceil(len(full) / limit)))])

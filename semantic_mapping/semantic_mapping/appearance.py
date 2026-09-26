@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from semantic_mapping.geometry_utils import mask_bounds
 from semantic_mapping.types import Detection2D
 
 
@@ -31,12 +32,19 @@ class Embedder(ABC):
 def _detection_pixels(rgb: np.ndarray, detection: Detection2D, max_pixels: int | None = None) -> np.ndarray:
     """(N, 3) pixels inside the detection's mask, or its box when there is no mask."""
     if detection.mask is not None and detection.mask.shape == rgb.shape[:2]:
+        # The mask's bounding crop lists the same pixels in the same (row-major)
+        # order as the whole image, at a fraction of the cost.
+        bounds = mask_bounds(detection.mask)
+        if bounds is None:
+            return np.zeros((0,) + rgb.shape[2:], dtype=rgb.dtype)
+        y1, y2, x1, x2 = bounds
+        mask, crop = detection.mask[y1:y2, x1:x2], rgb[y1:y2, x1:x2]
         if max_pixels is None:
-            return rgb[detection.mask]
-        indices = np.flatnonzero(detection.mask)
+            return crop[mask]
+        indices = np.flatnonzero(mask)
         stride = max(1, int(np.ceil(indices.size / max_pixels)))
         indices = indices[::stride]
-        return rgb[indices // rgb.shape[1], indices % rgb.shape[1]]
+        return crop[indices // (x2 - x1), indices % (x2 - x1)]
     h, w = rgb.shape[:2]
     x1, y1, x2, y2 = detection.bbox
     x1, y1 = int(max(np.floor(x1), 0)), int(max(np.floor(y1), 0))
