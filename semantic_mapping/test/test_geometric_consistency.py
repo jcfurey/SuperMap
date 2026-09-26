@@ -79,3 +79,27 @@ def test_occupied_fraction_and_prune_mask():
     log_odds = np.array([5.0, 5.0, -5.0])
     assert gc.occupied_fraction(log_odds) == pytest.approx(2 / 3)
     assert gc.prune_mask(log_odds, prune_threshold=-1.5).tolist() == [False, False, True]
+
+
+def test_classifying_many_point_sets_at_once_matches_one_call_per_set():
+    rng = np.random.default_rng(4)
+    K = np.array([[120.0, 0.0, 64.5], [0.0, 120.0, 48.5], [0.0, 0.0, 1.0]])
+    for trial in range(20):
+        angle = rng.uniform(-0.5, 0.5)
+        T = np.eye(4)
+        T[:3, :3] = [[np.cos(angle), 0.0, np.sin(angle)], [0.0, 1.0, 0.0], [-np.sin(angle), 0.0, np.cos(angle)]]
+        T[:3, 3] = rng.normal(0.0, 0.3, 3)
+        depth = rng.uniform(1.0, 4.0, size=(96, 128))
+        depth[rng.random(depth.shape) < 0.2] = 0.0         # missing readings
+        depth[rng.random(depth.shape) < 0.05] = np.nan
+        # Some sets straddle the image border or lie behind the camera; one is empty.
+        sets = [rng.normal([0.0, 0.0, 2.5], [1.5, 1.0, 1.5], size=(int(rng.integers(0, 400)), 3))
+                for _ in range(int(rng.integers(1, 8)))]
+        for window in (0, 2):
+            together = gc.project_and_classify_many(K, T, depth, sets, 0.1, window)
+            assert len(together) == len(sets)
+            for points, batched in zip(sets, together):
+                alone = gc.project_and_classify(K, T, depth, points, 0.1, window)
+                for a, b in zip(batched, alone):
+                    assert np.array_equal(a, b, equal_nan=True)
+    assert gc.project_and_classify_many(K, np.eye(4), depth, [], 0.1) == []

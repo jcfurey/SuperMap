@@ -37,7 +37,9 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from semantic_mapping.geometry_utils import bbox3d_gap, centroid, iou_3d, iou_3d_matrix, iou_xyxy, overlap_3d
+from semantic_mapping.geometry_utils import (
+    bbox3d_gap, centroid, iou_3d, iou_3d_matrix, iou_xyxy, iou_xyxy_matrix, overlap_3d,
+)
 from semantic_mapping.tracking import TrackKalmanState, mahalanobis_gate
 from semantic_mapping.types import ObjectInstance
 
@@ -113,17 +115,22 @@ def associate(
     label_aware = track_label_beliefs is not None and detection_labels is not None
 
     cost = np.full((len(rows), len(cols)), INVALID_COST, dtype=np.float64)
-    for r, i in enumerate(rows):
-        for c, j in enumerate(cols):
-            label_cost = 0.0
-            if label_aware:
-                mass = label_mass(detection_labels[j], track_label_beliefs[i])
-                if not labels_compatible(detection_labels[j], track_label_beliefs[i], label_min_mass):
-                    continue
-                label_cost = label_cost_weight * (1.0 - mass)
-            iou = iou_xyxy(predicted_bboxes[i], detection_bboxes[j])
-            if iou >= iou_threshold:
-                cost[r, c] = 1.0 - iou + label_cost
+    if rows and cols:
+        iou = iou_xyxy_matrix([predicted_bboxes[i] for i in rows], [detection_bboxes[j] for j in cols])
+        admissible = iou >= iou_threshold
+        label_cost = np.zeros_like(iou)
+        if label_aware:
+            # One belief lookup per (track, distinct detection label), not per pair.
+            by_label: dict[str, list[int]] = {}
+            for c, j in enumerate(cols):
+                by_label.setdefault(detection_labels[j], []).append(c)
+            for label, columns in by_label.items():
+                masses = [track_label_beliefs[i].get(label) for i in rows]
+                compatible = np.array([m is not None and m >= label_min_mass for m in masses])
+                mass = np.array([0.0 if m is None else float(m) for m in masses])
+                admissible[:, columns] &= compatible[:, None]
+                label_cost[:, columns] = (label_cost_weight * (1.0 - mass))[:, None]
+        cost[admissible] = 1.0 - iou[admissible] + label_cost[admissible]
 
     def accept(i: int, j: int) -> bool:
         return not use_mahalanobis_gate or mahalanobis_gate(tracks[i], detection_bboxes[j])

@@ -344,3 +344,48 @@ def test_packed_voxel_keys_match_row_wise_unique_and_fall_back_out_of_range():
     far = points + np.array([80_000.0, 0.0, 0.0])  # beyond +-52 km at 5 cm: exact slow path
     reference_far = np.sort(np.unique(np.floor(far / 0.05).astype(np.int64), axis=0, return_index=True)[1])
     assert np.array_equal(voxel_downsample_indices(far, 0.05), reference_far)
+
+
+def test_prepared_evidence_gives_the_same_update_and_is_ignored_once_stale():
+    from semantic_mapping.tracking import init_track
+    from semantic_mapping.types import Detection2D
+
+    rng = np.random.default_rng(9)
+    K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
+    T = np.eye(4)
+    depth = rng.uniform(1.5, 2.5, size=(80, 100))
+    depth[rng.random(depth.shape) < 0.1] = 0.0
+
+    def build():
+        m = ObjectMap(tau_eps=0.1, prune_membership=-1.5)
+        for i in range(6):
+            points = rng.normal([0.3 * i - 0.8, 0.0, 2.0], 0.15, size=(60, 3))
+            obj = m.spawn(np.array([10.0 * i, 30.0, 10.0 * i + 20.0, 50.0]), points, "chair", 0.9, stamp=0.0)
+            obj.point_log_odds = rng.normal(0.0, 1.0, obj.points_world.shape[0])
+        return m
+
+    state = rng.bit_generator.state
+    plain = build()
+    rng.bit_generator.state = state
+    prepared = build()
+    prepared.prepare_evidence(list(prepared.objects.values()), K, T, depth)
+    det = Detection2D(bbox=np.array([20.0, 30.0, 40.0, 50.0]), label="chair", score=0.9)
+    for m in (plain, prepared):
+        objs = list(m.objects.values())
+        m.update_matched(objs[0], init_track(det.bbox), np.zeros((0, 3)), det, 0.1, K, T, depth, in_view=True)
+        for obj in objs[1:]:
+            m.update_unmatched(obj, K, T, depth, in_view=True)
+    for a, b in zip(plain.objects.values(), prepared.objects.values()):
+        for name in ("points_world", "point_log_odds", "point_membership", "bbox3d"):
+            assert np.array_equal(getattr(a, name), getattr(b, name))
+        assert a.status == b.status
+
+    # Stale preparations never apply: new points, or another depth image.
+    obj = next(iter(prepared.objects.values()))
+    prepared.prepare_evidence([obj], K, T, depth)
+    assert prepared._prepared_classification(obj, K, T, depth) is not None
+    assert prepared._prepared_classification(obj, K, T, depth.copy()) is None
+    obj.points_world = obj.points_world.copy()
+    assert prepared._prepared_classification(obj, K, T, depth) is None
+    prepared.discard_prepared_evidence()
+    assert prepared._prepared_classification(obj, K, T, depth) is None

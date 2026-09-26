@@ -438,7 +438,7 @@ def exclude_platform(detections: Sequence[Detection2D], platform: np.ndarray,
     for detection in detections:
         if detection.mask is not None:
             # Only the mask's bounding crop can overlap: no whole-image passes per detection.
-            bounds = mask_bounds(detection.mask)
+            bounds = detection.mask_bounds()
             if bounds is None:
                 dropped += 1
                 continue

@@ -122,3 +122,59 @@ def test_mask_pixels_read_from_the_mask_crop_match_the_whole_image():
         for limit in (1, 7, 100):
             np.testing.assert_array_equal(appearance._detection_pixels(rgb, det, limit),
                                           full[::max(1, int(np.ceil(len(full) / limit)))])
+
+
+def _reference_embed(embedder, rgb, detections):
+    """ColorHistogramEmbedder.embed as it ran before the histograms were batched: one per detection."""
+    from semantic_mapping.appearance import _detection_pixels
+
+    out = []
+    for detection in detections:
+        sample_limit = embedder.max_pixels if embedder.max_pixels >= 2 * embedder.min_pixels else None
+        pixels = _detection_pixels(rgb, detection, sample_limit)
+        if pixels.shape[0] < embedder.min_pixels:
+            out.append(None)
+            continue
+        if pixels.shape[0] > embedder.max_pixels:
+            pixels = pixels[:: int(np.ceil(pixels.shape[0] / embedder.max_pixels))]
+        hist = embedder._histogram(pixels)
+        if hist is None:
+            out.append(None)
+            continue
+        hist = np.sqrt(hist / max(float(hist.sum()), 1.0))
+        norm = np.linalg.norm(hist)
+        out.append((hist / norm).astype(np.float32) if norm > 0 else None)
+    return out
+
+
+def test_batched_histograms_match_the_per_detection_embedding():
+    from semantic_mapping.appearance import ColorHistogramEmbedder
+    from semantic_mapping.types import Detection2D
+
+    rng = np.random.default_rng(5)
+    h, w = 96, 128
+    for trial in range(12):
+        rgb = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        # Patches of black, grey, white, saturated and dim colour exercise
+        # every branch: unlit, neutral (soft intensity bins) and chromatic.
+        for _ in range(10):
+            y, x = rng.integers(0, h - 8), rng.integers(0, w - 8)
+            kind = rng.integers(5)
+            colour = [(0, 0, 0), (128, 128, 128), (255, 255, 255), (255, 0, 0), (10, 30, 12)][kind]
+            rgb[y:y + int(rng.integers(4, 40)), x:x + int(rng.integers(4, 40))] = colour
+        detections = []
+        for _ in range(int(rng.integers(0, 25))):
+            mask = np.zeros((h, w), dtype=bool)
+            y, x = rng.integers(0, h - 2), rng.integers(0, w - 2)
+            mask[y:y + int(rng.integers(1, 60)), x:x + int(rng.integers(1, 60))] = True
+            box = np.array([x, y, x + 20, y + 20], dtype=np.float64)
+            detections.append(Detection2D(box, "thing", 0.9, mask=mask if rng.random() < 0.8 else None))
+        alpha = np.concatenate([rgb, rng.integers(0, 256, size=(h, w, 1), dtype=np.uint8)], axis=2)
+        for image in (rgb, alpha, rgb.astype(np.uint16) * 257):
+            for kwargs in ({}, {"achromatic_bins": 0}, {"achromatic_bins": 1}, {"bins": 4, "max_pixels": 64},
+                           {"min_pixels": 1, "max_pixels": 3}, {"min_intensity": 60.0, "achromatic_bins": 5}):
+                embedder = ColorHistogramEmbedder(**kwargs)
+                got, expected = embedder.embed(image, detections), _reference_embed(embedder, image, detections)
+                assert len(got) == len(expected)
+                for a, b in zip(got, expected):
+                    assert (a is None and b is None) or (a is not None and b is not None and np.array_equal(a, b))

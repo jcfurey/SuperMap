@@ -555,6 +555,43 @@ def iou_xyxy(box_a: Array, box_b: Array) -> float:
     return float(inter_area / union)
 
 
+def iou_xyxy_matrix(boxes_a, boxes_b) -> Array:
+    """Pairwise :func:`iou_xyxy` between two sequences of [x1, y1, x2, y2] boxes, as an (N, M) array.
+
+    The same operations in the same order give the same values as
+    :func:`iou_xyxy` for boxes of float64 coordinates (an array of that
+    type, or Python or NumPy float64 scalars). Any other box is left to
+    :func:`iou_xyxy` itself, as is a non-finite coordinate: its arithmetic
+    would round (or wrap) in the box's own type, and Python ``max``/``min``
+    treat NaN unlike ``np.maximum``/``np.minimum``.
+    """
+    def float64_box(box) -> bool:
+        if isinstance(box, np.ndarray):
+            return box.dtype == np.float64
+        return all(type(value) is float or type(value) is np.float64 for value in box)
+
+    def prepare(boxes):
+        boxes = list(boxes)
+        stacked = np.array(boxes, dtype=np.float64).reshape(-1, 4)
+        exact = np.array([float64_box(box) for box in boxes], dtype=bool).reshape(-1)
+        return stacked, boxes, ~exact | ~np.isfinite(stacked).all(axis=1)
+
+    a, originals_a, own_a = prepare(boxes_a)
+    b, originals_b, own_b = prepare(boxes_b)
+    inter_w = np.maximum(0.0, np.minimum(a[:, None, 2], b[None, :, 2]) - np.maximum(a[:, None, 0], b[None, :, 0]))
+    inter_h = np.maximum(0.0, np.minimum(a[:, None, 3], b[None, :, 3]) - np.maximum(a[:, None, 1], b[None, :, 1]))
+    inter = inter_w * inter_h
+    area_a = np.maximum(0.0, a[:, 2] - a[:, 0]) * np.maximum(0.0, a[:, 3] - a[:, 1])
+    area_b = np.maximum(0.0, b[:, 2] - b[:, 0]) * np.maximum(0.0, b[:, 3] - b[:, 1])
+    union = area_a[:, None] + area_b[None, :] - inter
+    iou = np.divide(inter, union, out=np.zeros_like(union), where=union > 1e-12)
+    for i in np.flatnonzero(own_a):
+        iou[i] = [iou_xyxy(originals_a[i], box) for box in originals_b]
+    for j in np.flatnonzero(own_b):
+        iou[:, j] = [iou_xyxy(box, originals_b[j]) for box in originals_a]
+    return iou
+
+
 def bbox3d_from_points(points: Array, trim_percentile: float = 0.0) -> Array:
     """Axis-aligned 3D bounding box [xmin, ymin, zmin, xmax, ymax, zmax] for a point set."""
     if not 0.0 <= trim_percentile < 50.0:

@@ -169,6 +169,7 @@ class ObjectMap:
 
         self.objects: dict[int, ObjectInstance] = {}
         self._next_id = 1
+        self._prepared_evidence: tuple | None = None
 
     @property
     def effective_prune_log_odds(self) -> float:
@@ -399,6 +400,7 @@ class ObjectMap:
         log_odds, states, pixels = gc.update_object_points(
             K, T_world_from_cam, depth_image, instance.points_world, instance.point_log_odds, self.tau_eps,
             contradiction_window_px=self.contradiction_window_px,
+            classification=self._prepared_classification(instance, K, T_world_from_cam, depth_image),
         )
         observable = states == gc.GeometricState.OBSERVABLE
         instance.point_log_odds = log_odds
@@ -417,6 +419,45 @@ class ObjectMap:
         if not np.all(keep):
             self._subset_points(instance, keep)
         return bool(np.any(observable))
+
+    def prepare_evidence(self, instances, K: np.ndarray, T_world_from_cam: np.ndarray,
+                         depth_image: np.ndarray | None) -> None:
+        """Project and classify the points of every instance about to receive evidence, in one pass.
+
+        :meth:`_apply_evidence` then uses an instance's prepared
+        classification instead of projecting its points itself, but only
+        while the instance still holds the very point array that was
+        projected and is updated with the same ``K``, pose and depth image
+        objects; anything else is classified on the spot. Clear with
+        :meth:`discard_prepared_evidence`.
+        """
+        self._prepared_evidence = None
+        if depth_image is None or not self.geometric_consistency:
+            return
+        chosen = [instance for instance in instances if instance.points_world.shape[0] > 0]
+        if not chosen:
+            return
+        results = gc.project_and_classify_many(
+            K, T_world_from_cam, depth_image, [instance.points_world for instance in chosen], self.tau_eps,
+            self.contradiction_window_px)
+        self._prepared_evidence = (K, T_world_from_cam, depth_image, {
+            instance.instance_id: (instance.points_world, states, pixels)
+            for instance, (states, _delta_d, pixels) in zip(chosen, results)
+        })
+
+    def discard_prepared_evidence(self) -> None:
+        self._prepared_evidence = None
+
+    def _prepared_classification(self, instance: ObjectInstance, K: np.ndarray, T_world_from_cam: np.ndarray,
+                                 depth_image: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        prepared = self._prepared_evidence
+        if prepared is None or prepared[0] is not K or prepared[1] is not T_world_from_cam \
+                or prepared[2] is not depth_image:
+            return None
+        entry = prepared[3].get(instance.instance_id)
+        if entry is None or entry[0] is not instance.points_world:
+            return None
+        return entry[1], entry[2]
 
     def _preserve_compact_body(self, instance: ObjectInstance) -> bool:
         return instance.label in self.dynamic_geometry_labels and self.dynamic_geometry_min_extent_fraction > 0
