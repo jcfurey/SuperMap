@@ -389,3 +389,25 @@ def test_prepared_evidence_gives_the_same_update_and_is_ignored_once_stale():
     assert prepared._prepared_classification(obj, K, T, depth) is None
     prepared.discard_prepared_evidence()
     assert prepared._prepared_classification(obj, K, T, depth) is None
+
+
+def test_visible_bbox_is_where_the_depth_confirms_the_instance():
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    T = np.eye(4)
+    us, vs = np.meshgrid(np.arange(60, 100, 2), np.arange(40, 80, 2))
+    points = np.column_stack(((us.ravel() - 80) * 0.02, (vs.ravel() - 60) * 0.02, np.full(us.size, 2.0)))
+    m = ObjectMap(voxel_size=0.01)
+    obj = m.spawn(np.array([60.0, 40.0, 100.0, 80.0]), points, "chair", 0.9, stamp=0.0)
+    depth = np.full((120, 160), 8.0)
+    depth[40:80, 60:100] = 2.0
+    np.testing.assert_array_equal(m.visible_bbox(obj, K, T, depth), [60.0, 40.0, 99.0, 79.0])
+
+    hidden = depth.copy()
+    hidden[40:80, 70:100] = 1.0  # something nearer covers the right three quarters
+    np.testing.assert_array_equal(m.visible_bbox(obj, K, T, hidden), [60.0, 40.0, 69.0, 79.0])
+    m.prepare_evidence([obj], K, T, hidden)  # the batched classification gives the same box
+    np.testing.assert_array_equal(m.visible_bbox(obj, K, T, hidden), [60.0, 40.0, 69.0, 79.0])
+    m.discard_prepared_evidence()
+
+    gone = np.full((120, 160), 8.0)  # seen through: nothing confirms it
+    assert m.visible_bbox(obj, K, T, gone) is None and m.visible_bbox(obj, K, T, None) is None

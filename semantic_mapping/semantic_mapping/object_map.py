@@ -459,6 +459,31 @@ class ObjectMap:
             return None
         return entry[1], entry[2]
 
+    def visible_bbox(self, instance: ObjectInstance, K: np.ndarray, T_world_from_cam: np.ndarray,
+                     depth_image: np.ndarray | None, min_points: int = 3) -> np.ndarray | None:
+        """Image box ``[x1, y1, x2, y2]`` of the instance's points the depth image confirms.
+
+        Where the object is seen in this frame, as opposed to where its track
+        predicts it or its whole 3D box projects: occlusion and the image
+        border leave only part of an object visible, and its detection boxes
+        only that part. Uses the classification :meth:`prepare_evidence`
+        computed for this frame when there is one. None without depth or
+        with fewer than ``min_points`` confirmed points.
+        """
+        if depth_image is None or instance.points_world.shape[0] == 0:
+            return None
+        prepared = self._prepared_classification(instance, K, T_world_from_cam, depth_image)
+        if prepared is None:
+            states, _delta_d, pixels = gc.project_and_classify(
+                K, T_world_from_cam, depth_image, instance.points_world, self.tau_eps, self.contradiction_window_px)
+        else:
+            states, pixels = prepared
+        seen = pixels[states == gc.GeometricState.OBSERVABLE]
+        if len(seen) < min_points:
+            return None
+        return np.array([seen[:, 0].min(), seen[:, 1].min(), seen[:, 0].max() + 1, seen[:, 1].max() + 1],
+                        dtype=np.float64)
+
     def _preserve_compact_body(self, instance: ObjectInstance) -> bool:
         return instance.label in self.dynamic_geometry_labels and self.dynamic_geometry_min_extent_fraction > 0
 

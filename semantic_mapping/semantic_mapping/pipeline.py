@@ -194,9 +194,10 @@ class PipelineConfig:
     0 disables."""
     relabel_min_overlap: float = 0.5
     """A high-confidence detection with a label the instance has not taken joins
-    a visible, unmatched track when the 2D boxes overlap and this fraction of the
-    smaller 3D box lies inside the other; Eq. (10) then weighs the new label
-    (association.associate_relabel). 0 disables."""
+    a visible, unmatched track when this fraction of the smaller 3D box lies
+    inside the other and its 2D box overlaps the track's prediction or the part
+    of the instance the depth shows this frame; Eq. (10) then weighs the new
+    label (association.associate_relabel). 0 disables."""
     min_points_for_3d_association: int = 5
     merge_iou_threshold: float = 0.3
     merge_distance_m: float = 0.25
@@ -844,23 +845,31 @@ class SemanticMappingPipeline:
             label_min_mass=cfg.label_compatibility_min_mass,
         )
         self._refuse_oversized(stage3, live_objects, detections, det_points)
+        # Every in-view live instance receives this frame's evidence below
+        # (matched, re-activated or unmatched); classify all their points at
+        # once. Association does not change them, and relabelling reads the
+        # classification to see where each candidate is visible.
+        self.object_map.prepare_evidence(
+            [obj for obj, flag in zip(live_objects, in_view) if flag], K, T_world_from_cam, evidence_depth)
         # Stage 4, relabelling: the same object under a label it has not taken yet (Eq. 10 decides).
+        relabel_overlap = cfg.relabel_min_overlap if cfg.use_2d_tracker else 0.0
+        visible_bboxes = None
+        if relabel_overlap > 0 and evidence_depth is not None and stage3.unmatched_detections:
+            visible_bboxes = [None] * len(live_objects)
+            for track_idx in stage3.unmatched_tracks:
+                visible_bboxes[track_idx] = self.object_map.visible_bbox(
+                    live_objects[track_idx], K, T_world_from_cam, evidence_depth)
         relabel = association.associate_relabel(
             predicted_tracks, predicted_bboxes, detection_bboxes, det_boxes3d, live_objects,
-            iou_threshold=cfg.association_iou_threshold,
-            min_overlap=cfg.relabel_min_overlap if cfg.use_2d_tracker else 0.0,
+            iou_threshold=cfg.association_iou_threshold, min_overlap=relabel_overlap,
             pad=cfg.voxel_size / 2, candidate_tracks=stage3.unmatched_tracks,
-            candidate_detections=stage3.unmatched_detections,
+            candidate_detections=stage3.unmatched_detections, visible_bboxes=visible_bboxes,
         )
         self._refuse_oversized(relabel, live_objects, detections, det_points)
         self.object_map.stats["relabel_matches"] += len(relabel.matches)
 
         t_associate = time.perf_counter()
 
-        # Every in-view live instance receives this frame's evidence below
-        # (matched, re-activated or unmatched); classify all their points at once.
-        self.object_map.prepare_evidence(
-            [obj for obj, flag in zip(live_objects, in_view) if flag], K, T_world_from_cam, evidence_depth)
         detection_instance_ids = [-1] * len(detections)
         for track_idx, det_idx in stage1.matches + stage2.matches + relabel.matches:
             detection = detections[det_idx]
