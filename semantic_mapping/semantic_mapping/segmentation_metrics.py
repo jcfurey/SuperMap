@@ -203,14 +203,29 @@ def _average_precision(is_tp: np.ndarray, n_gt: int) -> float:
     return float(np.sum((recall - recall_prev) * envelope))
 
 
-def instance_level_ap(
+@dataclass
+class InstanceMatches:
+    """One scene's ranked instance predictions per class and IoU threshold,
+    each marked true or false positive, plus the ground-truth counts: what
+    average precision needs, and what several scenes pool into one ranking."""
+
+    classes: list[str]
+    num_gt_instances: int
+    num_predictions: int
+    ranked: dict[float, dict[str, tuple[list[float], list[int], np.ndarray]]]
+    """Per threshold and class: (confidences, prediction ids, is_tp) in rank order."""
+    gt_counts: dict[str, int]
+    """Ground-truth instances per class."""
+
+
+def instance_matches(
     gt: GroundTruthPoints,
     transfer: LabelTransfer,
     iou_thresholds=DEFAULT_AP_THRESHOLDS,
     classes: list[str] | None = None,
     aliases: dict[str, str] | None = None,
-) -> dict:
-    """Per-class average precision of map instances at point-set IoU thresholds (Table III).
+) -> InstanceMatches:
+    """Rank one scene's map instances per class and match them to its ground truth (Table III).
 
     A map instance is the set of ground-truth points transferred to it; its
     IoU with a ground-truth instance is computed over those point sets.
@@ -253,9 +268,10 @@ def instance_level_ap(
     if classes is None:
         classes = sorted({name for name in gt_class if name != UNLABELED})
 
-    results: dict[str, dict] = {}
+    ranked: dict[float, dict[str, tuple[list[float], list[int], np.ndarray]]] = {}
+    gt_counts = {name: sum(1 for c in gt_class if c == name) for name in classes}
     for threshold in iou_thresholds:
-        per_class: dict[str, float] = {}
+        ranked[threshold] = {}
         for name in classes:
             gts = np.array([g for g in range(n_g) if gt_class[g] == name], dtype=np.int64)
             preds = sorted((p for p in range(n_p) if pred_class[p] == name),
@@ -270,14 +286,63 @@ def instance_level_ap(
                 if ious[best] > 0.0 and ious[best] >= threshold:
                     available[best] = False
                     is_tp[rank] = True
-            per_class[name] = _average_precision(is_tp, int(gts.size))
+            ranked[threshold][name] = ([pred_conf[p] for p in preds], [pids[p] for p in preds], is_tp)
+    return InstanceMatches(list(classes), int(n_g), n_p, ranked, gt_counts)
+
+
+def _ap_summary(classes: list[str], iou_thresholds, ap_of) -> dict:
+    results: dict[str, dict] = {}
+    for threshold in iou_thresholds:
+        per_class = {name: ap_of(threshold, name) for name in classes}
         scored = [ap for ap in per_class.values() if not np.isnan(ap)]
         results[f"ap{int(round(threshold * 100))}"] = {
             "threshold": threshold,
             "per_class": per_class,
             "map": float(np.mean(scored)) if scored else float("nan"),
         }
-    return {"classes": classes, "num_gt_instances": int(n_g), "num_predictions": n_p, **results}
+    return results
+
+
+def instance_level_ap(
+    gt: GroundTruthPoints,
+    transfer: LabelTransfer,
+    iou_thresholds=DEFAULT_AP_THRESHOLDS,
+    classes: list[str] | None = None,
+    aliases: dict[str, str] | None = None,
+) -> dict:
+    """Per-class average precision of map instances at point-set IoU thresholds (Table III)."""
+    m = instance_matches(gt, transfer, iou_thresholds, classes, aliases)
+    results = _ap_summary(m.classes, iou_thresholds,
+                          lambda t, name: _average_precision(m.ranked[t][name][2], m.gt_counts[name]))
+    return {"classes": m.classes, "num_gt_instances": m.num_gt_instances, "num_predictions": m.num_predictions,
+            **results}
+
+
+def pooled_instance_ap(scenes: list[InstanceMatches], iou_thresholds=DEFAULT_AP_THRESHOLDS,
+                       classes: list[str] | None = None) -> dict:
+    """Average precision with the predictions of several scenes ranked together.
+
+    Matching stays within each scene; the ranked lists are then merged by
+    confidence (ties by scene, then prediction id), as ScanNet's instance
+    benchmark pools a test set. One scene gives :func:`instance_level_ap`.
+    """
+    if classes is None:
+        classes = sorted({name for scene in scenes for name in scene.classes})
+
+    def ap_of(threshold, name):
+        entries, n_gt = [], 0
+        for index, scene in enumerate(scenes):
+            n_gt += scene.gt_counts.get(name, 0)
+            if name in scene.ranked.get(threshold, {}):
+                confidences, ids, is_tp = scene.ranked[threshold][name]
+                entries += [(-c, index, pid, bool(tp)) for c, pid, tp in zip(confidences, ids, is_tp)]
+        entries.sort(key=lambda e: e[:3])
+        return _average_precision(np.array([e[3] for e in entries], dtype=bool), n_gt)
+
+    return {"classes": list(classes),
+            "num_gt_instances": sum(scene.num_gt_instances for scene in scenes),
+            "num_predictions": sum(scene.num_predictions for scene in scenes),
+            **_ap_summary(list(classes), iou_thresholds, ap_of)}
 
 
 def segmentation_report(
@@ -304,6 +369,45 @@ def segmentation_report(
         },
         "instance_level": instance_level_ap(gt, transfer, ap_thresholds, instance_classes, aliases),
         "unsupported_points": {str(k): v for k, v in transfer.unsupported_points.items()},
+    }
+
+
+def pooled_segmentation_report(
+    scenes: list[tuple[list[ObjectInstance], GroundTruthPoints]],
+    background_classes=DEFAULT_BACKGROUND_CLASSES,
+    aliases: dict[str, str] | None = None,
+    max_distance: float = DEFAULT_MAX_DISTANCE_M,
+    ap_thresholds=DEFAULT_AP_THRESHOLDS,
+    instance_classes: list[str] | None = None,
+    class_names: list[str] | None = None,
+) -> dict:
+    """:func:`segmentation_report` over several scenes (each a final map and its annotation).
+
+    Class-level scores pool every scene's points into one confusion count and
+    instance AP ranks all scenes' predictions together
+    (:func:`pooled_instance_ap`); one scene gives :func:`segmentation_report`.
+    """
+    background = [normalize_label(c, aliases) for c in background_classes]
+    gt_labels, pred_labels, matches, n_gt, n_transferred = [], [], [], 0, 0
+    for objects, gt in scenes:
+        transfer = transfer_labels(objects, gt, max_distance=max_distance, aliases=aliases)
+        gt_labels.append(normalize_labels(gt.labels, aliases))
+        pred_labels.append(transfer.pred_labels)
+        matches.append(instance_matches(gt, transfer, ap_thresholds, instance_classes, aliases))
+        n_gt += int(gt.points.shape[0])
+        n_transferred += int(np.sum(transfer.pred_instance_ids >= 0))
+    all_gt = np.concatenate(gt_labels) if gt_labels else np.zeros(0, dtype=str)
+    all_pred = np.concatenate(pred_labels) if pred_labels else np.zeros(0, dtype=str)
+    return {
+        "max_distance": max_distance,
+        "num_scenes": len(scenes),
+        "num_gt_points": n_gt,
+        "num_transferred_points": n_transferred,
+        "class_level": {
+            "without_background": class_level_metrics(all_gt, all_pred, class_names, background),
+            "with_background": class_level_metrics(all_gt, all_pred, class_names),
+        },
+        "instance_level": pooled_instance_ap(matches, ap_thresholds, instance_classes),
     }
 
 

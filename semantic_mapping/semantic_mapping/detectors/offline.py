@@ -76,3 +76,19 @@ class OfflineDetector(Detector):
                 mask=mask,
             ))
         return detections
+
+
+def write_detections(detections_dir: str | Path, frame_id: int, detections) -> None:
+    """Store one frame's detections in the layout :class:`OfflineDetector` replays
+    (masks as ``.npy`` files next to the record)."""
+    detections_dir = Path(detections_dir)
+    detections_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    for i, det in enumerate(detections):
+        record = {"bbox": [float(v) for v in det.bbox], "label": det.label, "score": float(det.score)}
+        if det.mask is not None:
+            mask_name = f"{frame_id:06d}_{i}.npy"
+            np.save(detections_dir / mask_name, det.mask.astype(bool))
+            record["mask"] = mask_name
+        records.append(record)
+    (detections_dir / f"{frame_id:06d}.json").write_text(json.dumps({"detections": records}))

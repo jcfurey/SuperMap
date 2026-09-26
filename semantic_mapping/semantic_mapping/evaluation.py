@@ -179,6 +179,8 @@ class SequenceEvaluator:
         self._last_stamp: float | None = None
         self.stats = [ObjectStats(label=gt.label) for gt in ground_truth]
         self.total_ids_created = 0
+        self.max_id_by_frame: dict[int, int] = {}
+        """Highest instance ID in existence by each observed frame (IDs only grow)."""
         self._last_objects: list[ObjectInstance] = []
         self._last_frame_id = -1
 
@@ -207,6 +209,7 @@ class SequenceEvaluator:
         if stamp is not None:
             self._last_stamp = float(stamp)
         self.total_ids_created = max(self.total_ids_created, *(o.instance_id for o in objects), 0)
+        self.max_id_by_frame[frame_id] = self.total_ids_created
 
         for gt, stats in zip(self.ground_truth, self.stats):
             if gt.present_at(frame_id):
@@ -270,6 +273,22 @@ class SequenceEvaluator:
             "rate": len(consistent) / len(evaluated) if evaluated else float("nan"),
             "inconsistent": sorted(k for k in evaluated if k not in consistent),
         }
+
+    @property
+    def final_objects(self) -> list[ObjectInstance]:
+        """The map as of the last observed frame."""
+        return list(self._last_objects)
+
+    def got_new_identity(self, index: int) -> bool | None:
+        """Whether ground-truth object ``index`` was only ever matched by instances
+        created after it appeared, i.e. it received a new ID rather than an existing
+        one (Fig. 3: "newly introduced objects receive new IDs"). None when it was
+        never matched or was present from the first observed frame."""
+        gt, stats = self.ground_truth[index], self.stats[index]
+        earlier = [f for f in self.max_id_by_frame if f < gt.appear_frame]
+        if not stats.matched_ids or not earlier:
+            return None
+        return min(stats.matched_ids) > self.max_id_by_frame[max(earlier)]
 
     def is_stale(self, instance: ObjectInstance) -> bool:
         """Occluded and unseen for longer than ``stale_after_sec`` at the last observed stamp."""

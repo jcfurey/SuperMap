@@ -1,0 +1,129 @@
+# The quantitative results SuperMap's paper reports (doc/paper.pdf, Sec. V),
+# transcribed for examples/paper_harness.py, which checks this package
+# against them. Values are as printed; percentages stay percentages.
+#
+# Where the paper's own data is not public, the harness uses these numbers
+# as floors on easier synthetic data or checks the claims the paper draws
+# from them, never the values themselves (semantic_mapping/paper_harness.py).
+
+paper:
+  title: "SuperMap: A Spatio-Temporal SLAM System for Visual-Language Navigation"
+  venue: RSS 2026
+  source: doc/paper.pdf
+
+protocol:
+  # Sec. V-D: a true positive needs 3D IoU > 0.1, centroid distance < 0.3 m
+  # and the correct semantic label.
+  tp_iou_3d: 0.1
+  tp_centroid_m: 0.3
+  # Sec. V-B: Grounding DINO for detection, SAM2 for instance masks.
+  detector: groundingdino
+  masks: sam2
+
+# Sec. V-B, Table II: class-level segmentation on ScanNet (scene list not
+# given). mIoU, frequency-weighted mIoU and accuracy, without and with the
+# background classes, in percent.
+table2:
+  dataset: scannet
+  unit: percent
+  methods:
+    ConceptFusion:
+      approach: point-feature
+      without_background: {miou: 21.76, fmiou: 26.71, acc: 34.10}
+      with_background: {miou: 18.57, fmiou: 23.06, acc: 28.77}
+    NACLIP-3D:
+      approach: point-feature
+      without_background: {miou: 22.32, fmiou: 24.32, acc: 33.46}
+      with_background: {miou: 22.32, fmiou: 24.32, acc: 33.46}
+    Trident-3D:
+      approach: point-feature
+      without_background: {miou: 29.97, fmiou: 37.62, acc: 51.06}
+      with_background: {miou: 24.80, fmiou: 27.77, acc: 38.43}
+    RayFronts:
+      approach: point-feature
+      without_background: {miou: 41.29, fmiou: 46.42, acc: 56.76}
+      with_background: {miou: 32.29, fmiou: 39.04, acc: 49.15}
+    ConceptGraphs:
+      approach: object-level
+      without_background: {miou: 21.62, fmiou: 24.32, acc: 31.05}
+      with_background: {miou: 20.83, fmiou: 23.61, acc: 35.80}
+    HOV-SG:
+      approach: object-level
+      without_background: {miou: 26.79, fmiou: 36.05, acc: 35.17}
+      with_background: {miou: 23.48, fmiou: 28.92, acc: 38.52}
+    SuperMap:
+      approach: object-level
+      without_background: {miou: 27.42, fmiou: 43.50, acc: 55.48}
+      with_background: {miou: 22.61, fmiou: 29.10, acc: 33.00}
+  notes:
+    - "The text puts SuperMap's accuracy 1.32 points below RayFronts; the table gives 56.76 - 55.48 = 1.28."
+    - "The text calls ConceptFusion an object-centric baseline; the table lists it under point-feature methods."
+
+# Sec. V-B, Table III: instance-level AP on ScanNet, in percent, per class.
+# refrigerator is ScanNet's (misspelled) "refridgerator"; config/segmentation_eval.yaml maps it.
+table3:
+  dataset: scannet
+  unit: percent
+  classes: [chair, window, refrigerator, sofa, door]
+  methods:
+    HOV-SG:
+      chair: {ap50: 4.58, ap25: 4.73}
+      window: {ap50: 0.00, ap25: 0.00}
+      refrigerator: {ap50: 0.00, ap25: 0.00}
+      sofa: {ap50: 30.00, ap25: 31.25}
+      door: {ap50: 9.70, ap25: 10.40}
+    ConceptGraphs:
+      chair: {ap50: 0.00, ap25: 2.33}
+      window: {ap50: 0.00, ap25: 0.00}
+      refrigerator: {ap50: 0.00, ap25: 0.00}
+      sofa: {ap50: 0.00, ap25: 0.00}
+      door: {ap50: 0.00, ap25: 0.00}
+    SuperMap:
+      chair: {ap50: 63.76, ap25: 74.72}
+      window: {ap50: 42.20, ap25: 67.92}
+      refrigerator: {ap50: 62.50, ap25: 62.50}
+      sofa: {ap50: 33.35, ap25: 83.35}
+      door: {ap50: 10.00, ap25: 25.00}
+
+# Sec. V-D, Table IV: per-object detection recall and change-detection recall
+# in a 10-minute real-world run (30 m x 20 m indoors; data not public). Three
+# objects appear partway through, three are removed. Khronos produced no
+# consistent 3D estimates ("-" in the table).
+table4:
+  dataset: supermap_realworld
+  appeared: [bucket, cart, safety sign]
+  disappeared: [plant, trash can, chair]
+  methods:
+    SuperMap:
+      bucket: {detection: 1.000, change: 1.000}
+      cart: {detection: 0.262, change: 0.622}
+      safety sign: {detection: 0.583, change: 0.790}
+      plant: {detection: 0.755, change: 0.865}
+      trash can: {detection: 0.434, change: 0.679}
+      chair: {detection: 1.000, change: 1.000}
+    DualMap:
+      bucket: {detection: 0.000, change: 0.553}
+      cart: {detection: 0.000, change: 0.527}
+      safety sign: {detection: 0.000, change: 0.507}
+      plant: {detection: 0.000, change: 0.561}
+      trash can: {detection: 0.310, change: 0.642}
+      chair: {detection: 0.000, change: 0.449}
+
+# Sec. V-E, Table V: module ablation, final-map precision / recall / F1 on a
+# scene with 41 annotated objects (data not public).
+table5:
+  dataset: supermap_realworld_41_objects
+  configurations:
+    W/o 2D Tracker: {precision: 0.7787, recall: 0.4595, f1: 0.5780}
+    W/o Semantic Fusion: {precision: 0.7929, recall: 0.3870, f1: 0.5201}
+    W/o Geometric Consistency Update: {precision: 0.8189, recall: 0.4448, f1: 0.5764}
+    All (proposed): {precision: 0.8677, recall: 0.4955, f1: 0.6308}
+
+# Sec. V-H: module rates on an Intel i9-14900H with an RTX 4090 Laptop GPU.
+runtime:
+  hardware: "Intel i9-14900H CPU, NVIDIA RTX 4090 Laptop GPU (16 GB)"
+  rates_hz:
+    pose: 10
+    segmentation_2d: 1
+    mapping_3d: 3
+    scene_graph_4d: 5
