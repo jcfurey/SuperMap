@@ -433,7 +433,7 @@ On a 4-core Xeon, with the kernels and without:
 | occlusion-aware rasterization of a 131k-point LiDAR scan, 640x480 / 1920x1200 / 5 MP | 4 / 8 / 20 ms | 26 / 32 / 53 ms |
 | sparse-depth filling (radius 2), 1920x1200 / 5 MP | 3 / 9 ms | 20 / 57 ms |
 | ground-plane fit, 300 / 2000 points (once per detection) | 8 / 32 us | 420 / 810 us |
-| map update, about 140 objects in view at 640x480 | 260 ms | 390 ms |
+| map update, about 140 objects in view at 640x480 | 260 ms | 400 ms |
 
 ### Persist the map (living memory across sessions)
 
