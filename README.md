@@ -114,6 +114,40 @@ Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--confi
 
 `evaluate.py --ablation` re-runs the sequence with each module of the Sec. V-E ablation switched off (`use_2d_tracker`, `use_semantic_fusion`, `use_geometric_consistency`) and prints the final-map precision / recall / F1 of each, as in Table V. On the synthetic scene only the geometric-consistency update changes the final map (precision 0.89 → 0.67, because removed objects are never retired): its labels never flicker and its motion is gentle enough for 3D association alone, so the tracker and fusion ablations need a real capture to separate.
 
+### Check against the paper
+
+`examples/paper_harness.py` checks the package against every quantitative result in the paper's Sec. V. The numbers are transcribed in `config/paper_results.yaml`, with the baselines' rows, so claims such as "outperforms ConceptGraphs" can be tested too. The paper's ScanNet scene list is not published and its robot captures are private, so each check says what kind of comparison it is:
+
+- **reproduction**: on the paper's own data, the value must fall within a tolerance.
+- **floor**: on easier data, the value must not fall below the paper's.
+- **claim**: a statement the paper draws from its tables must hold.
+- **not run**: the data is missing; the report says why.
+
+```bash
+python examples/paper_harness.py                                  # synthetic suite (CI runs this)
+python examples/paper_harness.py --scannet scans/scene0011_00 scans/scene0050_00 \
+    --detector groundingdino --cache_detections                   # Tables II-III, pooled over the scenes
+python examples/paper_harness.py --scannet scans/scene0011_00 --detector offline   # rerun from the cache
+python examples/paper_harness.py --capture data/my_capture         # Tables IV-V on a capture with ground truth
+```
+
+The synthetic suite checks the following:
+
+- **Table IV floors.** The change scene has Table IV's six objects (bucket, cart and safety sign introduced; plant, trash can and chair removed). Their detection and change recall must reach the paper's real-world values.
+- **Identity claims (Sec. V-C, Fig. 3).** Removed objects keep one ID, introduced objects get new ones, objects that stay put keep theirs, and moved or returned objects keep theirs.
+- **Table V claim.** The full system must beat every ablation. The plain scene cannot separate the modules, so this runs on a stress version over 5 seeds: one detection in five reports a confusable prompted label (bucket for trash can, bag for backpack), and four dark objects lose their depth in half the frames. On the stress scene, the full system has the highest F1 against every ablation on 5 of 5 seeds.
+
+  | configuration | F1 |
+  |---|---|
+  | All | 0.70 |
+  | W/o 2D Tracker | 0.48 |
+  | W/o Semantic Fusion | 0.60 |
+  | W/o Geometric Consistency Update | 0.57 |
+
+- **Sec. V-H rates.** The 3 Hz mapping and 5 Hz scene-graph rates are floors.
+
+Each failed floor or claim fails the run, unless `config/paper_deviations.yaml` lists it with an explanation. One is listed today. The removed chair's change recall is 0.935 against the paper's 1.000: the log-odds filter of Eq. 8 needs four observations of the empty spot to retire a well-established object. That costs 3 of the 13 frames the synthetic scene sees the spot empty, a lag the paper's 10-minute run would hide.
+
 ## Run (live ROS2)
 
 ```bash

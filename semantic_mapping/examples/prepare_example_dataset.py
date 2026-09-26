@@ -102,6 +102,17 @@ SCENE_OBJECTS: list[SceneObject] = [
 ]
 
 
+CONFUSABLE_LABELS = {
+    "table": "shelf", "sofa": "chair", "shelf": "refrigerator", "plant": "bucket", "trash can": "bucket",
+    "chair": "sofa", "bucket": "trash can", "cart": "box", "safety sign": "traffic cone", "box": "cart",
+    "backpack": "bag",
+}
+"""What an open-vocabulary detector plausibly calls each object instead
+(``--label_flip_prob``): the label flicker that Eq. (10) fusion must absorb.
+Every confusion stays inside ``config/prompts.yaml``, since a prompted
+detector can only answer with a prompted label."""
+
+
 @dataclass
 class PresentObject:
     """An object as it stands in one frame: its label, colour, and box."""
@@ -247,11 +258,15 @@ def make_detections(
     detections_dir: Path | None = None,
     frame_id: int = 0,
     with_masks: bool = True,
+    label_flip_prob: float = 0.0,
+    flip_rng: np.random.Generator | None = None,
 ) -> list[dict]:
     """Pre-baked detections for one frame: a jittered box per visible object and,
     by default, its instance mask -- mirroring the paper's Grounding DINO box +
     SAM2 mask pairing. ``with_masks=False`` emits box-only records to exercise
-    the harder fallback path.
+    the harder fallback path. With ``label_flip_prob > 0`` each detection
+    reports its object's confusable label (:data:`CONFUSABLE_LABELS`) with
+    that probability, drawn from ``flip_rng`` so the other draws are unchanged.
     """
     detections = []
     for idx, obj in enumerate(present_objects):
@@ -261,9 +276,12 @@ def make_detections(
             continue
         jitter = rng.normal(0.0, 1.5, size=4)
         bbox = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float64) + jitter
+        label = obj.label
+        if label_flip_prob > 0 and flip_rng.random() < label_flip_prob:
+            label = CONFUSABLE_LABELS.get(label, label)
         record = {
             "bbox": bbox.tolist(),
-            "label": obj.label,
+            "label": label,
             "score": float(np.clip(rng.normal(0.9, 0.05), 0.5, 0.99)),
         }
         if with_masks and detections_dir is not None:
@@ -274,36 +292,37 @@ def make_detections(
     return detections
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out_dir", default="data/example_scene", help="Output dataset directory.")
-    parser.add_argument("--num_frames", type=int, default=60)
-    parser.add_argument("--fps", type=float, default=10.0)
-    parser.add_argument("--width", type=int, default=160)
-    parser.add_argument("--height", type=int, default=120)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no_masks", action="store_true",
-                        help="Emit box-only detections (no instance masks) to exercise the fallback path.")
-    parser.add_argument("--lidar_like", action="store_true",
-                        help="Store sparse, noisy depth as a LiDAR scan rasterized into the camera would give "
-                             "(RGB, detections, and ground truth stay dense).")
-    parser.add_argument("--lidar_density", type=float, default=0.05,
-                        help="Fraction of pixels carrying a depth reading with --lidar_like.")
-    parser.add_argument("--lidar_noise_m", type=float, default=0.02, help="Range noise (1 sigma) with --lidar_like.")
-    args = parser.parse_args()
-
-    out_dir = Path(args.out_dir)
+def generate_scene(
+    out_dir: str | Path,
+    num_frames: int = 60,
+    fps: float = 10.0,
+    width: int = 160,
+    height: int = 120,
+    seed: int = 0,
+    with_masks: bool = True,
+    lidar_like: bool = False,
+    lidar_density: float = 0.05,
+    lidar_noise_m: float = 0.02,
+    label_flip_prob: float = 0.0,
+    depth_dropout_labels=(),
+    depth_dropout_prob: float = 0.5,
+    verbose: bool = True,
+) -> Path:
+    """Write the synthetic sequence to ``out_dir`` (options as in :func:`main`); returns ``out_dir``."""
+    out_dir = Path(out_dir)
     frames_dir = out_dir / "frames"
     detections_dir = out_dir / "detections"
     frames_dir.mkdir(parents=True, exist_ok=True)
     detections_dir.mkdir(parents=True, exist_ok=True)
 
-    fx = fy = 0.9 * args.width
-    cx, cy = args.width / 2.0, args.height / 2.0
-    intrinsics = {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": args.width, "height": args.height}
+    fx = fy = 0.9 * width
+    cx, cy = width / 2.0, height / 2.0
+    intrinsics = {"fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": width, "height": height}
     (out_dir / "intrinsics.json").write_text(json.dumps(intrinsics, indent=2))
 
-    rng = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(seed)
+    # Stress options draw from their own stream, so the default scene is unchanged by them.
+    stress_rng = np.random.default_rng([seed, 1])
     radius, cam_height = 3.4, 1.2
     target = np.array([0.0, 0.0, 0.9])
     theta0, theta1 = np.deg2rad(200), np.deg2rad(-20)
@@ -313,18 +332,18 @@ def main() -> None:
     present_frames: dict[tuple[int, int], list[int]] = {}
 
     K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
-    final_frac = (args.num_frames - 1) / args.num_frames
-    sample_mask = np.zeros((args.height, args.width), dtype=bool)
+    final_frac = (num_frames - 1) / num_frames
+    sample_mask = np.zeros((height, width), dtype=bool)
     sample_mask[::2, ::2] = True
     gt_chunks: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
-    for frame_id in range(args.num_frames):
+    for frame_id in range(num_frames):
         # Orbit progress spans the full arc (last frame lands on theta1);
         # presence uses a half-open fraction in [0, 1) so disappear_frac=1.0
         # really means "never removed" on the final frame too.
-        orbit_frac = frame_id / max(args.num_frames - 1, 1)
-        frac = frame_id / args.num_frames
-        stamp = frame_id / args.fps
+        orbit_frac = frame_id / max(num_frames - 1, 1)
+        frac = frame_id / num_frames
+        stamp = frame_id / fps
 
         theta = theta0 + (theta1 - theta0) * orbit_frac
         position = np.array([radius * np.cos(theta), radius * np.sin(theta), cam_height])
@@ -344,7 +363,7 @@ def main() -> None:
             present_objects.append(PresentObject(obj.label, obj.color, obj.bbox_for(phase), idx, in_final_scene))
             phase_keys.append((idx, phase_idx))
         depth, rgb, object_id_map = render_frame(
-            position, R_world_from_cam, present_objects, args.width, args.height, fx, fy, cx, cy,
+            position, R_world_from_cam, present_objects, width, height, fx, fy, cx, cy,
         )
 
         gt_chunks.append(ground_truth_surfaces(
@@ -352,9 +371,12 @@ def main() -> None:
         ))
 
         stored_depth = depth
-        if args.lidar_like:
-            keep = rng.random(depth.shape) < args.lidar_density
-            stored_depth = np.where(keep & (depth > 0), depth + rng.normal(0.0, args.lidar_noise_m, depth.shape), 0.0)
+        for local_idx, obj in enumerate(present_objects):
+            if obj.label in depth_dropout_labels and stress_rng.random() < depth_dropout_prob:
+                stored_depth = np.where(object_id_map == local_idx, 0.0, stored_depth)
+        if lidar_like:
+            keep = rng.random(depth.shape) < lidar_density
+            stored_depth = np.where(keep & (depth > 0), depth + rng.normal(0.0, lidar_noise_m, depth.shape), 0.0)
             stored_depth = np.maximum(stored_depth, 0.0)
 
         frame_prefix = frames_dir / f"{frame_id:06d}"
@@ -366,7 +388,8 @@ def main() -> None:
         (frames_dir / f"{frame_id:06d}_pose.json").write_text(json.dumps(pose))
 
         detections = make_detections(
-            present_objects, object_id_map, rng, detections_dir, frame_id, with_masks=not args.no_masks,
+            present_objects, object_id_map, rng, detections_dir, frame_id, with_masks=with_masks,
+            label_flip_prob=label_flip_prob, flip_rng=stress_rng,
         )
         (detections_dir / f"{frame_id:06d}.json").write_text(json.dumps({"detections": detections}))
 
@@ -379,8 +402,8 @@ def main() -> None:
     # object share an identity, which is what the identity-consistency metric
     # scores (the same instance ID must serve every phase).
     scene_meta = {
-        "num_frames": args.num_frames,
-        "fps": args.fps,
+        "num_frames": num_frames,
+        "fps": fps,
         "objects": [
             {
                 "label": o.label,
@@ -390,9 +413,9 @@ def main() -> None:
                 "appear_frac": phase.appear_frac,
                 "disappear_frac": phase.disappear_frac,
                 # Each phase is a single contiguous interval by construction.
-                "appear_frame": present_frames.get((idx, phase_idx), [args.num_frames])[0],
+                "appear_frame": present_frames.get((idx, phase_idx), [num_frames])[0],
                 "disappear_frame": (present_frames[(idx, phase_idx)][-1] + 1
-                                    if (idx, phase_idx) in present_frames else args.num_frames),
+                                    if (idx, phase_idx) in present_frames else num_frames),
                 "visible_frames": visible_frames.get((idx, phase_idx), []),
             }
             for idx, o in enumerate(SCENE_OBJECTS)
@@ -411,10 +434,44 @@ def main() -> None:
     first = np.sort(first)
     GroundTruthPoints(points[first], labels[first], instance_ids[first]).save(out_dir / "gt_points.npz")
 
-    print(f"Wrote {args.num_frames} synthetic frames to {out_dir}/ "
-          f"({first.size} labeled ground-truth surface points in gt_points.npz)")
-    print("This is a deterministic offline substitute for a real capture -- "
-          "point --data_dir at a real RGB-D/LiDAR sequence for actual deployment.")
+    if verbose:
+        print(f"Wrote {num_frames} synthetic frames to {out_dir}/ "
+              f"({first.size} labeled ground-truth surface points in gt_points.npz)")
+        print("This is a deterministic offline substitute for a real capture -- "
+              "point --data_dir at a real RGB-D/LiDAR sequence for actual deployment.")
+    return out_dir
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out_dir", default="data/example_scene", help="Output dataset directory.")
+    parser.add_argument("--num_frames", type=int, default=60)
+    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--width", type=int, default=160)
+    parser.add_argument("--height", type=int, default=120)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no_masks", action="store_true",
+                        help="Emit box-only detections (no instance masks) to exercise the fallback path.")
+    parser.add_argument("--lidar_like", action="store_true",
+                        help="Store sparse, noisy depth as a LiDAR scan rasterized into the camera would give "
+                             "(RGB, detections, and ground truth stay dense).")
+    parser.add_argument("--lidar_density", type=float, default=0.05,
+                        help="Fraction of pixels carrying a depth reading with --lidar_like.")
+    parser.add_argument("--lidar_noise_m", type=float, default=0.02, help="Range noise (1 sigma) with --lidar_like.")
+    parser.add_argument("--label_flip_prob", type=float, default=0.0,
+                        help="Probability that a detection reports its object's confusable label (label flicker).")
+    parser.add_argument("--depth_dropout_labels", nargs="*", default=[],
+                        help="Objects whose depth readings vanish in some frames (dark or absorptive surfaces).")
+    parser.add_argument("--depth_dropout_prob", type=float, default=0.5,
+                        help="Per-frame probability that a --depth_dropout_labels object has no depth at all.")
+    args = parser.parse_args()
+    generate_scene(
+        args.out_dir, num_frames=args.num_frames, fps=args.fps, width=args.width, height=args.height,
+        seed=args.seed, with_masks=not args.no_masks, lidar_like=args.lidar_like,
+        lidar_density=args.lidar_density, lidar_noise_m=args.lidar_noise_m,
+        label_flip_prob=args.label_flip_prob, depth_dropout_labels=args.depth_dropout_labels,
+        depth_dropout_prob=args.depth_dropout_prob,
+    )
 
 
 if __name__ == "__main__":
