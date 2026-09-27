@@ -168,7 +168,10 @@ class PipelineConfig:
     disappeared_seen_through_frames: int = 3
     """Retire an undetected instance after this many frames in which the part
     of it the depth could check was seen through, however much of it stayed
-    hidden (ObjectMap._count_seen_through). 0 disables."""
+    hidden (ObjectMap._count_seen_through). A frame that clearly shows its
+    spot empty while the rest of the view agrees with the map retires it at
+    once; one in which the rest of the view is seen through too (a pose or
+    depth glitch) does not count. 0 disables."""
     min_label_confidence: float = 0.4
     min_observations_for_confidence_check: int = 5
     min_hits_to_confirm: int = 2

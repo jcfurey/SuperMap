@@ -76,10 +76,11 @@ def test_known_deviations_name_real_checks(reference, change_scene):
     checks = harness.table4_checks(run.evaluator, reference, "synthetic")
     checks += harness.identity_checks(run.evaluator, reference, "synthetic")
     ids = {check.id for check in checks}
-    assert deviations and set(deviations) <= ids
+    assert set(deviations) <= ids
     assert not harness.apply_known_deviations(checks, deviations)  # every entry still describes a real miss
     assert not [check.id for check in checks if check.failed()]
     by_id = {check.id: check for check in checks}
+    assert by_id["table4.chair.change"].verdict == harness.AT_OR_ABOVE  # retired on the first empty view
     assert by_id["table4.cart.detection"].verdict == harness.AT_OR_ABOVE
     assert by_id["identity.bucket.new"].verdict == harness.HOLDS
     assert by_id["identity.static.kept"].verdict == harness.HOLDS

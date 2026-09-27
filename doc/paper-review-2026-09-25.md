@@ -129,6 +129,27 @@ tests for each item are in `test/test_paper_review_2026_09_25.py`.
     - The chair's retirement lag drops from 3 frames to 2 (change recall 0.935 to 0.957), with the per-point filter unchanged; `config/paper_deviations.yaml` is updated.
     - The moved box's old spot is confirmed empty before it reappears, so it keeps its ID without a provisional one: 11 IDs for 11 objects.
     - Final-map F1 is 1.000 on the change scene and on the stress scene (was 0.941). Sparse LiDAR without fill keeps both identities (was 1 of 2) with F1 0.889 (was 0.727).
+- **D9 refined again: one conclusive empty view retires an object.**
+  - With three seen-through frames needed, the removed chair was still asserted for 2 frames after its removal. Its change recall was 0.957 against the paper's 1.000, the last entry in `config/paper_deviations.yaml`.
+  - The three frames guard against glitches. On the change scene with 1 Hz detection:
+    - With one frame enough, a single frame offset by 0.3 m or 5° retired 2 to 4 present objects.
+    - With three, three consecutive frames offset by 0.6 m and 10° still retired 4 (table, shelf, plant, chair).
+  - A glitch contradicts everything in view, a removal only the removed object. A seen-through frame is now weighed by the share of the other in-view instances' checked points that the frame confirms (`ObjectMap._view_agreement`; it uses the frame's batched classification and needs at least 20 checked points):
+    - at most `disappeared_occupied_fraction`: the frame does not count;
+    - at least `active_occupied_fraction`: the frame retires the object at once;
+    - otherwise, or with too little else in view, the frame counts once, as before.
+  - Retiring at once also needs the depth to have read the object. At least `active_occupied_fraction` of its points that project into the image must be confirmed or seen through, not left without a reading.
+    - A dark or absorptive object returns no depth. Only its outline, which rounds onto the background, is then checked, and it is seen through.
+    - On the stress scene's depth-dropout frames, the depth read 1% to 5% of a present bucket or cart. It read 96% of the removed chair and all of the removed box.
+    - Without this condition, the W/o 2D Tracker ablation retired present buckets and carts, and its recall fell from 0.975 to 0.875.
+  - Retiring at once also needs the frame to check at least a tenth of the object's points (`_MIN_CONCLUSIVE_SHARE`).
+    - With sparse LiDAR and depth filling, the camera saw a present shelf only as a 2-pixel sliver at the image border. The fill had spread the background over that sliver, so 20 of the 21 checked points were seen through. That was 1% of the shelf's 3612 points, and the shelf was retired and later re-spawned under a new ID.
+    - Every real removal in the synthetic scenes had at least 14% of its points checked on its retiring frame (the plant, partly out of view). The chair, box, backpack and trash can had 16% to 100%.
+  - Effects:
+    - The chair's change recall is 1.000. `config/paper_deviations.yaml` lists nothing, and the harness passes.
+    - No present object is retired with up to three consecutive glitched frames of 0.6 m and 10°, with detection at 1 Hz or on every frame.
+    - Every other harness check is unchanged, the Table V rows included.
+    - On the other synthetic scenes nothing gets worse. Change recall rises on the change scene at 160x120 and at 640x480 (0.970 to 0.977, 0.976 to 0.983) and on sparse LiDAR with filling (0.962 to 0.964). On one scene without instance masks, F1 rises from 0.526 to 0.556. The W/o 2D Tracker ablation on the stress scene matches dev.
 - **Test fix for ac159e9.** The dense-launch test compared only top-level YAML keys with declared parameters. It now flattens nested keys such as `platform_mask.enabled`, as ROS does.
 - **D21 fixed**, in two parts:
   - **Descriptor.** The colour histogram now bins neutral pixels by intensity (3 soft, log-spaced bins) instead of putting them all at one chromaticity. A pixel is neutral when its channel spread is below 15% of its brightest channel, or below 16 levels, so dark sensor noise stays neutral.
