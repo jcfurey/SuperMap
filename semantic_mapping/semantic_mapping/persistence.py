@@ -82,6 +82,7 @@ def instance_to_record(obj: ObjectInstance) -> dict:
         "embedding": _floats(obj.embedding) if obj.embedding is not None else None,
         "embedding_count": int(obj.embedding_count),
         "match_stamps": _floats(obj.match_stamps),
+        "seen_through_frames": int(obj.seen_through_frames),
     }
 
 
@@ -116,6 +117,7 @@ def instance_from_record(
         embedding=(np.asarray(record["embedding"], dtype=np.float32) if record.get("embedding") is not None else None),
         embedding_count=int(record.get("embedding_count", 0)),
         match_stamps=[float(s) for s in record.get("match_stamps", [])],
+        seen_through_frames=int(record.get("seen_through_frames", 0)),
     )
 
 

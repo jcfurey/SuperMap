@@ -71,6 +71,10 @@ def voxel_downsample_indices(points: np.ndarray, voxel_size: float) -> np.ndarra
 _MIN_SUPPORTED_POINTS = 3
 """Fewest supported points a support-based box is computed from; fewer fall back to all points."""
 
+_MIN_CHECKED_POINTS = 5
+"""Fewest points the depth must confirm or see through in a frame for that frame to count for or against
+an undetected instance being there (ObjectMap._count_seen_through)."""
+
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     """Deduplicate points onto a voxel grid, keeping the map's point budget bounded."""
@@ -106,6 +110,7 @@ class ObjectMap:
         active_occupied_fraction: float = 0.6,
         disappeared_occupied_fraction: float = 0.2,
         max_occlusion_frames: int = 30,
+        disappeared_seen_through_frames: int = 0,
         min_label_confidence: float = 0.4,
         min_observations_for_confidence_check: int = 5,
         tentative_max_age: int = 10,
@@ -140,6 +145,9 @@ class ObjectMap:
         self.active_occupied_fraction = active_occupied_fraction
         self.disappeared_occupied_fraction = disappeared_occupied_fraction
         self.max_occlusion_frames = max_occlusion_frames
+        self.disappeared_seen_through_frames = disappeared_seen_through_frames
+        """Retire an undetected instance after this many frames in which the part of it the camera could
+        check was seen through (ObjectInstance.seen_through_frames); 0 disables."""
         self.min_label_confidence = min_label_confidence
         self.min_observations_for_confidence_check = min_observations_for_confidence_check
         self.tentative_max_age = tentative_max_age
@@ -394,11 +402,12 @@ class ObjectMap:
         depth_image: np.ndarray | None,
         detection: Detection2D | None = None,
         in_view: bool | None = None,
-    ) -> bool:
+    ) -> tuple[int, int]:
         """Run Eq. (7)-(9) over the instance's points and, when a detection is
         associated this frame, the per-point membership update; then prune
-        points that either evidence has ruled out. Returns whether any point
-        was geometrically confirmed observable.
+        points that either evidence has ruled out. Returns how many points
+        the depth confirmed (observable) and how many it saw through
+        (disappeared) this frame.
 
         Instances whose box is entirely outside the view get no evidence from
         this frame (every point would be OUT_OF_VIEW), so their per-point
@@ -409,18 +418,19 @@ class ObjectMap:
         caller; ``None`` runs the per-instance test here.
         """
         if instance.points_world.shape[0] == 0 or depth_image is None or not self.geometric_consistency:
-            return False
+            return 0, 0
         if in_view is False:
-            return False
+            return 0, 0
         if in_view is None and self.cull_out_of_view \
                 and not self.may_be_in_view(instance.bbox3d, K, T_world_from_cam, depth_image.shape):
-            return False
+            return 0, 0
         log_odds, states, pixels = gc.update_object_points(
             K, T_world_from_cam, depth_image, instance.points_world, instance.point_log_odds, self.tau_eps,
             contradiction_window_px=self.contradiction_window_px,
             classification=self._prepared_classification(instance, K, T_world_from_cam, depth_image),
         )
         observable = states == gc.GeometricState.OBSERVABLE
+        evidence = int(np.count_nonzero(observable)), int(np.count_nonzero(states == gc.GeometricState.DISAPPEARED))
         instance.point_log_odds = log_odds
         if detection is not None and self.semantic_fusion:
             inside = _inside_detection(pixels, detection, self.membership_margin_px)
@@ -431,12 +441,12 @@ class ObjectMap:
             # Keep the last supported body intact while accumulating evidence.
             # Unknown/occluded points retain their prior; contradicted points
             # can retire the whole body instead of leaving a floor fragment.
-            return bool(np.any(observable))
+            return evidence
         instance.points_contradicted += int(contradicted.sum())
         keep = ~(contradicted | (instance.point_membership < self.prune_membership))
         if not np.all(keep):
             self._subset_points(instance, keep)
-        return bool(np.any(observable))
+        return evidence
 
     def prepare_evidence(self, instances, K: np.ndarray, T_world_from_cam: np.ndarray,
                          depth_image: np.ndarray | None) -> None:
@@ -593,6 +603,7 @@ class ObjectMap:
         instance.latest_stamp = stamp
         instance.frames_since_seen = 0
         instance.missed_detection_frames = 0
+        instance.seen_through_frames = 0
         instance.hits += 1
         instance.match_stamps = _recent_matches(instance.match_stamps + [float(stamp)])
         self._raise_existence(instance, detection.score)
@@ -609,7 +620,8 @@ class ObjectMap:
             instance.points_contradicted = 0
         # A visible 2D silhouette with inadequate depth is not a measurement
         # of its body or evidence that the last body has become empty space.
-        corroborated = (self._apply_evidence(instance, K, T_world_from_cam, depth_image, detection, in_view=in_view)
+        corroborated = (self._apply_evidence(instance, K, T_world_from_cam, depth_image, detection,
+                                             in_view=in_view)[0] > 0
                         if has_geometry or not dynamic else False)
 
         if detection.label in self.dynamic_geometry_labels and len(new_points_world):
@@ -714,11 +726,12 @@ class ObjectMap:
         from that expiry.
         """
         instance.frames_since_seen += 1
-        observed = self._apply_evidence(instance, K, T_world_from_cam, depth_image, in_view=in_view)
+        confirmed, seen_through = self._apply_evidence(instance, K, T_world_from_cam, depth_image, in_view=in_view)
+        self._count_seen_through(instance, confirmed, seen_through)
         if depth_image is None or instance.points_world.shape[0] == 0 or not self.geometric_consistency:
             visible = in_view is not False
         else:
-            visible = observed
+            visible = confirmed > 0
         if detections_evaluated and visible:
             instance.missed_detection_frames += 1
             if self.tracks_existence:
@@ -746,12 +759,38 @@ class ObjectMap:
         occupied = gc.occupied_fraction(instance.point_log_odds) * alive
         denominator = alive if self._preserve_compact_body(instance) else alive + instance.points_contradicted
         fraction = occupied / denominator if denominator else 0.0
-        if alive == 0 or fraction <= self.disappeared_occupied_fraction or self._body_contradicted(instance):
+        seen_through_long_enough = (self.disappeared_seen_through_frames > 0
+                                    and instance.seen_through_frames >= self.disappeared_seen_through_frames)
+        if alive == 0 or fraction <= self.disappeared_occupied_fraction or self._body_contradicted(instance) \
+                or seen_through_long_enough:
             instance.status = ObjectStatus.DISAPPEARED
         elif instance.status != ObjectStatus.TENTATIVE and (
             fraction < self.active_occupied_fraction or instance.frames_since_seen > self.max_occlusion_frames
         ):
             instance.status = ObjectStatus.OCCLUDED
+
+    def _count_seen_through(self, instance: ObjectInstance, confirmed: int, seen_through: int) -> None:
+        """Advance ``instance.seen_through_frames`` by this frame's verdict on the part of it the camera checked.
+
+        The occupied fraction judges an object by all its points, and points
+        hidden since it was last detected keep their old confirmations: a
+        removed object whose spot the camera sees only partly, past
+        something in front of it, never drops below
+        ``disappeared_occupied_fraction`` however clearly the visible part
+        is empty. A rigid object is there or not, so the part the depth
+        checked this frame speaks for the whole: with at least
+        ``_MIN_CHECKED_POINTS`` checked, a frame that confirms at most
+        ``disappeared_occupied_fraction`` of them counts as seen through, one
+        that confirms at least ``active_occupied_fraction`` resets the
+        count, and anything else or a hidden view leaves it.
+        """
+        checked = confirmed + seen_through
+        if checked < _MIN_CHECKED_POINTS:
+            return
+        if confirmed <= self.disappeared_occupied_fraction * checked:
+            instance.seen_through_frames += 1
+        elif confirmed >= self.active_occupied_fraction * checked:
+            instance.seen_through_frames = 0
 
     def confirm_tentative(self, instance: ObjectInstance, min_hits: int) -> None:
         """Promote a tentative track to active once it has enough corroborating hits."""
@@ -824,6 +863,7 @@ class ObjectMap:
 
         keep.hits = total_hits
         keep.match_stamps = _recent_matches(keep.match_stamps + drop.match_stamps)
+        keep.seen_through_frames = min(keep.seen_through_frames, drop.seen_through_frames)
         keep.existence_log_odds = max(keep.existence_log_odds, drop.existence_log_odds)
         keep.missed_detection_frames = min(keep.missed_detection_frames, drop.missed_detection_frames)
         keep.frames_since_seen = min(keep.frames_since_seen, drop.frames_since_seen)

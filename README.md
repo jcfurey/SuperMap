@@ -90,10 +90,10 @@ No public SuperMap dataset is bundled yet, so `prepare_example_dataset.py` synth
 
 | detections | detection recall | change recall | identity kept (moved / returned) | instance IDs / objects | final-map F1 |
 |---|---|---|---|---|---|
-| boxes + masks | 0.98 | 0.96 | 2 / 2 | 12 / 11 | 0.89 |
-| boxes only (`--no_masks`) | 0.69 | 0.69 | 0 / 2 | 18 / 11 | 0.53 |
+| boxes + masks | 0.97 | 0.97 | 2 / 2 | 11 / 11 | 1.00 |
+| boxes only (`--no_masks`) | 0.64 | 0.67 | 1 / 2 | 16 / 11 | 0.53 |
 
-The twelfth ID is the provisional one the moved box holds for the three frames between being seen at its new place and its old spot being confirmed empty; it is then folded into the original identity (see [Identities across relocation](#identities-across-relocation-and-return)).
+With masks every object keeps one ID: the moved box's old spot is confirmed empty before it turns up at its new place, where re-identification restores its identity. An object seen elsewhere before its old spot is confirmed empty holds a provisional ID until then (see [Identities across relocation](#identities-across-relocation-and-return)).
 
 `evaluate.py` also runs the paper's segmentation benchmark (Sec. V-B): map instances are transferred onto annotated points by nearest neighbour and scored with class-level mIoU / f-mIoU / accuracy, with and without background classes (Table II), and instance-level AP25 / AP50 per class (Table III). The synthetic scene ships annotated surfaces (`gt_points.npz`), so this runs offline too; the mask run above scores:
 
@@ -112,7 +112,7 @@ Options: `--detector yoloe|offline|groundingdino`, `--data_dir <path>`, `--confi
 
 `evaluate.py --detector_rate_hz 1` detects at the paper's 1 Hz by frame stamps (the live node's scheduler) and maps the other frames from geometry alone; the default detects on every frame, which the synthetic scene needs because it packs its changes into 6 s.
 
-`evaluate.py --ablation` re-runs the sequence with each module of the Sec. V-E ablation switched off (`use_2d_tracker`, `use_semantic_fusion`, `use_geometric_consistency`) and prints the final-map precision / recall / F1 of each, as in Table V. On the synthetic scene only the geometric-consistency update changes the final map (precision 0.89 → 0.67, because removed objects are never retired): its labels never flicker and its motion is gentle enough for 3D association alone, so the tracker and fusion ablations need a real capture to separate.
+`evaluate.py --ablation` re-runs the sequence with each module of the Sec. V-E ablation switched off (`use_2d_tracker`, `use_semantic_fusion`, `use_geometric_consistency`) and prints the final-map precision / recall / F1 of each, as in Table V. On the synthetic scene only the geometric-consistency update changes the final map (precision 1.00 → 0.67, because removed objects are never retired): its labels never flicker and its motion is gentle enough for 3D association alone, so the tracker and fusion ablations need a real capture to separate.
 
 ### Check against the paper
 
@@ -139,16 +139,16 @@ The synthetic suite checks the following:
 
   | configuration | F1 |
   |---|---|
-  | All | 0.94 |
-  | W/o 2D Tracker | 0.58 |
-  | W/o Semantic Fusion | 0.72 |
+  | All | 1.00 |
+  | W/o 2D Tracker | 0.60 |
+  | W/o Semantic Fusion | 0.76 |
   | W/o Geometric Consistency Update | 0.80 |
 
-  The full system's final map on the stress scene matches the plain scene's (precision 0.89, recall 1.0): no flipped label or missing depth leaves a duplicate or a wrong label behind.
+  The full system's final map on the stress scene matches the plain scene's (precision and recall 1.0): no flipped label or missing depth leaves a duplicate or a wrong label behind, and every removed object is retired.
 
 - **Sec. V-H rates.** The 3 Hz mapping and 5 Hz scene-graph rates are floors.
 
-Each failed floor or claim fails the run, unless `config/paper_deviations.yaml` lists it with an explanation. One is listed today. The removed chair's change recall is 0.935 against the paper's 1.000: the log-odds filter of Eq. 8 needs four observations of the empty spot to retire a well-established object. That costs 3 of the 13 frames the synthetic scene sees the spot empty, a lag the paper's 10-minute run would hide.
+Each failed floor or claim fails the run, unless `config/paper_deviations.yaml` lists it with an explanation. One is listed today. The removed chair's change recall is 0.957 against the paper's 1.000: an undetected object is retired on the third frame in which the part of it the camera checks is seen through (`disappeared_seen_through_frames`, so a glitched frame or two cannot retire an object). That costs 2 of the 13 frames the synthetic scene sees the spot empty, a lag the paper's 10-minute run would hide.
 
 ## Run (live ROS2)
 
@@ -361,9 +361,9 @@ A LiDAR scan rasterized into the camera covers a few percent of the pixels, and 
 
 | depth | detection recall | change recall | identity kept | instance IDs / objects | final-map F1 |
 |---|---|---|---|---|---|
-| dense | 0.98 | 0.96 | 2 / 2 | 12 / 11 | 0.89 |
-| 5% sparse, no fill | 0.96 | 0.96 | 1 / 2 | 17 / 11 | 0.73 |
-| 5% sparse, `depth_fill_radius_px: 2` | 0.96 | 0.96 | 2 / 2 | 13 / 11 | 0.89 |
+| dense | 0.97 | 0.97 | 2 / 2 | 11 / 11 | 1.00 |
+| 5% sparse, no fill | 0.96 | 0.96 | 2 / 2 | 16 / 11 | 0.89 |
+| 5% sparse, `depth_fill_radius_px: 2` | 0.96 | 0.96 | 2 / 2 | 12 / 11 | 1.00 |
 
 Two defaults keep a mask's depth on the object when the depth comes from a LiDAR
 mounted apart from the camera ([analysis](doc/lidar-camera-range-2026-09-25.md)):
