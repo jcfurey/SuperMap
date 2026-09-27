@@ -25,6 +25,7 @@ def _populated_map() -> ObjectMap:
     chair.first_seen_stamp, chair.latest_stamp = 1.5, 9.25
     chair.geometry_stamp = 8.75
     chair.trajectory = [(1.5, np.array([0.5, 0.5, 0.5]), "tentative"), (2.0, np.array([0.6, 0.5, 0.5]), "active")]
+    chair.match_stamps = [1.5, 2.0, 9.25]
     plant = make_object(5, "plant", [2, 2, 0, 3, 3, 1], status=ObjectStatus.DISAPPEARED)  # no points at all
     object_map.objects = {3: chair, 5: plant}
     object_map._next_id = 11
@@ -52,6 +53,7 @@ def test_roundtrip_restores_every_field(tmp_path):
         assert (r.frames_since_seen, r.hits, r.points_contradicted) == (s.frames_since_seen, s.hits, s.points_contradicted)
         assert r.missed_detection_frames == s.missed_detection_frames
         assert r.geometry_stamp == s.geometry_stamp
+        assert r.match_stamps == s.match_stamps
         assert len(r.trajectory) == len(s.trajectory)
         for (rs, rc, rst), (ss, sc, sst) in zip(r.trajectory, s.trajectory):
             assert rs == ss and rst == sst and np.allclose(rc, sc)
