@@ -75,6 +75,15 @@ _MIN_CHECKED_POINTS = 5
 """Fewest points the depth must confirm or see through in a frame for that frame to count for or against
 an undetected instance being there (ObjectMap._count_seen_through)."""
 
+_MIN_VIEW_POINTS = 20
+"""Fewest points of the other instances in view the depth must check for the frame's agreement with the
+map to count (ObjectMap._view_agreement)."""
+
+_MIN_CONCLUSIVE_SHARE = 0.1
+"""Least share of an instance's points a seen-through frame must check to retire it at once
+(ObjectMap._count_seen_through). A sliver at the image border, whose pixels depth filling can cover with
+the background behind it, is not a view of the object."""
+
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
     """Deduplicate points onto a voxel grid, keeping the map's point budget bounded."""
@@ -402,12 +411,13 @@ class ObjectMap:
         depth_image: np.ndarray | None,
         detection: Detection2D | None = None,
         in_view: bool | None = None,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         """Run Eq. (7)-(9) over the instance's points and, when a detection is
         associated this frame, the per-point membership update; then prune
         points that either evidence has ruled out. Returns how many points
-        the depth confirmed (observable) and how many it saw through
-        (disappeared) this frame.
+        the depth confirmed (observable), how many it saw through
+        (disappeared), and how many project into the image where it has no
+        reading this frame.
 
         Instances whose box is entirely outside the view get no evidence from
         this frame (every point would be OUT_OF_VIEW), so their per-point
@@ -418,19 +428,20 @@ class ObjectMap:
         caller; ``None`` runs the per-instance test here.
         """
         if instance.points_world.shape[0] == 0 or depth_image is None or not self.geometric_consistency:
-            return 0, 0
+            return 0, 0, 0
         if in_view is False:
-            return 0, 0
+            return 0, 0, 0
         if in_view is None and self.cull_out_of_view \
                 and not self.may_be_in_view(instance.bbox3d, K, T_world_from_cam, depth_image.shape):
-            return 0, 0
+            return 0, 0, 0
         log_odds, states, pixels = gc.update_object_points(
             K, T_world_from_cam, depth_image, instance.points_world, instance.point_log_odds, self.tau_eps,
             contradiction_window_px=self.contradiction_window_px,
             classification=self._prepared_classification(instance, K, T_world_from_cam, depth_image),
         )
         observable = states == gc.GeometricState.OBSERVABLE
-        evidence = int(np.count_nonzero(observable)), int(np.count_nonzero(states == gc.GeometricState.DISAPPEARED))
+        evidence = (int(np.count_nonzero(observable)), int(np.count_nonzero(states == gc.GeometricState.DISAPPEARED)),
+                    int(np.count_nonzero((states == gc.GeometricState.OUT_OF_VIEW) & (pixels[:, 0] >= 0))))
         instance.point_log_odds = log_odds
         if detection is not None and self.semantic_fusion:
             inside = _inside_detection(pixels, detection, self.membership_margin_px)
@@ -471,6 +482,10 @@ class ObjectMap:
         self._prepared_evidence = (K, T_world_from_cam, depth_image, {
             instance.instance_id: (instance.points_world, states, pixels)
             for instance, (states, _delta_d, pixels) in zip(chosen, results)
+        }, {
+            instance.instance_id: (int(np.count_nonzero(states == gc.GeometricState.OBSERVABLE)),
+                                   int(np.count_nonzero(states == gc.GeometricState.DISAPPEARED)))
+            for instance, (states, _delta_d, _pixels) in zip(chosen, results)
         })
 
     def discard_prepared_evidence(self) -> None:
@@ -726,8 +741,9 @@ class ObjectMap:
         from that expiry.
         """
         instance.frames_since_seen += 1
-        confirmed, seen_through = self._apply_evidence(instance, K, T_world_from_cam, depth_image, in_view=in_view)
-        self._count_seen_through(instance, confirmed, seen_through)
+        confirmed, seen_through, unread = self._apply_evidence(instance, K, T_world_from_cam, depth_image,
+                                                               in_view=in_view)
+        self._count_seen_through(instance, confirmed, seen_through, unread, K, T_world_from_cam, depth_image)
         if depth_image is None or instance.points_world.shape[0] == 0 or not self.geometric_consistency:
             visible = in_view is not False
         else:
@@ -769,7 +785,8 @@ class ObjectMap:
         ):
             instance.status = ObjectStatus.OCCLUDED
 
-    def _count_seen_through(self, instance: ObjectInstance, confirmed: int, seen_through: int) -> None:
+    def _count_seen_through(self, instance: ObjectInstance, confirmed: int, seen_through: int, unread: int,
+                            K: np.ndarray, T_world_from_cam: np.ndarray, depth_image: np.ndarray | None) -> None:
         """Advance ``instance.seen_through_frames`` by this frame's verdict on the part of it the camera checked.
 
         The occupied fraction judges an object by all its points, and points
@@ -783,14 +800,58 @@ class ObjectMap:
         ``disappeared_occupied_fraction`` of them counts as seen through, one
         that confirms at least ``active_occupied_fraction`` resets the
         count, and anything else or a hidden view leaves it.
+
+        A seen-through frame is weighed by how the rest of the view agrees
+        with the map (:meth:`_view_agreement`). A pose or depth glitch
+        contradicts everything in view, a removal only the removed object:
+        when the other instances in view are seen through as well, the frame
+        does not count; when they are confirmed, the frame is conclusive and
+        retires the instance at once, provided the depth also read most of
+        the instance where it is in view (``unread`` of its points project
+        into the image where there is no reading) and checked at least
+        ``_MIN_CONCLUSIVE_SHARE`` of it. A dark or absorptive object returns
+        no depth, and only its outline, which rounds onto the background, is
+        then checked and seen through; a sliver at the image border is no
+        view of the object either. Otherwise, or with too little else in
+        view to tell, the frame counts once towards
+        ``disappeared_seen_through_frames``.
         """
         checked = confirmed + seen_through
         if checked < _MIN_CHECKED_POINTS:
             return
         if confirmed <= self.disappeared_occupied_fraction * checked:
+            agreement = self._view_agreement(instance, K, T_world_from_cam, depth_image)
+            if agreement is not None and agreement <= self.disappeared_occupied_fraction:
+                return  # the whole view disagrees with the map: a bad frame, not a removal
             instance.seen_through_frames += 1
+            conclusive = (agreement is not None and agreement >= self.active_occupied_fraction
+                          and checked >= self.active_occupied_fraction * (checked + unread)  # the depth read it
+                          and checked >= _MIN_CONCLUSIVE_SHARE * instance.points_world.shape[0])  # not a sliver
+            if conclusive:
+                instance.seen_through_frames = max(instance.seen_through_frames, self.disappeared_seen_through_frames)
         elif confirmed >= self.active_occupied_fraction * checked:
             instance.seen_through_frames = 0
+
+    def _view_agreement(self, instance: ObjectInstance, K: np.ndarray, T_world_from_cam: np.ndarray,
+                        depth_image: np.ndarray | None) -> float | None:
+        """Share of the checked points of the other instances in view that this frame confirms.
+
+        From the classification :meth:`prepare_evidence` computed for this
+        frame (the same ``K``, pose and depth image objects); None without
+        one, or with fewer than ``_MIN_VIEW_POINTS`` points checked
+        elsewhere in view.
+        """
+        prepared = self._prepared_evidence
+        if prepared is None or prepared[0] is not K or prepared[1] is not T_world_from_cam \
+                or prepared[2] is not depth_image:
+            return None
+        confirmed = seen_through = 0
+        for instance_id, (c, d) in prepared[4].items():
+            if instance_id != instance.instance_id:
+                confirmed, seen_through = confirmed + c, seen_through + d
+        if confirmed + seen_through < _MIN_VIEW_POINTS:
+            return None
+        return confirmed / (confirmed + seen_through)
 
     def confirm_tentative(self, instance: ObjectInstance, min_hits: int) -> None:
         """Promote a tentative track to active once it has enough corroborating hits."""

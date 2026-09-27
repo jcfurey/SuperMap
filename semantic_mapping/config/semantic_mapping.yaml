@@ -191,7 +191,10 @@
     max_occlusion_frames: 30
     disappeared_seen_through_frames: 3     # retire an undetected object after this many frames in which the part of
                                            # it the camera could check was seen through, however much of it stays
-                                           # hidden behind something; 0 = off (occupied fraction only)
+                                           # hidden behind something; at once on a clear view of its empty spot
+                                           # while the rest of the view confirms the map, never on a frame the
+                                           # rest of the view contradicts too (a pose or depth glitch); 0 = off
+                                           # (occupied fraction only)
     min_label_confidence: 0.4              # Eq. (10) instance-level confirmation threshold
     min_observations_for_confidence_check: 5
     min_hits_to_confirm: 2

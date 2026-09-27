@@ -148,7 +148,7 @@ The synthetic suite checks the following:
 
 - **Sec. V-H rates.** The 3 Hz mapping and 5 Hz scene-graph rates are floors.
 
-Each failed floor or claim fails the run, unless `config/paper_deviations.yaml` lists it with an explanation. One is listed today. The removed chair's change recall is 0.957 against the paper's 1.000: an undetected object is retired on the third frame in which the part of it the camera checks is seen through (`disappeared_seen_through_frames`, so a glitched frame or two cannot retire an object). That costs 2 of the 13 frames the synthetic scene sees the spot empty, a lag the paper's 10-minute run would hide.
+Each failed floor or claim fails the run, unless `config/paper_deviations.yaml` lists it with an explanation. None is listed today. The last one was the removed chair's change recall (0.957 against 1.000): retiring an object took three frames of its empty spot, to keep a glitched frame from retiring objects. A frame now counts by how the rest of the view agrees with the map: when the other objects in view are confirmed and the frame clearly shows the object's spot (not a sliver at the image border, nor a dark object that returns no depth), the removal is retired at once; when they are seen through too, as under a pose glitch, the frame does not count (`disappeared_seen_through_frames`).
 
 ## Run (live ROS2)
 

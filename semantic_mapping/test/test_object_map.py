@@ -466,12 +466,12 @@ def test_shift_stamps_moves_match_stamps_too():
     assert obj.match_stamps == [0.5, 1.5] and obj.first_seen_stamp == 0.5 and obj.latest_stamp == 1.5
 
 
-def _established_chair(seen_through_frames=3):
-    """A long-confirmed chair at 2 m covering pixels [60, 100) x [40, 80) of a 160x120 view."""
+def _established_chair(seen_through_frames=3, columns=(60, 100)):
+    """A long-confirmed chair at 2 m covering pixels [60, 100) x [40, 80) of a 160x120 view (other columns on request)."""
     m = ObjectMap(voxel_size=0.01, disappeared_seen_through_frames=seen_through_frames)
-    us, vs = np.meshgrid(np.arange(60, 100, 2), np.arange(40, 80, 2))
+    us, vs = np.meshgrid(np.arange(*columns, 2), np.arange(40, 80, 2))
     points = np.column_stack(((us.ravel() - 80) * 0.02, (vs.ravel() - 60) * 0.02, np.full(us.size, 2.0)))
-    obj = m.spawn(np.array([60.0, 40.0, 100.0, 80.0]), points, "chair", 0.9, stamp=0.0)
+    obj = m.spawn(np.array([columns[0], 40.0, columns[1], 80.0]), points, "chair", 0.9, stamp=0.0)
     obj.status, obj.point_log_odds = ObjectStatus.ACTIVE, np.full(len(obj.points_world), 8.0)
     return m, obj
 
@@ -526,3 +526,36 @@ def test_seen_through_frames_need_the_visible_part_empty_and_reset_on_a_confirma
     detection = Detection2D(bbox=np.array([60.0, 40.0, 100.0, 80.0]), label="chair", score=0.9)
     m.update_matched(obj, init_track(detection.bbox), np.zeros((0, 3)), detection, 0.1, K, np.eye(4), there)
     assert obj.seen_through_frames == 0
+
+
+def test_a_seen_through_frame_counts_by_how_the_rest_of_the_view_agrees_with_the_map():
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+
+    def with_table(table_depth, depth=None, columns=(60, 100)):
+        """The chair's view (the removed chair's by default) plus a table 3 m away at pixels [110, 150) x [40, 80)."""
+        m, chair = _established_chair(columns=columns)
+        us, vs = np.meshgrid(np.arange(110, 150, 2), np.arange(40, 80, 2))
+        table = m.spawn(np.array([110.0, 40.0, 150.0, 80.0]), np.column_stack(
+            ((us.ravel() - 80) * 0.03, (vs.ravel() - 60) * 0.03, np.full(us.size, 3.0))), "table", 0.9, stamp=0.0)
+        depth, pose = (_view(5.0) if depth is None else depth), np.eye(4)
+        depth[40:80, 110:150] = table_depth
+        m.prepare_evidence([chair, table], K, pose, depth)
+        m.update_unmatched(chair, K, pose, depth, in_view=True)
+        return m, chair
+
+    _m, chair = with_table(3.0)  # the table is where the map has it: the chair's empty spot is a removal
+    assert chair.status == ObjectStatus.DISAPPEARED
+    _m, chair = with_table(6.0)  # the table is seen through too: the frame disagrees with the whole map
+    assert chair.seen_through_frames == 0 and chair.status != ObjectStatus.DISAPPEARED
+    dark = np.full((120, 160), 8.0)  # a chair that returns no depth: only its outline column rounds onto the wall
+    dark[40:80, 61:100] = 0.0
+    _m, chair = with_table(3.0, dark)  # the depth never read the chair: one frame of three
+    assert chair.seen_through_frames == 1 and chair.status != ObjectStatus.DISAPPEARED
+    # A chair almost wholly past the image's right border: its one column in view sees the wall behind it.
+    _m, chair = with_table(3.0, np.full((120, 160), 8.0), columns=(158, 240))
+    assert chair.seen_through_frames == 1 and chair.status != ObjectStatus.DISAPPEARED
+    m, chair = _established_chair()  # nothing else in view to tell: one frame of three
+    depth, pose = _view(5.0), np.eye(4)
+    m.prepare_evidence([chair], K, pose, depth)
+    m.update_unmatched(chair, K, pose, depth, in_view=True)
+    assert chair.seen_through_frames == 1 and chair.status != ObjectStatus.DISAPPEARED
