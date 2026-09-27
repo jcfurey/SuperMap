@@ -165,6 +165,10 @@ class PipelineConfig:
     active_occupied_fraction: float = 0.6
     disappeared_occupied_fraction: float = 0.2
     max_occlusion_frames: int = 30
+    disappeared_seen_through_frames: int = 3
+    """Retire an undetected instance after this many frames in which the part
+    of it the depth could check was seen through, however much of it stayed
+    hidden (ObjectMap._count_seen_through). 0 disables."""
     min_label_confidence: float = 0.4
     min_observations_for_confidence_check: int = 5
     min_hits_to_confirm: int = 2
@@ -320,6 +324,7 @@ class PipelineConfig:
             if int(value) != value or value < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
         for name in ('tentative_max_age', 'max_occlusion_frames', 'disappeared_prune_grace_frames',
+                     'disappeared_seen_through_frames',
                      'contradiction_window_px', 'depth_fill_radius_px', 'ground_context_px'):
             value = getattr(self, name)
             if int(value) != value or value < 0:
@@ -380,6 +385,7 @@ class SemanticMappingPipeline:
             active_occupied_fraction=self.config.active_occupied_fraction,
             disappeared_occupied_fraction=self.config.disappeared_occupied_fraction,
             max_occlusion_frames=self.config.max_occlusion_frames,
+            disappeared_seen_through_frames=self.config.disappeared_seen_through_frames,
             min_label_confidence=self.config.min_label_confidence,
             min_observations_for_confidence_check=self.config.min_observations_for_confidence_check,
             tentative_max_age=self.config.tentative_max_age,

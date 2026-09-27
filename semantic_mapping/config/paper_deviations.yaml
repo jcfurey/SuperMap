@@ -6,11 +6,14 @@
 # harness report (--json).
 
 table4.chair.change: >-
-  The removed chair is still asserted for 3 frames after its removal: map points
-  confirmed over many frames sit at the log-odds clamp (+8), and each frame that
-  sees the empty spot subtracts logit(0.9) = 2.2 (Eq. 8), so the fourth such
-  frame is the first to retire it. The paper-literal Eq. 9 settings
+  The removed chair is still asserted for 2 frames after its removal. An
+  undetected object is retired on the third frame in which the part of it the
+  camera checks is seen through (disappeared_seen_through_frames: one or two
+  glitched frames must not retire an object); per point it would take a
+  fourth, since map points confirmed over many frames sit at the log-odds
+  clamp (+8) and each frame that sees the empty spot subtracts
+  logit(0.9) = 2.2 (Eq. 8). The paper-literal Eq. 9 settings
   (contradiction_window_px 0, prune_min_contradictions 1) give the same lag.
   The synthetic scene sees the spot empty in only 13 frames, so the lag costs
-  3/13 of change recall (0.935); over the paper's 10-minute run it would barely
-  register, and the paper reports 1.000.
+  2 of them (change recall 0.957); over the paper's 10-minute run it would
+  barely register, and the paper reports 1.000.

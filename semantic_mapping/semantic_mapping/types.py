@@ -186,6 +186,10 @@ class ObjectInstance:
     """Log-odds that this instance is a real object (ObjectMap existence_*): raised
     by score-weighted detections, lowered by frames in which the detector could
     have seen it and did not. Only maintained when existence_hit_gain > 0."""
+    seen_through_frames: int = 0
+    """Frames since the last detection in which the part of this instance the
+    depth could check was seen through (ObjectMap._count_seen_through); reset
+    by a detection or a frame that confirms the part it sees."""
     match_stamps: list[float] = field(default_factory=list)
     """Stamps of the most recent frames whose detection was fused into this
     instance (object_map.MATCH_HISTORY of them): two co-located instances that

@@ -464,3 +464,65 @@ def test_shift_stamps_moves_match_stamps_too():
     obj = _co_located(m, "chair", [1.0, 2.0])
     m.shift_stamps(-0.5)
     assert obj.match_stamps == [0.5, 1.5] and obj.first_seen_stamp == 0.5 and obj.latest_stamp == 1.5
+
+
+def _established_chair(seen_through_frames=3):
+    """A long-confirmed chair at 2 m covering pixels [60, 100) x [40, 80) of a 160x120 view."""
+    m = ObjectMap(voxel_size=0.01, disappeared_seen_through_frames=seen_through_frames)
+    us, vs = np.meshgrid(np.arange(60, 100, 2), np.arange(40, 80, 2))
+    points = np.column_stack(((us.ravel() - 80) * 0.02, (vs.ravel() - 60) * 0.02, np.full(us.size, 2.0)))
+    obj = m.spawn(np.array([60.0, 40.0, 100.0, 80.0]), points, "chair", 0.9, stamp=0.0)
+    obj.status, obj.point_log_odds = ObjectStatus.ACTIVE, np.full(len(obj.points_world), 8.0)
+    return m, obj
+
+
+def _view(left_quarter):
+    """The chair's left quarter at the given depth (None: hidden too), the rest behind something 1 m away."""
+    depth = np.full((120, 160), 8.0)
+    depth[40:80, 60:100] = 1.0
+    if left_quarter is not None:
+        depth[40:80, 60:70] = left_quarter
+    return depth
+
+
+def test_an_undetected_object_whose_visible_part_is_seen_through_is_retired_however_much_is_hidden():
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    gone = _view(5.0)  # the visible quarter shows the wall behind where the chair was
+    m, obj = _established_chair()
+    for frame in range(3):
+        m.update_unmatched(obj, K, np.eye(4), gone, in_view=True)
+        assert obj.seen_through_frames == frame + 1
+        assert obj.status == (ObjectStatus.DISAPPEARED if frame == 2 else ObjectStatus.ACTIVE)
+    assert np.mean(obj.point_log_odds >= 0) > 0.6  # the hidden three quarters still look occupied
+
+    m, obj = _established_chair(seen_through_frames=0)  # the occupied fraction alone keeps it
+    for _ in range(5):
+        m.update_unmatched(obj, K, np.eye(4), gone, in_view=True)
+    assert obj.status != ObjectStatus.DISAPPEARED
+
+
+def test_seen_through_frames_need_the_visible_part_empty_and_reset_on_a_confirmation_or_detection():
+    from semantic_mapping.tracking import init_track
+    from semantic_mapping.types import Detection2D
+
+    K = np.array([[100.0, 0.0, 80.0], [0.0, 100.0, 60.0], [0.0, 0.0, 1.0]])
+    gone, there, hidden = _view(5.0), _view(2.0), _view(None)
+
+    def run(views):
+        m, obj = _established_chair()
+        for view in views:
+            m.update_unmatched(obj, K, np.eye(4), view, in_view=True)
+        return obj
+
+    assert run([there] * 5).status == ObjectStatus.ACTIVE      # present, partly hidden: never votes itself away
+    assert run([hidden] * 5).seen_through_frames == 0          # nothing checked, nothing counted
+    obj = run([gone, hidden, gone, gone])                      # hidden frames neither count nor reset
+    assert obj.seen_through_frames == 3 and obj.status == ObjectStatus.DISAPPEARED
+    obj = run([gone, gone, there, gone, gone])                 # a confirmed view starts the count over
+    assert obj.seen_through_frames == 2 and obj.status != ObjectStatus.DISAPPEARED
+
+    m, obj = _established_chair()
+    m.update_unmatched(obj, K, np.eye(4), gone, in_view=True)
+    detection = Detection2D(bbox=np.array([60.0, 40.0, 100.0, 80.0]), label="chair", score=0.9)
+    m.update_matched(obj, init_track(detection.bbox), np.zeros((0, 3)), detection, 0.1, K, np.eye(4), there)
+    assert obj.seen_through_frames == 0

@@ -121,6 +121,14 @@ tests for each item are in `test/test_paper_review_2026_09_25.py`.
   - The 3×3 contradiction window and the two-contradiction prune threshold guard against review item C3: single glitched frames deleting points, and erosion at silhouettes.
   - On the synthetic scene the paper-literal settings (`contradiction_window_px: 0`, `prune_min_contradictions: 1`) give identical metrics. That scene has perfect poses and depth, so it cannot show the failure the guards address.
   - Deciding this needs a real recording with ground truth.
+- **D9 refined: a removed object seen only in part is retired.**
+  - The occupied fraction judges an object by all its points. Points hidden since its last detection keep their old confirmations (+8 at the clamp), so a removed object whose spot the camera sees only past something in front of it never drops to 20% occupied. The synthetic change scene's trash can stayed OCCLUDED to the end that way: the table hid most of its spot, and in the last five frames all of the 9 to 110 points the camera could check were seen through, none confirmed.
+  - The part the depth checks now speaks for the whole object (`ObjectMap._count_seen_through`). A frame with at least 5 checked points counts as seen through when at most `disappeared_occupied_fraction` of them are confirmed, and a frame confirming at least `active_occupied_fraction` resets the count. After `disappeared_seen_through_frames` (3) such frames without a detection, the object is retired, however much of it stayed hidden. A present object always shows confirmed points where it can be seen, so it never votes itself away.
+  - Effects on the synthetic scenes:
+    - The trash can is retired (DISAPPEARED) at frame 57.
+    - The chair's retirement lag drops from 3 frames to 2 (change recall 0.935 to 0.957), with the per-point filter unchanged; `config/paper_deviations.yaml` is updated.
+    - The moved box's old spot is confirmed empty before it reappears, so it keeps its ID without a provisional one: 11 IDs for 11 objects.
+    - Final-map F1 is 1.000 on the change scene and on the stress scene (was 0.941). Sparse LiDAR without fill keeps both identities (was 1 of 2) with F1 0.889 (was 0.727).
 - **Test fix for ac159e9.** The dense-launch test compared only top-level YAML keys with declared parameters. It now flattens nested keys such as `platform_mask.enabled`, as ROS does.
 - **D21 fixed**, in two parts:
   - **Descriptor.** The colour histogram now bins neutral pixels by intensity (3 soft, log-spaced bins) instead of putting them all at one chromaticity. A pixel is neutral when its channel spread is below 15% of its brightest channel, or below 16 levels, so dark sensor noise stays neutral.
