@@ -218,3 +218,36 @@ def test_runtime_tunable_grounding_parameters(node_factory):
     assert node.set_parameters([Parameter("vlm.local_radius_m", value=3.0)])[0].successful
     assert node.grounder.local_radius_m == 3.0
     assert not node.set_parameters([Parameter("world_frame", value="odom")])[0].successful  # read-only
+
+
+def test_action_aborts_on_deactivation_before_model_returns(action_setup):
+    node, client_node, client = action_setup()
+    started, release = threading.Event(), threading.Event()
+    inner = node.grounder.client
+    sent = []
+    node._nav2_send_goal = True
+    node._send_nav2_goal = sent.append
+
+    def complete(prompt):
+        started.set()
+        assert release.wait(10.)
+        return inner.complete(prompt)
+
+    node.grounder.client = SimpleNamespace(complete=complete)
+    try:
+        with BackgroundExecutor(node, client_node):
+            assert client.wait_for_server(timeout_sec=5.)
+            handle = _send(client, 'go to the sofa')
+            assert started.wait(2.)
+            node.trigger_deactivate()
+            response = _result(handle, timeout=2.)
+            assert response.status == GoalStatus.STATUS_ABORTED and not response.result.success
+            assert not response.result.goals
+            node.trigger_activate()
+            release.set()
+            wait_for(lambda: node._grounding_outstanding == 0)
+            assert not sent
+    finally:
+        release.set()
+        client.destroy()
+        client_node.destroy_node()

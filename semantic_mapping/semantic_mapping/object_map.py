@@ -874,6 +874,10 @@ class ObjectMap:
 
     # ---------------------------------------------------------------- merging
     def _merge_into(self, keep: ObjectInstance, drop: ObjectInstance) -> None:
+        # Duplicate detections from one frame are one observation, including
+        # when their combined geometry is tested for confirmation below.
+        shared_hits = len(set(keep.match_stamps) & set(drop.match_stamps))
+        total_hits = max(keep.hits, drop.hits, keep.hits + drop.hits - shared_hits)
         if keep.label in self.dynamic_geometry_labels and drop.label in self.dynamic_geometry_labels:
             # Preserve the oldest ID without reviving an older body position.
             newest = max((keep, drop), key=lambda o: (o.geometry_stamp if o.geometry_stamp is not None else -np.inf,
@@ -899,13 +903,12 @@ class ObjectMap:
                 np.maximum.at(best, cells, support)
                 keep.point_support = best[cells]
             idx = self._cap_indices(keep, voxel_downsample_indices(keep.points_world, self.voxel_size))
-            keep.hits += drop.hits  # the merged box is judged by the merged hit count
+            previous_hits, keep.hits = keep.hits, total_hits
             self._subset_points(keep, idx)
-            keep.hits -= drop.hits
+            keep.hits = previous_hits
             stamps = [o.geometry_stamp for o in (keep, drop) if o.geometry_stamp is not None]
             keep.geometry_stamp = max(stamps, default=None)
 
-        total_hits = keep.hits + drop.hits
         merged_belief: dict[str, float] = {}
         for belief, weight in ((keep.label_belief, keep.hits), (drop.label_belief, drop.hits)):
             for label, prob in belief.items():
@@ -946,7 +949,7 @@ class ObjectMap:
         instances merge when either
         - their labels are compatible and their boxes overlap by more than
           ``iou_threshold`` IoU or their centres lie within
-          ``distance_threshold``; or
+          ``distance_threshold`` without having been detected together; or
         - they take turns being detected: at least ``alternating_min_overlap``
           of the smaller box lies inside the other, both were matched since
           the younger appeared, over at least ``alternating_min_frames`` frames
@@ -997,7 +1000,8 @@ class ObjectMap:
                     continue
                 duplicate = beliefs_compatible(keep.label_belief, drop.label_belief, self.label_min_mass) and (
                     iou_3d(keep.bbox3d, drop.bbox3d) > iou_threshold
-                    or float(np.linalg.norm(keep.center - drop.center)) < distance_threshold)
+                    or (float(np.linalg.norm(keep.center - drop.center)) < distance_threshold
+                        and not (set(keep.match_stamps) & set(drop.match_stamps))))
                 alternating = not duplicate and alternating_min_overlap > 0 \
                     and _take_turns(keep, drop, alternating_min_frames) \
                     and overlap_3d(keep.bbox3d, drop.bbox3d, self.voxel_size / 2.0) >= alternating_min_overlap

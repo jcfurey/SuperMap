@@ -41,6 +41,22 @@ def test_static_object_becomes_and_stays_active():
     assert record["status"] == "active"
 
 
+def test_adjacent_cups_detected_together_keep_separate_identities():
+    pipeline = SemanticMappingPipeline()
+    for stamp in (1., 2.):
+        observation = _observation(stamp, 2., False)
+        for x in (70, 80):
+            mask = np.zeros((120, 160), dtype=bool)
+            mask[50:55, x:x + 5] = True
+            observation.detections.append(Detection2D(np.array([x, 50, x + 5, 55]), 'cup', .9, mask))
+        result = pipeline.process_frame(observation)
+        assert result.detection_instance_ids == [1, 2]
+        assert len(result.objects) == 2
+        assert [obj.hits for obj in result.objects] == [int(stamp)] * 2
+        expected = ObjectStatus.TENTATIVE if stamp == 1. else ObjectStatus.ACTIVE
+        assert all(obj.status == expected for obj in result.objects)
+
+
 def test_geometry_only_frames_do_not_expire_a_tentative_object_between_detections():
     pipeline = SemanticMappingPipeline()
     for i in range(16):

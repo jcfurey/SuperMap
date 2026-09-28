@@ -80,12 +80,13 @@ def _temporal_ground_truth(dataset):
     return evaluation.load_ground_truth(path)[1] if path.exists() else None
 
 
-def run_ablation(dataset, detector, prompts, params: dict, ground_truth, full_run=None) -> dict:
+def run_ablation(dataset, detector, prompts, params: dict, ground_truth, full_run=None,
+                 detector_rate_hz: float = 0.0) -> dict:
     """Table V: final-map precision / recall / F1 of each configuration on one sequence."""
     rows = {}
     for name, overrides in harness.TABLE5_OVERRIDES.items():
         run = full_run if (not overrides and full_run is not None) else harness.run_sequence(
-            dataset, detector, prompts, {**params, **overrides}, ground_truth)
+            dataset, detector, prompts, {**params, **overrides}, ground_truth, detector_rate_hz=detector_rate_hz)
         rows[name] = harness.ablation_row(run)
     return rows
 
@@ -124,7 +125,8 @@ def capture_suite(reference: dict, params: dict, prompts, args) -> list[harness.
                                    tolerance=args.tolerance)
     checks += harness.identity_checks(run.evaluator, reference, label)
     checks += harness.runtime_checks(run.timings_ms, reference, label)
-    rows = run_ablation(dataset, detector, prompts, params, ground_truth, full_run=run)
+    rows = run_ablation(dataset, detector, prompts, params, ground_truth, full_run=run,
+                        detector_rate_hz=args.detector_rate_hz)
     checks += harness.table5_checks([rows], reference, label, reproduction=args.paper_capture,
                                     tolerance=args.tolerance)
     return checks

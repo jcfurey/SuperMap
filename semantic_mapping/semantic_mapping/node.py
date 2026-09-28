@@ -34,6 +34,7 @@ the VLM run in worker threads that never touch the pipeline.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import queue
@@ -313,6 +314,7 @@ class _GroundingJob:
     obstacles: dict[int, np.ndarray]
     robot_xy: np.ndarray | None
     goal_z: float
+    epoch: int
     feedback: object = None
     """Callable(stage) publishing action feedback, or None for topic queries."""
     on_done: object = None
@@ -356,6 +358,8 @@ class SemanticMappingNode(AutostartLifecycleNode):
         self._slot_lock = threading.Lock()
         self._configured = False
         self._active = False
+        self._detector_thread = self._grounding_thread = None
+        self._grounding_epoch = 0
         self._updater = None
         self._declare_parameters()
         self.add_on_set_parameters_callback(self._on_set_parameters)
@@ -535,6 +539,12 @@ class SemanticMappingNode(AutostartLifecycleNode):
 
     # ------------------------------------------------------------- lifecycle
     def on_configure(self, state) -> TransitionCallbackReturn:
+        # A model call cannot be forcibly interrupted. Keep its worker owned
+        # after cleanup and wait for it to exit before replacing models or I/O.
+        if any(worker is not None and worker.is_alive()
+               for worker in (self._detector_thread, self._grounding_thread)):
+            self.get_logger().error("previous inference workers are still stopping; retry configure when they exit")
+            return TransitionCallbackReturn.FAILURE
         try:
             self._configure()
         except Exception as exc:  # noqa: BLE001 - report and stay unconfigured
@@ -555,6 +565,8 @@ class SemanticMappingNode(AutostartLifecycleNode):
     def on_deactivate(self, state) -> TransitionCallbackReturn:
         with self._lock:
             self._active = False
+            self._grounding_epoch += 1
+            self._reset_input_state()
         return super().on_deactivate(state)
 
     def on_cleanup(self, state) -> TransitionCallbackReturn:
@@ -640,6 +652,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
         )
         self._grounding_jobs: queue.Queue[_GroundingJob | None] = queue.Queue()
         self._grounding_outstanding = 0
+        self._accepted_groundings: dict[int, tuple[int, object]] = {}
         self._query_counter = 0
 
         self._stats = self._empty_stats()
@@ -684,8 +697,11 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 post_callback=self._on_time_jump)
         self._setup_diagnostics()
 
-        self._detector_thread = threading.Thread(target=self._detector_loop, name="detector", daemon=True)
-        self._grounding_thread = threading.Thread(target=self._grounding_loop, name="grounding", daemon=True)
+        self._detector_thread = threading.Thread(
+            target=self._detector_loop, args=(self._stop_event, self._detection_jobs, self._detection_results),
+            name="detector", daemon=True)
+        self._grounding_thread = threading.Thread(
+            target=self._grounding_loop, args=(self._stop_event, self._grounding_jobs), name="grounding", daemon=True)
         self._detector_thread.start()
         self._grounding_thread.start()
         self._configured = True
@@ -702,6 +718,7 @@ class SemanticMappingNode(AutostartLifecycleNode):
         with self._lock:
             self._active = False
             self._configured = False
+            self._grounding_epoch += 1
         self._stop_event.set()
         if hasattr(self, "_grounding_jobs"):
             self._grounding_jobs.put(None)  # wake the grounding worker
@@ -710,7 +727,6 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 worker.join(timeout=2.0)
                 if worker.is_alive():
                     self.get_logger().warning(f"{worker.name} thread still busy at shutdown; it exits when done")
-        self._detector_thread = self._grounding_thread = None
         with self._guard_lock:
             if self._detection_ready is not None:
                 self.destroy_guard_condition(self._detection_ready)
@@ -1133,11 +1149,16 @@ class SemanticMappingNode(AutostartLifecycleNode):
             labels = {o.instance_id: o.label for o in result.objects}
             obstacles = {o.instance_id: bboxes[o.instance_id] for o in result.objects
                          if o.status != ObjectStatus.DISAPPEARED}
+            epoch = self._grounding_epoch
+            # All objects remain obstacles, but only the serialized candidates
+            # can be navigation targets.
+            bboxes = {i: b for i, b in bboxes.items() if i in request.centers_by_id}
+            labels = {i: labels[i] for i in bboxes}
         goal_z = float(robot[2]) if robot is not None and self._goal_use_robot_z else self._goal_z_m
         return _GroundingJob(request_id=request_id, instruction=instruction, request=request, bboxes=bboxes,
                              labels=labels, obstacles=obstacles,
                              robot_xy=None if robot is None else np.asarray(robot[:2], dtype=np.float64),
-                             goal_z=goal_z, feedback=feedback, on_done=on_done)
+                             goal_z=goal_z, epoch=epoch, feedback=feedback, on_done=on_done)
 
     def _on_query(self, msg: String) -> None:
         """Legacy interface: instruction (plain text, or JSON with ``instruction`` and
@@ -1153,25 +1174,30 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 pass
         if not text:
             return
-        with self._slot_lock:
-            self._query_counter += 1
-            request_id = str(request_id) if request_id is not None else f"query-{self._query_counter}"
-        if not self._reserve_grounding_slot():
-            self._publish_answer_error(text, request_id, "grounding queue is full; retry later")
-            return
-        try:
-            job = self._prepare_grounding(text, request_id, on_done=self._publish_topic_answer)
-        except _GroundingUnavailable as exc:
-            self._release_grounding_slot()
-            self.get_logger().warning(f"query '{text}' ignored: {exc}")
-            self._publish_answer_error(text, request_id, str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001
-            self._release_grounding_slot()
-            self._count_failure("grounding", exc)
-            self._publish_answer_error(text, request_id, f"{type(exc).__name__}: {exc}")
-            return
-        self._grounding_jobs.put(job)
+        # Reservation, snapshot and queue insertion belong to one lifecycle
+        # epoch; cleanup must not replace their counters, queues or publishers.
+        with self._lock:
+            if not self._configured:
+                return
+            with self._slot_lock:
+                self._query_counter += 1
+                request_id = str(request_id) if request_id is not None else f"query-{self._query_counter}"
+            if not self._reserve_grounding_slot():
+                self._publish_answer_error(text, request_id, "grounding queue is full; retry later")
+                return
+            try:
+                job = self._prepare_grounding(text, request_id, on_done=self._publish_topic_answer)
+            except _GroundingUnavailable as exc:
+                self._release_grounding_slot()
+                self.get_logger().warning(f"query '{text}' ignored: {exc}")
+                self._publish_answer_error(text, request_id, str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._release_grounding_slot()
+                self._count_failure("grounding", exc)
+                self._publish_answer_error(text, request_id, f"{type(exc).__name__}: {exc}")
+                return
+            self._grounding_jobs.put(job)
 
     def _publish_answer_error(self, instruction: str, request_id: str, error: str) -> None:
         self.answer_pub.publish(String(data=json.dumps({
@@ -1187,37 +1213,48 @@ class SemanticMappingNode(AutostartLifecycleNode):
         payload["goals"] = [list(goal) for goal in outcome.goals]
         self.answer_pub.publish(String(data=json.dumps(payload)))
 
-    def _grounding_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _grounding_current(self, job: _GroundingJob) -> bool:
+        """Caller holds the lifecycle lock through any resulting output."""
+        return self._active and self._configured and job.epoch == self._grounding_epoch and not job.cancelled
+
+    def _grounding_loop(self, stop_event: threading.Event, jobs: queue.Queue) -> None:
+        while not stop_event.is_set():
             try:
-                job = self._grounding_jobs.get(timeout=0.5)
+                job = jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
             if job is None:
                 return
             try:
-                if job.cancelled:
-                    continue
-                self._send_feedback(job, "querying")
-                result = self.grounder.complete(job.request)
-                if self._stop_event.is_set():
-                    return
-                self._send_feedback(job, "parsing")
-                job.outcome = self._finish_grounding(job, result)
+                with self._lock:
+                    if not self._grounding_current(job):
+                        job.outcome = _GroundingOutcome(False, "grounding invalidated by lifecycle transition")
+                        continue
+                    grounder = self.grounder
+                    self._send_feedback(job, "querying")
+                result = grounder.complete(job.request)
+                with self._lock:
+                    if stop_event.is_set() or not self._grounding_current(job):
+                        job.outcome = _GroundingOutcome(False, "grounding invalidated by lifecycle transition")
+                        continue
+                    self._send_feedback(job, "parsing")
+                    job.outcome = self._finish_grounding(job, result)
             except Exception as exc:  # noqa: BLE001 - a VLM failure must not kill the worker
-                job.outcome = _GroundingOutcome(False, f"grounding failed: {type(exc).__name__}: {exc}")
-                self._count_failure("grounding", exc)
+                with self._lock:
+                    job.outcome = _GroundingOutcome(False, f"grounding failed: {type(exc).__name__}: {exc}")
+                    if not stop_event.is_set() and self._grounding_current(job):
+                        self._count_failure("grounding", exc)
             finally:
+                with self._lock:
+                    if not stop_event.is_set() and self._grounding_current(job) and job.outcome is not None:
+                        try:
+                            if job.on_done is not None:
+                                job.on_done(job)
+                            self._publish_goals(job.outcome)
+                        except Exception as exc:  # noqa: BLE001
+                            self._count_failure("grounding output", exc)
                 self._release_grounding_slot()
                 job.done.set()
-            if job.cancelled or job.outcome is None:
-                continue
-            try:
-                if job.on_done is not None:
-                    job.on_done(job)
-                self._publish_goals(job.outcome)
-            except Exception as exc:  # noqa: BLE001
-                self._count_failure("grounding output", exc)
 
     @staticmethod
     def _send_feedback(job: _GroundingJob, stage: str) -> None:
@@ -1232,8 +1269,10 @@ class SemanticMappingNode(AutostartLifecycleNode):
             self.get_logger().warning(f"grounding '{job.instruction}': {result.error}")
         else:
             self.get_logger().info(f"grounding '{job.instruction}' -> instances {result.target_ids}")
-        goals, labels = [], []
-        for target in result.target_ids:
+        goals, labels, targets = [], [], []
+        for target in result.target_ids if result.ok else []:
+            if target not in job.request.centers_by_id or target in result.unresolved_ids:
+                continue
             bbox = job.bboxes.get(target)
             if bbox is None:
                 continue
@@ -1241,10 +1280,11 @@ class SemanticMappingNode(AutostartLifecycleNode):
             x, y, yaw = approach_pose(bbox, job.robot_xy, self._goal_standoff_m, others, self._goal_clearance_m)
             goals.append((x, y, job.goal_z, yaw))
             labels.append(job.labels.get(target, ""))
+            targets.append(target)
         ok = result.error is None and bool(goals)
         message = result.error or ("" if goals else "no answered instance is in the map")
         return _GroundingOutcome(ok, message or f"{len(goals)} goals",
-                                 target_ids=[i for i in result.target_ids if i in job.bboxes],
+                                 target_ids=targets,
                                  target_labels=labels, unresolved_ids=list(result.unresolved_ids),
                                  goals=goals, response=result.response, result=result)
 
@@ -1260,13 +1300,16 @@ class SemanticMappingNode(AutostartLifecycleNode):
         return poses
 
     def _publish_goals(self, outcome: _GroundingOutcome) -> None:
-        poses = self._goal_poses(outcome)
-        if not poses:
-            return
-        self.waypoints_pub.publish(Path(header=poses[0].header, poses=poses))
-        self.goal_pub.publish(poses[0])
-        if self._nav2_send_goal:
-            self._send_nav2_goal(poses[0])
+        with self._lock:
+            if not self._active or not outcome.success:
+                return
+            poses = self._goal_poses(outcome)
+            if not poses:
+                return
+            self.waypoints_pub.publish(Path(header=poses[0].header, poses=poses))
+            self.goal_pub.publish(poses[0])
+            if self._nav2_send_goal:
+                self._send_nav2_goal(poses[0])
 
     def _send_nav2_goal(self, pose: PoseStamped) -> None:
         """Forward an approach pose to Nav2. nav2_msgs is imported lazily, so the
@@ -1290,12 +1333,17 @@ class SemanticMappingNode(AutostartLifecycleNode):
 
     # ------------------------------------------------------ grounding action
     def _on_ground_goal(self, goal_request) -> GoalResponse:
-        if not self._active or not goal_request.instruction.strip():
-            return GoalResponse.REJECT
-        if not self._reserve_grounding_slot():
-            self.get_logger().warning("grounding queue full; goal rejected", throttle_duration_sec=5.0)
-            return GoalResponse.REJECT
-        return GoalResponse.ACCEPT
+        with self._lock:
+            if not self._active or not goal_request.instruction.strip():
+                return GoalResponse.REJECT
+            if not self._reserve_grounding_slot():
+                self.get_logger().warning("grounding queue full; goal rejected", throttle_duration_sec=5.0)
+                return GoalResponse.REJECT
+            # rclpy gives the same request to the goal callback and goal
+            # handle. Retain it until execution so acceptance cannot cross
+            # deactivation/reactivation (or a whole new configuration).
+            self._accepted_groundings[id(goal_request)] = (self._grounding_epoch, goal_request)
+            return GoalResponse.ACCEPT
 
     def _execute_ground_instruction(self, goal_handle):
         goal = goal_handle.request
@@ -1304,32 +1352,42 @@ class SemanticMappingNode(AutostartLifecycleNode):
         def feedback(stage: str) -> None:
             goal_handle.publish_feedback(GroundInstruction.Feedback(stage=stage))
 
-        job = None
-        try:
-            feedback("serializing")
-            job = self._prepare_grounding(goal.instruction.strip(), uuid.UUID(bytes=bytes(goal_handle.goal_id.uuid)).hex,
-                                          local_radius_m=goal.local_radius_m, feedback=feedback)
-        except Exception as exc:  # noqa: BLE001 - _GroundingUnavailable or a serialization error
-            self._release_grounding_slot()
-            if not isinstance(exc, _GroundingUnavailable):
-                self._count_failure("grounding", exc)
-            result.success, result.message = False, str(exc)
-            goal_handle.abort()
-            return result
-        self._grounding_jobs.put(job)
-        feedback("queued")
+        with self._lock:
+            accepted = self._accepted_groundings.pop(id(goal), None)
+            if accepted is None or not self._active or accepted[0] != self._grounding_epoch:
+                if accepted is not None:
+                    self._release_grounding_slot()
+                result.message = "grounding invalidated by lifecycle transition"
+                goal_handle.abort()
+                return result
+            try:
+                feedback("serializing")
+                job = self._prepare_grounding(goal.instruction.strip(), uuid.UUID(bytes=bytes(goal_handle.goal_id.uuid)).hex,
+                                              local_radius_m=goal.local_radius_m, feedback=feedback)
+            except Exception as exc:  # noqa: BLE001 - _GroundingUnavailable or a serialization error
+                self._release_grounding_slot()
+                if not isinstance(exc, _GroundingUnavailable):
+                    self._count_failure("grounding", exc)
+                result.success, result.message = False, str(exc)
+                goal_handle.abort()
+                return result
+            self._grounding_jobs.put(job)
+            feedback("queued")
         while not job.done.wait(0.05):
             if goal_handle.is_cancel_requested:
                 job.cancelled = True  # a running model call finishes in the background and is discarded
                 goal_handle.canceled()
                 result.message = "canceled"
                 return result
-            if self._stop_event.is_set():
-                job.cancelled = True
-                goal_handle.abort()
-                result.message = "node shutting down"
-                return result
-        outcome = job.outcome or _GroundingOutcome(False, "grounding did not complete")
+            with self._lock:
+                if not self._grounding_current(job):
+                    job.cancelled = True
+                    goal_handle.abort()
+                    result.message = "grounding invalidated by lifecycle transition"
+                    return result
+        with self._lock:
+            outcome = (job.outcome or _GroundingOutcome(False, "grounding did not complete")) \
+                if self._grounding_current(job) else _GroundingOutcome(False, "grounding invalidated by lifecycle transition")
         poses = self._goal_poses(outcome)
         result.success, result.message = outcome.success, outcome.message
         result.target_ids = [int(i) for i in outcome.target_ids if int(i) >= 0]
@@ -1512,12 +1570,14 @@ class SemanticMappingNode(AutostartLifecycleNode):
             self._last_detector_stamp = _advance_schedule(
                 self._last_detector_stamp, stamp, self._detector_period_sec)
 
-    def _detector_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _detector_loop(self, stop_event: threading.Event, jobs: queue.Queue, results: queue.Queue) -> None:
+        while not stop_event.is_set():
             try:
-                observation, platform_mask = self._detection_jobs.get(timeout=0.5)
+                observation, platform_mask = jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if stop_event.is_set():
+                return
             evaluated = True
             started_at = time.monotonic()
             try:
@@ -1533,22 +1593,22 @@ class SemanticMappingNode(AutostartLifecycleNode):
                     with self._stats_lock:
                         self._counters["platform_detections"] += dropped
             except Exception as exc:  # noqa: BLE001 - a detector failure must not kill the mapping loop
-                if self._stop_event.is_set():
+                if stop_event.is_set():
                     return
                 self._count_failure("detector", exc)
                 detections = []
                 evaluated = False
-            if self._stop_event.is_set():
+            if stop_event.is_set():
                 return
             with self._stats_lock:
                 self._stats["detections"] += 1
                 self._stats["detector_seconds"] += time.monotonic() - started_at
             self._tick("detector")
-            self._detection_results.put((observation.frame_id, detections, time.monotonic(), evaluated))
+            results.put((observation.frame_id, detections, time.monotonic(), evaluated))
             # The guard condition is destroyed under the same lock during
             # teardown, so it is never triggered after destruction (C38).
             with self._guard_lock:
-                if self._detection_ready is not None and not self._stop_event.is_set():
+                if self._detection_ready is not None and not stop_event.is_set():
                     self._detection_ready.trigger()
 
     def _drain_detection_results(self) -> None:
@@ -1557,8 +1617,9 @@ class SemanticMappingNode(AutostartLifecycleNode):
                 return
             try:
                 self._drain_detection_results_locked()
-                self._admit_waiting_frames()
-                self._flush_pending_frames()
+                if self._active:
+                    self._admit_waiting_frames()
+                    self._flush_pending_frames()
             except Exception as exc:  # noqa: BLE001
                 self._count_failure("result drain", exc)
 
@@ -1726,7 +1787,8 @@ class SemanticMappingNode(AutostartLifecycleNode):
                    if self._include_history or obj.status != ObjectStatus.DISAPPEARED]
         counts = [obj.points_world.shape[0] for obj in objects]
         # The cloud is latched; republish it only when its content changed (P6).
-        signature = tuple((obj.instance_id, obj.label, n, float(obj.points_world.sum()) if n else 0.0)
+        signature = tuple((obj.instance_id, obj.label, n,
+                           hashlib.blake2b(np.ascontiguousarray(obj.points_world), digest_size=16).digest())
                           for obj, n in zip(objects, counts))
         if signature == self._cloud_signature:
             return

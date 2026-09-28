@@ -160,6 +160,49 @@ def test_pooled_instance_ap_ranks_all_scenes_together():
     assert report["class_level"]["with_background"]["num_points"] == 5
 
 
+def test_pooled_ap_counts_false_positives_in_scenes_without_that_class():
+    points = np.array([[0., 0., 1.], [.05, 0., 1.]])
+    scenes = []
+    for label, confidence in [('table', .99), ('chair', .90)]:
+        obj = make_object(1, 'chair', [0, 0, 1, .1, .1, 1.1])
+        obj.points_world = points.copy()
+        obj.label_belief = {'chair': confidence, 'other': 1 - confidence}
+        scenes.append(([obj], seg.GroundTruthPoints(points, [label] * 2, [0, 0])))
+    inferred = seg.pooled_segmentation_report(scenes)['instance_level']
+    explicit = seg.pooled_segmentation_report(scenes, instance_classes=['chair', 'table'])['instance_level']
+    for key in ('ap25', 'ap50'):
+        assert inferred[key] == explicit[key]
+        assert inferred[key]['per_class']['chair'] == pytest.approx(.5)
+    matches = [seg.instance_matches(gt, seg.transfer_labels(objects, gt)) for objects, gt in scenes]
+    assert seg.pooled_instance_ap(matches) == inferred
+
+
+def test_capture_ablation_preserves_detector_schedule(monkeypatch, change_scene, reference):
+    from types import SimpleNamespace
+
+    spec = importlib.util.spec_from_file_location('paper_cli', ROOT / 'examples/paper_harness.py')
+    cli = importlib.util.module_from_spec(spec)
+    monkeypatch.syspath_prepend(str(ROOT / 'examples'))
+    spec.loader.exec_module(cli)
+    calls = []
+    original = harness.run_sequence
+
+    def run(*args, **kwargs):
+        rate = args[5] if len(args) > 5 else kwargs.get('detector_rate_hz', 0.)
+        detected = []
+        result = original(*args, **kwargs, on_frame=lambda frame, detections: detected.append(frame.frame_id)
+                          if detections else None)
+        calls.append((rate, detected))
+        return result
+
+    monkeypatch.setattr(harness, 'run_sequence', run)
+    cli.capture_suite(reference, {}, load_prompts(ROOT / 'config/prompts.yaml'), SimpleNamespace(
+        capture=change_scene, frame_skip=1, detector='offline', detector_rate_hz=1.,
+        paper_capture=False, tolerance=.05))
+    assert len(calls) == 4 and calls[0][1]
+    assert all(rate == 1. and detected == calls[0][1] for rate, detected in calls)
+
+
 def test_cached_detections_replay_exactly(tmp_path):
     from semantic_mapping.detectors.offline import OfflineDetector, write_detections
     from semantic_mapping.types import Detection2D

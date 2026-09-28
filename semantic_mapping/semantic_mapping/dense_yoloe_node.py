@@ -40,11 +40,10 @@ _THROTTLE = 5.0
 def calibrated_frame(image, info, max_delta, *, use_projection=True):
     """Require an already rectified image with matching optical calibration.
 
-    Returns ``(stamp, intrinsics, rgb, rectified_info)``. When the CameraInfo
-    still describes the raw sensor (nonzero ``D`` or ``R != I``, as image_proc
-    republishes next to ``image_rect*``), its projection matrix ``P`` describes
-    the rectified pixels and ``rectified_info`` is that form; otherwise the
-    frame is rejected.
+    Returns ``(stamp, intrinsics, rgb, rectified_info)``. With
+    ``use_projection``, ``P`` describes the rectified pixels, even when
+    ``D == 0`` and ``R == I``. Without it, ``K`` must already describe an
+    undistorted image with no rectification rotation.
     """
     stamp = stamp_to_seconds(image.header.stamp)
     info_stamp = stamp_to_seconds(info.header.stamp)
@@ -54,14 +53,14 @@ def calibrated_frame(image, info, max_delta, *, use_projection=True):
         raise ValueError("image and CameraInfo capture times differ")
     rotation = np.asarray(info.r).reshape(3, 3)
     raw_calibration = camera_info_has_distortion(info) or (rotation.any() and not np.allclose(rotation, np.eye(3)))
-    if raw_calibration:
-        if not use_projection:
-            raise ValueError("YOLOE input must use a rectified image and zero-distortion CameraInfo")
+    if use_projection:
         try:
             info = rectified_camera_info(info)
         except ValueError as exc:
-            raise ValueError("CameraInfo describes a distorted/unrectified camera and has no usable P "
+            raise ValueError("CameraInfo has no usable P "
                              "for the rectified image") from exc
+    elif raw_calibration:
+        raise ValueError("YOLOE input must use a rectified image and zero-distortion CameraInfo")
     intr = camera_info_to_intrinsics(info)
     rgb = image_to_numpy(image)
     if rgb.ndim == 2:
@@ -77,7 +76,7 @@ class DenseYOLOELabelsNode(AutostartLifecycleNode):
         declare(self, "allow_yoloe", False, "Explicit policy exception required to run YOLOE")
         declare(self, "images_rectified", False, "Set true only for calibrated, rectified images")
         declare(self, "use_projection_matrix", True,
-                "For raw CameraInfo next to a rectified image, describe masks with P (image_proc convention)")
+                "Describe rectified masks with CameraInfo P; false uses an already undistorted K")
         declare(self, "checkpoint", "", "Existing local YOLOE segmentation checkpoint")
         declare(self, "text_encoder_path", "", "Matching local MobileCLIP TorchScript encoder")
         declare(self, "device", "cuda", "Torch device")

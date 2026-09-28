@@ -162,6 +162,11 @@ ros2 launch semantic_mapping semantic_mapping.launch.py autostart:=false      # 
 
 `semantic_mapping_node` is a managed (lifecycle) node. Models, subscriptions and
 publishers are created in `on_configure`; input is processed only while active.
+Deactivation discards pending sensor frames and invalidates queued or running
+grounding requests. Reactivation accepts fresh work. Cleanup waits briefly for
+inference workers; if a model call is still running, reconfiguration fails with
+a retry message until that worker exits. This prevents overlapping model
+instances and results from an earlier configuration entering a new map.
 With `autostart:=true` (default) it configures and activates itself once
 spinning, so `ros2 run` and plain launch `Node` actions keep working; with
 `autostart:=false` add it to a `nav2_lifecycle_manager` `node_names` list.

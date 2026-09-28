@@ -149,6 +149,25 @@ def test_merge_duplicates_ignores_different_labels_and_far_objects():
     assert len(m.objects) == 3
 
 
+def test_overlapping_duplicate_detections_do_not_confirm_on_one_frame():
+    m = ObjectMap()
+    points = np.array([[0., 0., 1.], [.1, .1, 1.1]])
+    box = np.array([0., 0., 10., 10.])
+    older = m.spawn(box, points, 'cup', .9, 1.)
+    newer = m.spawn(box, points, 'cup', .9, 1.)
+    assert m.merge_duplicates() == [(older.instance_id, newer.instance_id)]
+    assert older.hits == 1
+    m.confirm_tentative(older, min_hits=2)
+    assert older.status == ObjectStatus.TENTATIVE
+
+
+def test_distance_merge_respects_previous_coobservations():
+    m = ObjectMap()
+    a = _co_located(m, 'cup', [1., 2., 3.], np.array([[0., 0., 1.], [.05, .05, 1.05]]))
+    _co_located(m, 'cup', [1., 2., 4.], a.points_world + np.array([.2, 0., 0.]))
+    assert m.merge_duplicates() == []  # different latest stamps do not erase the co-observations
+
+
 def test_tentative_instance_expires_when_never_corroborated():
     m = ObjectMap(tentative_max_age=2)
     K, T, depth = _identity_camera_looking_at_z()

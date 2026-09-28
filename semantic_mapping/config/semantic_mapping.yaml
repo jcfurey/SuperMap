@@ -220,7 +220,7 @@
                                            # Eq. (10) then weighs the label; 0 = off
     min_points_for_3d_association: 5
     merge_iou_threshold: 0.3               # duplicate instances (same label) merged when their 3D boxes overlap this much
-    merge_distance_m: 0.25                 #   ... or their centroids are this close; the older ID survives
+    merge_distance_m: 0.25                 #   ... or their centroids are this close and they were not detected together
     merge_alternating_min_overlap: 0.5     # also merged, whatever the labels, when this much of the smaller 3D box lies
                                            # in the other and they take turns being detected (never in the same
                                            # frame): one object under a flickering label; 0 = off

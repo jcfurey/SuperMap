@@ -55,7 +55,7 @@ Original point padding is preserved; inter-row padding is repacked. Reflectivity
 
 ## Optional camera labels
 
-Publish a `std_msgs/String` JSON object to `/supermap/camera_annotations`. Use the **image capture timestamp**, calibrated rectified optical frame, and intrinsics for the exact mask resolution. The ROS node resolves world-from-camera TF at that timestamp; it does not accept a transform override from the message. Example schema:
+The default `/supermap/camera_annotations` input expects `supermap_msgs/CameraAnnotations`. For manual JSON, set `manual_annotations_topic:=/supermap/manual_annotations` and publish a `std_msgs/String` on that separate topic. Use the **image capture timestamp**, calibrated rectified optical frame, and intrinsics for the exact mask resolution. The JSON input resolves world-from-camera TF at that timestamp; it does not accept a transform override from the message. Example JSON schema:
 
 ```json
 {
@@ -118,7 +118,7 @@ python3 -m semantic_mapping.dense_yoloe_node --ros-args \
   --params-file /path/to/deployment-dense-yoloe.yaml
 ```
 
-The independent camera adapter runs directly on synchronized RGB/CameraInfo pairs, up to `max_rate_hz` (20 Hz by default). Neither live clouds nor accumulated maps gate image inference or the annotated camera display. The image capture timestamp and optical frame accompany every mask. CameraInfo must describe the actual rectified image dimensions with zero distortion and identity rectification rotation.
+The independent camera adapter runs directly on synchronized RGB/CameraInfo pairs, up to `max_rate_hz` (20 Hz by default). Neither live clouds nor accumulated maps gate image inference or the annotated camera display. The image capture timestamp and optical frame accompany every mask. With `use_projection_matrix: true` (default), CameraInfo must have a valid `P` describing those rectified pixels, even if `D` is zero and `R` is identity. Set it to false only when `K` already describes the undistorted image and `R` has no rectification rotation. Exported calibration uses zero distortion and identity rectification rotation.
 
 For live Ouster processing, feed the dense node the complete deskewed scan, e.g. `/deliriom/odom_node/pointcloud/deskewed`, in `odom`. Use `input_mode: snapshot` for independent complete live scans, or `scan` to retain a world-voxel union (whose segmentation cost grows with the union). To keep the live path responsive while also labeling an accumulated map, run a second dense node with the map as its snapshot input and distinct output topics. Both consume the same live camera annotations. Delayed map snapshots choose matching historical masks from a bounded queue (512 by default), with 30 seconds of TF history. They never hold up the camera or live-cloud process. Size the queue for the observed map delay and inference rate.
 

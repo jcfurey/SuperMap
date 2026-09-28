@@ -75,15 +75,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pip's opencv-python, which would shadow apt's python3-opencv with a second
 # cv2 built against a different numpy; it is removed again so `import cv2`
 # resolves to the apt build.
-RUN if [ "$INSTALL_DETECTORS" = "1" ]; then \
+RUN set -e; if [ "$INSTALL_DETECTORS" = "1" ]; then \
         pip3 install --no-cache-dir --break-system-packages \
             "numpy<2" torch==2.5.1 torchvision==0.20.1 \
-            --index-url https://download.pytorch.org/whl/cu124 \
-        && pip3 install --no-cache-dir --break-system-packages \
-            "numpy<2" ultralytics rerun-sdk \
-        && pip3 uninstall -y --break-system-packages opencv-python opencv-python-headless || true; \
-    fi \
-    && python3 -c "import cv2, numpy; assert cv2.__file__.startswith('/usr/lib/python3/'), cv2.__file__; print('cv2', cv2.__version__, 'numpy', numpy.__version__)"
+            --index-url https://download.pytorch.org/whl/cu124; \
+        pip3 install --no-cache-dir --break-system-packages \
+            "numpy<2" ultralytics rerun-sdk; \
+        pip3 uninstall -y --break-system-packages opencv-python opencv-python-headless; \
+        python3 -c "import torch, torchvision, ultralytics"; \
+    fi; \
+    python3 -c "import cv2, numpy; assert cv2.__file__.startswith('/usr/lib/python3/'), cv2.__file__; print('cv2', cv2.__version__, 'numpy', numpy.__version__)"
 
 WORKDIR /workspace/src/SuperMap
 COPY . .

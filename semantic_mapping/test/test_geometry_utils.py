@@ -278,7 +278,7 @@ def test_detection_mask_bounds_are_remembered_per_mask_array():
     assert copy.mask_bounds() == (5, 9, 10, 25) and detection.mask_bounds() == (20, 22, 1, 3)
     detection.mask = np.zeros_like(mask)
     assert detection.mask_bounds() is None
-    assert copy == dataclasses.replace(copy)                    # the cache is not a field
+    assert "_mask_bounds" not in {f.name for f in dataclasses.fields(copy)}  # the cache is not a field
 
 
 @pytest.mark.filterwarnings("ignore:overflow encountered:RuntimeWarning")  # uint8 boxes wrap, on both sides

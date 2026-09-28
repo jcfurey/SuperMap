@@ -267,12 +267,18 @@ def instance_matches(
 
     if classes is None:
         classes = sorted({name for name in gt_class if name != UNLABELED})
+        # Keep false positives in scenes with no GT of their class: another
+        # scene may supply that class when these rankings are pooled. Single-
+        # scene summaries still report only the GT classes in `classes`.
+        ranked_classes = sorted(set(classes) | set(pred_class))
+    else:
+        ranked_classes = classes
 
     ranked: dict[float, dict[str, tuple[list[float], list[int], np.ndarray]]] = {}
     gt_counts = {name: sum(1 for c in gt_class if c == name) for name in classes}
     for threshold in iou_thresholds:
         ranked[threshold] = {}
-        for name in classes:
+        for name in ranked_classes:
             gts = np.array([g for g in range(n_g) if gt_class[g] == name], dtype=np.int64)
             preds = sorted((p for p in range(n_p) if pred_class[p] == name),
                            key=lambda p: (-pred_conf[p], pids[p]))

@@ -24,7 +24,9 @@ INTRINSICS = CameraIntrinsics(10., 10., 5., 5., 10, 10)
 def frame(stamp):
     header = Header(stamp=stamp_msg(stamp), frame_id="map")
     image = numpy_to_image(np.zeros((10, 10, 3), np.uint8), "rgb8", header)
-    return image, camera_info(INTRINSICS, header)
+    info = camera_info(INTRINSICS, header)
+    info.p = [10., 0., 5., 0., 0., 10., 5., 0., 0., 0., 1., 0.]
+    return image, info
 
 
 class FakeDetector:
@@ -123,6 +125,7 @@ def test_camera_calibration_rejects_mismatches(bad):
     image, info = frame(1.)
     if bad == "distortion":
         info.d = [.1, 0., 0., 0., 0.]
+        info.p = [0.] * 12
     elif bad == "size":
         info.width = 20
     elif bad == "time":
@@ -131,6 +134,7 @@ def test_camera_calibration_rejects_mismatches(bad):
         info.header = Header(stamp=stamp_msg(1.), frame_id="wrong")
     else:
         info.r = [0., -1., 0., 1., 0., 0., 0., 0., 1.]
+        info.p = [0.] * 12
     with pytest.raises(ValueError):
         calibrated_frame(image, info, .2)
 
@@ -149,6 +153,22 @@ def test_rectified_image_with_raw_camera_info_uses_p():
     assert intr == INTRINSICS and not any(rectified.d) and list(rectified.k)[:3] == [10., 0., 5.]
     with pytest.raises(ValueError):
         calibrated_frame(image, info, .2, use_projection=False)
+
+
+def test_projection_selection_is_independent_of_distortion():
+    image, info = frame(1.)
+    info.d = [0.] * 5
+    info.r = np.eye(3).ravel().tolist()
+    info.k = [11., 0., 4., 0., 12., 6., 0., 0., 1.]
+    _, intr, _, normalized = calibrated_frame(image, info, .2, use_projection=True)
+    assert intr == INTRINSICS
+    assert list(normalized.k) == INTRINSICS.K.ravel().tolist()
+    _, raw_intr, _, raw_info = calibrated_frame(image, info, .2, use_projection=False)
+    assert raw_intr.fx == 11. and raw_intr.cx == 4. and raw_info is info
+    assert list(info.k)[:3] == [11., 0., 4.]  # conversion did not mutate the source
+    info.p = [0.] * 12
+    with pytest.raises(ValueError, match='no usable P'):
+        calibrated_frame(image, info, .2, use_projection=True)
 
 
 class ExplodingDetector:

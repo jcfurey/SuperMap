@@ -4,7 +4,7 @@
     # Explicit policy exception: YOLOE is not a US-created model.
     allow_yoloe: false
     images_rectified: false
-    use_projection_matrix: true  # raw CameraInfo next to image_rect*: describe masks with P
+    use_projection_matrix: true  # always describe image_rect* masks with P; false uses an already undistorted K
     checkpoint: ""  # existing local YOLOE segmentation checkpoint
     text_encoder_path: ""  # matching local MobileCLIP TorchScript encoder
     device: cuda

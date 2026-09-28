@@ -43,7 +43,7 @@ class GroundingDINODetector(Detector):
             return []
 
         detections_raw = self.model.predict_with_classes(
-            image=rgb_image,
+            image=np.ascontiguousarray(rgb_image[:, :, ::-1]),  # Model.predict_with_classes expects BGR
             classes=prompts,
             box_threshold=self.box_threshold,
             text_threshold=self.text_threshold,
